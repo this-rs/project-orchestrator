@@ -948,11 +948,14 @@ pub struct PlanEnrichmentResult {
 
 /// What the prompt says once when a step is listed as skipped.
 ///
-/// A step is `skipped` only when someone ruled it out: the runner no longer
-/// closes the steps a run did not reach (they stay `pending`, a to-do), so the
-/// mark always means "left out on purpose", and the rule can say so.
-const SKIPPED_STEPS_LEGEND: &str =
-    "`[-]` = skipped on purpose: the step was ruled out, do not do such a step.\n";
+/// The store holds one `skipped` for two things: a step someone ruled out, and a
+/// step an EARLIER runner closed because its run stopped before reaching it
+/// (steps closed that way before the runner stopped doing it are still in the
+/// database, and a task that failed then is retried now). Nothing in the data
+/// tells them apart, and guessing would either forbid pending work or resurrect
+/// excluded work. So the legend states both origins and never forbids: the
+/// acceptance criteria decide.
+pub(crate) const SKIPPED_STEPS_LEGEND: &str = "`[-]` = skipped: either ruled out, or not reached by an earlier run. If an acceptance criterion cannot hold without it, do it.\n";
 
 /// The steps of the task, as both prompt paths list them.
 ///
@@ -965,7 +968,7 @@ pub(crate) fn render_steps(steps: &[crate::neo4j::models::StepNode]) -> String {
     for step in steps {
         let (mark, note) = match step.status {
             StepStatus::Completed => ("[x]", ""),
-            StepStatus::Skipped => ("[-]", " — skipped, not done"),
+            StepStatus::Skipped => ("[-]", " — skipped"),
             StepStatus::Pending | StepStatus::InProgress => ("[ ]", ""),
         };
         out.push_str(&format!(
@@ -1811,14 +1814,30 @@ mod tests {
                 skipped.starts_with("[-]") && skipped.contains("skipped"),
                 "a skipped step says so: {skipped}"
             );
-            // "Skipped" is also what the runner writes on steps a failed run
-            // did not reach: the mark is explained, the work is not forbidden.
-            assert!(!prompt.to_lowercase().contains("do not do it"), "{prompt}");
+            // The legend is the exact one, shown once.
             assert_eq!(
-                prompt.matches("skipped on purpose").count(),
+                prompt.matches(SKIPPED_STEPS_LEGEND.trim_end()).count(),
                 1,
                 "the legend appears once: {prompt}"
             );
+        }
+    }
+
+    #[test]
+    fn the_skipped_legend_never_forbids_a_step() {
+        // A `skipped` step may be one an earlier runner closed after a failed run:
+        // the legend must leave the decision to the acceptance criteria.
+        let legend = SKIPPED_STEPS_LEGEND.to_lowercase();
+        assert!(
+            legend.contains("either ruled out, or not reached by an earlier run"),
+            "{legend}"
+        );
+        assert!(
+            legend.contains("if an acceptance criterion cannot hold without it, do it"),
+            "{legend}"
+        );
+        for forbidding in ["do not", "don't", "must not", "never", "skip it"] {
+            assert!(!legend.contains(forbidding), "'{forbidding}' in: {legend}");
         }
     }
 

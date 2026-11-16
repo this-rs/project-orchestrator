@@ -4908,11 +4908,12 @@ impl PlanRunner {
     ///
     /// - `Success`: pending/in_progress → completed
     /// - `Timeout` with commits: in_progress → completed; the rest stays to do
-    /// - `Timeout` without commits, `Error`/`Cancelled`/`BudgetExceeded`: the
-    ///   steps are NOT touched: a run that stopped before a step was done leaves
-    ///   it to do. Closing it as `skipped` told the next run of the task not to
-    ///   do the work (issue #1189: the store has no way to tell that from a step
-    ///   skipped on purpose).
+    /// - `Timeout` without commits, `Error`/`Cancelled`/`BudgetExceeded`:
+    ///   in_progress → pending (no agent works on it any more, and a dashboard
+    ///   counts in-progress steps as running); pending stays pending. A run that
+    ///   stopped before a step was done leaves it to do. Closing it as `skipped`
+    ///   told the next run of the task not to do the work (issue #1189: the store
+    ///   has no way to tell that from a step skipped on purpose).
     async fn finalize_steps(
         &self,
         task_id: Uuid,
@@ -5001,6 +5002,10 @@ impl PlanRunner {
                         && step.status == crate::neo4j::models::StepStatus::InProgress =>
                 {
                     crate::neo4j::models::StepStatus::Completed
+                }
+                // A run that stopped leaves no agent on the step: back to to-do.
+                _ if step.status == crate::neo4j::models::StepStatus::InProgress => {
+                    crate::neo4j::models::StepStatus::Pending
                 }
                 // Not reached by a run that stopped: still to do, for the next run.
                 _ => continue,
@@ -7024,6 +7029,113 @@ mod tests {
         }
     }
 
+    /// No agent works on a step once the run stopped: an `in_progress` step goes
+    /// back to `pending` on every outcome that stops the run (a dashboard counts
+    /// in-progress steps as running), and a pending one is left alone.
+    #[tokio::test]
+    async fn an_in_progress_step_goes_back_to_pending_when_the_run_stops() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let outcomes = [
+            TaskResult::Failed {
+                reason: "Agent crashed".to_string(),
+                attempts: 1,
+                cost_usd: 0.05,
+            },
+            // /tmp holds no recent commit: a timeout without proof of work.
+            TaskResult::Timeout {
+                duration_secs: 60.0,
+                cost_usd: 0.05,
+            },
+            TaskResult::BudgetExceeded {
+                cumulated_cost_usd: 2.0,
+                limit_usd: 1.0,
+                cumulated_tokens: None,
+                limit_tokens: None,
+            },
+        ];
+        for outcome in outcomes {
+            let (runner, graph) = test_plan_runner_with_graph();
+            let plan = test_plan();
+            graph.create_plan(&plan).await.unwrap();
+            let mut task = test_task();
+            task.status = TaskStatus::InProgress;
+            graph.create_task(plan.id, &task).await.unwrap();
+            let mut running = test_step(0, "Running");
+            running.status = StepStatus::InProgress;
+            graph.create_step(task.id, &running).await.unwrap();
+            graph
+                .create_step(task.id, &test_step(1, "Waiting"))
+                .await
+                .unwrap();
+
+            runner.finalize_steps(task.id, &outcome, "/tmp").await;
+
+            let steps = graph.get_task_steps(task.id).await.unwrap();
+            for step in &steps {
+                assert_eq!(
+                    step.status,
+                    StepStatus::Pending,
+                    "{outcome:?}: '{}' should be pending",
+                    step.description
+                );
+            }
+        }
+    }
+
+    /// Tasks that failed BEFORE the runner stopped closing steps as skipped have
+    /// those steps `skipped` in the database. Retried now, the prompt must not
+    /// forbid them: the legend leaves the decision to the acceptance criteria.
+    #[tokio::test]
+    async fn a_retried_task_with_steps_already_skipped_in_the_store_is_not_forbidden_them() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::orchestrator::context::SKIPPED_STEPS_LEGEND;
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+        let plan = test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let mut task = test_task();
+        task.status = TaskStatus::Failed;
+        graph.create_task(plan.id, &task).await.unwrap();
+        for (order, name) in [(0, "Write code"), (1, "Run tests"), (2, "Update docs")] {
+            let mut step = test_step(order, name);
+            step.status = StepStatus::Skipped;
+            graph.create_step(task.id, &step).await.unwrap();
+        }
+
+        crate::api::handlers::prepare_task_retry(graph.as_ref(), plan.id, task.id)
+            .await
+            .expect("a failed task with no active run is retried");
+
+        let context = runner
+            .context_builder
+            .build_context(task.id, plan.id)
+            .await
+            .unwrap();
+        let plain = runner.context_builder.generate_prompt(&context);
+        let enriched = runner
+            .context_builder
+            .build_prompt_builder(&context)
+            .build();
+        for prompt in [&plain, &enriched] {
+            for name in ["Write code", "Run tests", "Update docs"] {
+                assert!(prompt.contains(name), "{prompt}");
+            }
+            assert_eq!(
+                prompt.matches(SKIPPED_STEPS_LEGEND.trim_end()).count(),
+                1,
+                "{prompt}"
+            );
+            assert!(!prompt.to_lowercase().contains("do not do"), "{prompt}");
+            assert!(
+                !prompt.to_lowercase().contains("ruled out, do not"),
+                "{prompt}"
+            );
+        }
+    }
+
     /// A failed run leaves its unreached steps to do, and the retry of the task
     /// goes through `prepare_task_retry` (the path `retry_plan_task` takes): the
     /// prompt of the retried task lists them as to-do, with no order to skip them.
@@ -7895,8 +8007,8 @@ mod tests {
         // in_progress stays to do (a run that fails leaves them to do)
         assert_eq!(
             step1_updated.status,
-            StepStatus::InProgress,
-            "in_progress step should stay to do when the run fails"
+            StepStatus::Pending,
+            "in_progress step goes back to pending when the run fails: no agent works on it"
         );
         // pending stays to do
         assert_eq!(
