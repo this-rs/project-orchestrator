@@ -751,6 +751,16 @@ jobs:
           cargo test --features obrain-backend --test obrain_backend --test store_conformance \
             --example obrain_mesures -- obrain_project:: with_the_feature an_unknown
 
+      # The task-and-step portage suite had no job at all, and it was measured
+      # red for a while without anybody seeing it (16/11/2026: three tests,
+      # including one that asserted the full flush per blob-sized write that
+      # obrain #172/#175 and the removal of `flush_complet` had just retired).
+      # A portage suite nothing runs is worse than no suite: it reads as
+      # coverage. No filter: every test of the file runs, and the compilation is
+      # already warm from the step above.
+      - name: Run the task-and-step portage tests
+        run: cargo test --features obrain-backend --test obrain_taches
+
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
   # ==========================================================================
