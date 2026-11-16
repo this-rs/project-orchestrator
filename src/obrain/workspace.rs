@@ -504,9 +504,10 @@ fn id_requis(get: Get<'_>, cle: &str, quoi: &str) -> Result<Uuid> {
 }
 
 fn date_requise(get: Get<'_>, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
-    let s = chaine(get, cle).ok_or_else(|| anyhow!("{quoi} sans propriété `{cle}`"))?;
-    s.parse()
-        .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {s} ») : {e}"))
+    // The three stored shapes (ISO string, Timestamp, ZonedDatetime), never the
+    // string only: the migrator writes `ZonedDatetime`, and a string-only read
+    // quarantined every migrated node as if its date were absent.
+    super::date_propriete(get, cle)?.ok_or_else(|| anyhow!("{quoi} sans propriété `{cle}`"))
 }
 
 fn optionnelle_id(get: Get<'_>, cle: &str) -> Option<Uuid> {
@@ -532,7 +533,7 @@ fn decoder_espace(get: Get<'_>) -> Result<(Uuid, WorkspaceNode)> {
         slug: chaine(get, "slug").ok_or_else(|| anyhow!("{quoi} sans `slug`"))?,
         description: chaine(get, "description"),
         created_at: date_requise(get, "created_at", &quoi)?,
-        updated_at: chaine(get, "updated_at").and_then(|s| s.parse().ok()),
+        updated_at: super::date_propriete(get, "updated_at")?,
         metadata: chaine(get, "metadata")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({})),
@@ -559,8 +560,8 @@ fn decoder_jalon(get: Get<'_>) -> Result<(Uuid, WorkspaceMilestoneNode)> {
         title: chaine(get, "title").ok_or_else(|| anyhow!("{quoi} sans `title`"))?,
         description: chaine(get, "description"),
         status,
-        target_date: chaine(get, "target_date").and_then(|s| s.parse().ok()),
-        closed_at: chaine(get, "closed_at").and_then(|s| s.parse().ok()),
+        target_date: super::date_propriete(get, "target_date")?,
+        closed_at: super::date_propriete(get, "closed_at")?,
         created_at: date_requise(get, "created_at", &quoi)?,
         tags: liste(get, "tags"),
     };
@@ -597,7 +598,7 @@ fn decoder_ressource(get: Get<'_>) -> Result<(Uuid, ResourceNode)> {
         version: chaine(get, "version"),
         description: chaine(get, "description"),
         created_at: date_requise(get, "created_at", &quoi)?,
-        updated_at: chaine(get, "updated_at").and_then(|s| s.parse().ok()),
+        updated_at: super::date_propriete(get, "updated_at")?,
         metadata: chaine(get, "metadata")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({})),

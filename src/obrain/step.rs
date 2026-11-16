@@ -56,7 +56,11 @@ fn statut_depuis(s: &str) -> Option<StepStatus> {
 /// on an unknown status and an unreadable `created_at`).
 pub(super) fn lire_etape(get: &dyn Fn(&str) -> Option<Value>) -> Result<StepNode> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    // The three shapes a stored date can take: ISO string, `Timestamp` (obrain's
+    // `datetime()`), `ZonedDatetime` (what the migrator writes). A PRESENT but
+    // unreadable date is an error, so this node is quarantined by name — read as
+    // undated instead, it is how 130 713 migrated nodes were lost.
+    let instant = |cle: &str| super::date_propriete(get, cle);
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Step sans propriété `id` lisible"))?;
@@ -80,8 +84,8 @@ pub(super) fn lire_etape(get: &dyn Fn(&str) -> Option<Value>) -> Result<StepNode
         status,
         verification: chaine("verification").filter(|s| !s.is_empty()),
         created_at,
-        updated_at: instant("updated_at"),
-        completed_at: instant("completed_at"),
+        updated_at: instant("updated_at")?,
+        completed_at: instant("completed_at")?,
         execution_context: None,
         persona: None,
     })

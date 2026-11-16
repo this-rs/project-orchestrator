@@ -391,7 +391,11 @@ fn lecteur(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option<Value
 /// `Neo4jClient::node_to_note`. Returns the note and its `updated_at`.
 fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTime<Utc>>)> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    // The three shapes a stored date can take: ISO string, `Timestamp` (obrain's
+    // `datetime()`), `ZonedDatetime` (what the migrator writes). A PRESENT but
+    // unreadable date is an error, so this node is quarantined by name — read as
+    // undated instead, it is how 130 713 migrated nodes were lost.
+    let instant = |cle: &str| super::date_propriete(get, cle);
     let entier = |cle: &str| get(cle).and_then(|v| v.as_int64());
     let reel = |cle: &str| get(cle).and_then(|v| v.as_float64());
 
@@ -442,9 +446,9 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| NoteAuthorKind::infer_from_created_by(&created_by)),
         confidence: reel("confidence"),
-        human_confirmed_at: instant("human_confirmed_at"),
+        human_confirmed_at: instant("human_confirmed_at")?,
         human_confirmed_by: chaine("human_confirmed_by").filter(|s| !s.is_empty()),
-        last_confirmed_at: instant("last_confirmed_at"),
+        last_confirmed_at: instant("last_confirmed_at")?,
         last_confirmed_by: chaine("last_confirmed_by"),
         staleness_score: reel("staleness_score").unwrap_or(0.0),
         energy: reel("energy").unwrap_or(1.0),
@@ -453,11 +457,11 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .and_then(|s| s.parse().ok())
             .unwrap_or(MemoryHorizon::Consolidated),
         activation_count: entier("activation_count").unwrap_or(0),
-        last_activated: instant("last_activated"),
+        last_activated: instant("last_activated")?,
         supersedes: chaine("supersedes").and_then(|s| s.parse().ok()),
         superseded_by: chaine("superseded_by").and_then(|s| s.parse().ok()),
-        valid_from: instant("valid_from"),
-        valid_until: instant("valid_until"),
+        valid_from: instant("valid_from")?,
+        valid_until: instant("valid_until")?,
         revision: (!revision_json.is_empty())
             .then(|| serde_json::from_str(&revision_json).ok())
             .flatten(),
@@ -470,11 +474,11 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .flatten(),
         revision_reason: chaine("revision_reason").filter(|s| !s.is_empty()),
         reactivation_count: entier("reactivation_count").unwrap_or(0),
-        last_reactivated: instant("last_reactivated"),
-        freshness_pinged_at: instant("freshness_pinged_at"),
+        last_reactivated: instant("last_reactivated")?,
+        freshness_pinged_at: instant("freshness_pinged_at")?,
         sharing_consent: consentement_lu(get, id)?,
     };
-    Ok((note, instant("updated_at")))
+    Ok((note, instant("updated_at")?))
 }
 
 /// The sharing consent of a note node. ABSENT is `NotSet` (a note written before

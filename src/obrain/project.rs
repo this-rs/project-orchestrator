@@ -88,7 +88,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -270,16 +270,19 @@ impl IndexProjets {
 /// answers `None` for an absent or null property.
 fn lire_projet(get: &dyn Fn(&str) -> Option<Value>) -> Result<ProjectNode> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    // The three shapes a stored date can take: ISO string, `Timestamp` (obrain's
+    // `datetime()`), `ZonedDatetime` (what the migrator writes). A PRESENT but
+    // unreadable date is an error, so this node is quarantined by name — read as
+    // undated instead, it is how 130 713 migrated nodes were lost.
+    let instant = |cle: &str| super::date_propriete(get, cle);
 
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Project sans propriété `id` lisible"))?;
-    let created_at =
-        chaine("created_at").ok_or_else(|| anyhow!("projet {id} sans propriété `created_at`"))?;
-    let created_at: DateTime<Utc> = created_at
-        .parse()
-        .map_err(|e| anyhow!("projet {id} : `created_at` illisible (« {created_at} ») : {e}"))?;
+    // Required, but read in the three stored shapes: the migrator writes
+    // `ZonedDatetime`, which an `as_str()` read could not see at all.
+    let created_at = super::date_propriete(get, "created_at")?
+        .ok_or_else(|| anyhow!("projet {id} sans propriété `created_at`"))?;
 
     Ok(ProjectNode {
         id,
@@ -289,9 +292,9 @@ fn lire_projet(get: &dyn Fn(&str) -> Option<Value>) -> Result<ProjectNode> {
         root_path: chaine("root_path").unwrap_or_default(),
         description: chaine("description"),
         created_at,
-        last_synced: instant("last_synced"),
-        analytics_computed_at: instant("analytics_computed_at"),
-        last_co_change_computed_at: instant("last_co_change_computed_at"),
+        last_synced: instant("last_synced")?,
+        analytics_computed_at: instant("analytics_computed_at")?,
+        last_co_change_computed_at: instant("last_co_change_computed_at")?,
         // None means default (1.0).
         default_note_energy: get("default_note_energy")
             .and_then(|v| v.as_float64())

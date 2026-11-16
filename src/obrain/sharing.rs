@@ -210,10 +210,10 @@ fn lire_tombe(get: &dyn Fn(&str) -> Option<Value>) -> Result<SignedTombstone> {
     Ok(SignedTombstone {
         issuer_did: texte("issuer_did")?,
         signature_hex: texte("signature_hex")?,
-        // Neo4j's stated rule (`tombstone_from_stored`): the epoch, never "now".
-        issued_at: texte("issued_at")?
-            .parse::<DateTime<Utc>>()
-            .unwrap_or(DateTime::UNIX_EPOCH),
+        // Neo4j's stated rule (`tombstone_from_stored`): the epoch, never "now",
+        // when the value is ABSENT or unreadable — a tombstone's date must not
+        // become the time of the read.
+        issued_at: super::date_propriete(get, "issued_at")?.unwrap_or(DateTime::UNIX_EPOCH),
         reason: Some(texte("reason")?).filter(|r| !r.is_empty()),
         content_hash: hash,
     })

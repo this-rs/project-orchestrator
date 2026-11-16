@@ -305,12 +305,8 @@ fn lire_session(get: &dyn Fn(&str) -> Option<Value>) -> Result<ChatSessionNode> 
         cwd,
         title: non_vide("title"),
         model,
-        created_at: chaine("created_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
-        updated_at: chaine("updated_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
+        created_at: super::date_propriete(get, "created_at")?.unwrap_or_else(Utc::now),
+        updated_at: super::date_propriete(get, "updated_at")?.unwrap_or_else(Utc::now),
         message_count: get("message_count").and_then(|v| v.as_int64()).unwrap_or(0),
         total_cost_usd: if total_cost_usd == 0.0 {
             None
@@ -375,9 +371,7 @@ fn lire_evenement(get: &dyn Fn(&str) -> Option<Value>) -> Result<ChatEventRecord
             .ok_or_else(|| anyhow!("événement sans `seq`"))?,
         event_type: chaine("event_type").ok_or_else(|| anyhow!("événement sans `event_type`"))?,
         data: chaine("data").ok_or_else(|| anyhow!("événement sans `data`"))?,
-        created_at: chaine("created_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
+        created_at: super::date_propriete(get, "created_at")?.unwrap_or_else(Utc::now),
     })
 }
 

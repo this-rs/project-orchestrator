@@ -109,7 +109,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -278,7 +278,11 @@ fn proprietes_de_creation(t: &TaskNode) -> Vec<(&'static str, Value)> {
 /// status, an unreadable `created_at`).
 fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    // The three shapes a stored date can take: ISO string, `Timestamp` (obrain's
+    // `datetime()`), `ZonedDatetime` (what the migrator writes). A PRESENT but
+    // unreadable date is an error, so this node is quarantined by name — read as
+    // undated instead, it is how 130 713 migrated nodes were lost.
+    let instant = |cle: &str| super::date_propriete(get, cle);
     let entier = |cle: &str| get(cle).and_then(|v| v.as_int64());
     let positif = |cle: &str| entier(cle).filter(|&v| v > 0).map(|v| v as u32);
     let non_vide = |cle: &str| chaine(cle).filter(|s| !s.is_empty());
@@ -290,19 +294,16 @@ fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
     let statut_brut = requise("status")?;
     let status = statut_depuis(&statut_brut)
         .ok_or_else(|| anyhow!("tâche {id} : statut inconnu « {statut_brut} »"))?;
-    let cree_brut = requise("created_at")?;
-    let created_at: DateTime<Utc> = cree_brut
-        .parse()
-        .map_err(|e| anyhow!("tâche {id} : `created_at` illisible (« {cree_brut} ») : {e}"))?;
+    // Required, in the three stored shapes (`ZonedDatetime` from the migrator).
+    let created_at = super::date_propriete(get, "created_at")?
+        .ok_or_else(|| anyhow!("tâche {id} sans propriété `created_at`"))?;
     Ok(TaskNode {
         id,
         title: non_vide("title"),
         description: requise("description")?,
         status,
         assigned_to: chaine("assigned_to"),
-        interrupted_at: chaine("interrupted_at")
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc)),
+        interrupted_at: instant("interrupted_at")?,
         interrupted_reason: non_vide("interrupted_reason"),
         priority: entier("priority").map(|v| v as i32),
         tags: lire_liste(get, "tags", id)?,
@@ -313,9 +314,9 @@ fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
         due_date: non_vide("due_date").and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
         estimated_minutes: positif("estimated_minutes"),
         created_at,
-        updated_at: instant("updated_at"),
-        started_at: instant("started_at"),
-        completed_at: instant("completed_at"),
+        updated_at: instant("updated_at")?,
+        started_at: instant("started_at")?,
+        completed_at: instant("completed_at")?,
         frustration_score: get("frustration_score")
             .and_then(|v| v.as_float64())
             .unwrap_or(0.0),
