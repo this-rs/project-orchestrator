@@ -120,6 +120,40 @@ pub(crate) fn update_body(args: &Value, keys: &[&str]) -> serde_json::Map<String
     body
 }
 
+/// Fields `task(action: "update")` writes. `PATCH /api/tasks/{id}` writes each
+/// of them; the arm used to forward nine by hand and drop the others in
+/// silence — `acceptance_criteria` and `affected_files` among them (issue #1189).
+const TASK_UPDATE_KEYS: &[&str] = &[
+    "status",
+    "assigned_to",
+    "priority",
+    "tags",
+    "title",
+    "description",
+    "acceptance_criteria",
+    "affected_files",
+    "estimated_complexity",
+    "actual_complexity",
+    "session_id",
+];
+
+/// Fields `step(action: "update")` writes.
+const STEP_UPDATE_KEYS: &[&str] = &["status", "description", "verification"];
+
+/// The body of an update, and the names of the fields it writes.
+///
+/// Only the keys in `writable` are copied, as before; the answer names them so
+/// a caller can see what was written. Keys the update does not write are not
+/// copied and not refused here: refusing them is a contract change (#1189).
+pub(crate) fn written_update_body(
+    args: &Value,
+    writable: &[&str],
+) -> (serde_json::Map<String, Value>, Vec<String>) {
+    let body = update_body(args, writable);
+    let fields = body.keys().cloned().collect();
+    (body, fields)
+}
+
 fn unstringify_json_values(args: &mut Value, properties: Option<&Value>) {
     let (Some(obj), Some(props)) = (args.as_object_mut(), properties) else {
         return;
@@ -1637,39 +1671,12 @@ impl ToolHandler {
 
             "update_task" => {
                 let task_id = extract_id(args, "task_id")?;
-                let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("status") {
-                    body.insert("status".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("assigned_to") {
-                    body.insert("assigned_to".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("priority") {
-                    body.insert("priority".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("tags") {
-                    body.insert("tags".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("title") {
-                    body.insert("title".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("description") {
-                    body.insert("description".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("estimated_complexity") {
-                    body.insert("estimated_complexity".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("actual_complexity") {
-                    body.insert("actual_complexity".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("session_id") {
-                    body.insert("session_id".to_string(), v.clone());
-                }
+                let (body, fields) = written_update_body(args, TASK_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
                     .await?;
                 Ok(Some(if result.is_null() {
-                    json!({"updated": true})
+                    json!({"updated": true, "updated_fields": fields})
                 } else {
                     result
                 }))
@@ -1934,21 +1941,12 @@ impl ToolHandler {
 
             "update_step" => {
                 let step_id = extract_id(args, "step_id")?;
-                let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("status") {
-                    body.insert("status".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("description") {
-                    body.insert("description".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("verification") {
-                    body.insert("verification".to_string(), v.clone());
-                }
+                let (body, fields) = written_update_body(args, STEP_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
                     .await?;
                 Ok(Some(if result.is_null() {
-                    json!({"updated": true})
+                    json!({"updated": true, "updated_fields": fields})
                 } else {
                     result
                 }))
@@ -2130,6 +2128,10 @@ impl ToolHandler {
             }
 
             "supersede_decision" => {
+                // REST: /api/decisions/{new}/supersedes/{old}, which marks `old`.
+                // The MCP names are bound as they always were, so the decision
+                // marked superseded is `superseded_by_id`. Which one it is comes
+                // back in the answer: a change of direction is a separate change.
                 let new_id = extract_id(args, "decision_id")?;
                 let old_id = extract_id(args, "superseded_by_id")?;
                 let result = http
@@ -2139,12 +2141,15 @@ impl ToolHandler {
                     )
                     .await?;
                 Ok(Some(if result.is_null() {
-                    json!({"status": "ok"})
+                    json!({
+                        "status": "ok",
+                        "marked_superseded": old_id.to_string(),
+                        "superseded_by": new_id.to_string(),
+                    })
                 } else {
                     result
                 }))
             }
-
             "get_decision_timeline" => {
                 let mut query = Vec::new();
                 if let Some(tid) = extract_optional_string(args, "task_id") {
@@ -7730,6 +7735,61 @@ mod tests {
         assert!(result["path"].as_str().unwrap().starts_with("/api/tasks/"));
     }
 
+    // -- Issue #1189: a write that drops a field does not answer success ----
+
+    /// `task update` forwarded nine fields and dropped the rest in silence:
+    /// `acceptance_criteria` and `affected_files` never reached the API, and
+    /// the answer was `updated: true`.
+    #[tokio::test]
+    async fn task_update_forwards_every_field_the_api_writes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": UUID1,
+                    "title": "t",
+                    "acceptance_criteria": ["The export is complete"],
+                    "affected_files": ["src/export.rs"],
+                    "session_id": UUID2,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert_eq!(result["path"], format!("/api/tasks/{UUID1}"));
+        let body = &result["body"];
+        assert_eq!(body["title"], "t");
+        assert_eq!(
+            body["acceptance_criteria"],
+            json!(["The export is complete"])
+        );
+        assert_eq!(body["affected_files"], json!(["src/export.rs"]));
+        assert_eq!(body["session_id"], UUID2);
+        // The envelope is not a field of the task.
+        assert!(body.get("action").is_none());
+        assert!(body.get("task_id").is_none());
+    }
+
+    /// The arrays an MCP client sends as JSON strings arrive as arrays.
+    #[tokio::test]
+    async fn task_update_forwards_criteria_sent_as_a_json_string() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": UUID1,
+                    "acceptance_criteria": "[\"a\", \"b\"]",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"]["acceptance_criteria"], json!(["a", "b"]));
+    }
+
     #[tokio::test]
     async fn test_http_get_next_task() {
         let (handler, _) = make_http_handler().await;
@@ -13135,7 +13195,7 @@ mod schema_drift_tests {
         // ImportSkillBody / MergeSkillsRequest
         ("skill", "conflict_strategy"), ("skill", "package"), ("skill", "skill_ids"),
         // CreateTaskRequest / BuildPromptRequest
-        ("task", "acceptance_criteria"), ("task", "affected_files"), ("task", "custom_sections"), ("task", "depends_on"), ("task", "steps"),
+        ("task", "custom_sections"), ("task", "depends_on"), ("task", "steps"),
         // CreateWorkspaceMilestoneRequest
         ("workspace_milestone", "tags"),
     ];
@@ -13203,10 +13263,11 @@ mod schema_drift_tests {
             regex::Regex::new(r#"args\["([a-z_0-9]+)"\]"#).unwrap(),
         ];
         let for_list = regex::Regex::new(r"for \w+ in &?\[([^\]]*)\]").unwrap();
-        // An arm may read its keys through a shared list (`update_body(args, X)`)
-        // instead of spelling every `args.get("k")`. Follow the list to its
+        // An arm may read its keys through a shared list (`update_body(args, X)`,
+        // `written_update_body(args, X)`) instead of spelling every
+        // `args.get("k")`. Follow the list to its
         // `const X: &[&str] = &[...]` so the check keeps seeing those keys.
-        let update_body_re = regex::Regex::new(r"update_body\(args, ([A-Z_]+)\)").unwrap();
+        let update_body_re = regex::Regex::new(r"update_body\(args, ([A-Z_]+)[,)]").unwrap();
         let const_re = regex::Regex::new(r"(?s)const ([A-Z_]+): &\[&str\] = &\[(.*?)\];").unwrap();
         let mut const_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for cap in const_re.captures_iter(src) {

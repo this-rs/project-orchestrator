@@ -639,16 +639,26 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
-/// Delete a task and all its related data
+/// Delete a task and all its related data.
+///
+/// The task's steps and decisions go with it — the same ownership rule as
+/// deleting a plan or a project. The answer stays an empty 204; what went with
+/// the task is logged here, so the cascade is at least on the record.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
+    let report = state
         .orchestrator
         .plan_manager()
         .delete_task(task_id)
         .await?;
+    tracing::info!(
+        %task_id,
+        steps_deleted = report.steps_deleted,
+        decisions_deleted = report.deleted_decision_ids.len(),
+        "task deleted with its steps and decisions"
+    );
     state
         .event_bus
         .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
@@ -10961,9 +10971,33 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_supersede_decision() {
-        let app = test_app().await;
-        let new_id = uuid::Uuid::new_v4();
-        let old_id = uuid::Uuid::new_v4();
+        // Two decisions that exist: the old one becomes superseded, the new
+        // one keeps its status. (This test used to supersede two random ids
+        // and expect 204 — the silent success of issue #1189.)
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(auth_post_json(
+                    &format!("/api/tasks/{}/decisions", task.id),
+                    serde_json::json!({ "description": "d", "rationale": "r" }),
+                ))
+                .await
+                .unwrap();
+            ids.push(
+                resp_json(resp).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            );
+        }
+        let (new_id, old_id) = (ids[0], ids[1]);
+        let new_status_before = graph.get_decision(new_id).await.unwrap().unwrap().status;
         let uri = format!("/api/decisions/{}/supersedes/{}", new_id, old_id);
         let resp = app
             .oneshot(
@@ -10978,6 +11012,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+        assert_eq!(
+            graph.get_decision(old_id).await.unwrap().unwrap().status,
+            crate::neo4j::models::DecisionStatus::Superseded
+        );
+        assert_eq!(
+            graph.get_decision(new_id).await.unwrap().unwrap().status,
+            new_status_before
+        );
     }
 
     // ----------------------------------------------------------------
@@ -13918,6 +13960,75 @@ pub(crate) mod tests {
             Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap())
         );
         assert_eq!(stored.estimated_minutes, Some(45));
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #1189 — a write that changes nothing does not answer success
+    // ----------------------------------------------------------------
+
+    /// A task in the mock store, with its id.
+    async fn seeded_task(graph: &crate::neo4j::mock::MockGraphStore) -> Uuid {
+        let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        task.id
+    }
+
+    async fn posted_id(app: &axum::Router, uri: &str, body: serde_json::Value) -> String {
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(uri, body))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "POST {uri}: {}", resp.status());
+        resp_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    /// PATCH /api/tasks/{id} writes the criteria and the files, and a step that
+    /// exists is still updated (the 404 above is not a blanket refusal).
+    #[tokio::test]
+    async fn patching_an_existing_task_and_step_still_writes() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{task_id}"),
+                serde_json::json!({
+                    "acceptance_criteria": ["The export is complete"],
+                    "affected_files": ["src/export.rs"],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.acceptance_criteria, vec!["The export is complete"]);
+        assert_eq!(stored.affected_files, vec!["src/export.rs"]);
+
+        let step_id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "first wording" }),
+        )
+        .await;
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/steps/{step_id}"),
+                serde_json::json!({ "description": "second wording", "status": "skipped" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let step = graph
+            .get_step(step_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.description, "second wording");
+        assert_eq!(step.status, crate::neo4j::models::StepStatus::Skipped);
     }
 }
 

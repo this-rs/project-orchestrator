@@ -748,27 +748,47 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Delete a task and all its related data (steps, decisions)
-    pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        // Delete all steps belonging to this task
+    /// Delete a task and all its related data (steps, decisions), and report
+    /// what went with it.
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion> {
+        // Delete all steps belonging to this task. The aggregation yields one
+        // row even when nothing matches, so the count is always read.
         let q = query(
             r#"
             MATCH (t:Task {id: $id})-[:HAS_STEP]->(s:Step)
-            DETACH DELETE s
+            WITH collect(DISTINCT s) AS steps
+            FOREACH (s IN steps | DETACH DELETE s)
+            RETURN size(steps) AS steps_deleted
             "#,
         )
         .param("id", task_id.to_string());
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        let steps_deleted = match result.next().await? {
+            Some(row) => row.get::<i64>("steps_deleted")?.max(0) as usize,
+            None => 0,
+        };
 
-        // Delete all decisions belonging to this task
+        // Delete all decisions belonging to this task; their ids are read
+        // before the delete, in the same statement.
         let q = query(
             r#"
             MATCH (t:Task {id: $id})-[:INFORMED_BY]->(d:Decision)
-            DETACH DELETE d
+            WITH collect(DISTINCT d) AS decisions
+            WITH decisions, [d IN decisions | d.id] AS ids
+            FOREACH (d IN decisions | DETACH DELETE d)
+            RETURN ids
             "#,
         )
         .param("id", task_id.to_string());
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        let deleted_decision_ids = match result.next().await? {
+            Some(row) => row
+                .get::<Vec<String>>("ids")?
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect(),
+            None => Vec::new(),
+        };
 
         // Delete the task itself
         let q = query(
@@ -780,7 +800,10 @@ impl Neo4jClient {
         .param("id", task_id.to_string());
         self.graph.run(q).await?;
 
-        Ok(())
+        Ok(crate::neo4j::models::TaskDeletion {
+            steps_deleted,
+            deleted_decision_ids,
+        })
     }
 
     /// Get the project that owns a task (via Plan←Task, Project←Plan chain).

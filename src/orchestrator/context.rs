@@ -437,20 +437,7 @@ impl ContextBuilder {
         if !context.steps.is_empty() {
             let mut s = String::new();
             for step in &context.steps {
-                let status = match step.status {
-                    StepStatus::Completed => "[x]",
-                    _ => "[ ]",
-                };
-                s.push_str(&format!(
-                    "{} {}. {} `[step_id: {}]`\n",
-                    status,
-                    step.order + 1,
-                    step.description,
-                    step.id
-                ));
-                if let Some(ref verification) = step.verification {
-                    s.push_str(&format!("   Verification: {}\n", verification));
-                }
+                s.push_str(&render_step(step));
             }
             builder = builder.with_steps(s);
         }
@@ -657,20 +644,7 @@ impl ContextBuilder {
         if !context.steps.is_empty() {
             prompt.push_str("## Steps\n");
             for step in &context.steps {
-                let status = match step.status {
-                    StepStatus::Completed => "[x]",
-                    _ => "[ ]",
-                };
-                prompt.push_str(&format!(
-                    "{} {}. {} `[step_id: {}]`\n",
-                    status,
-                    step.order + 1,
-                    step.description,
-                    step.id
-                ));
-                if let Some(ref verification) = step.verification {
-                    prompt.push_str(&format!("   Verification: {}\n", verification));
-                }
+                prompt.push_str(&render_step(step));
             }
             prompt.push('\n');
         }
@@ -977,6 +951,32 @@ pub struct PlanEnrichmentResult {
 // ============================================================================
 // Standalone utilities
 // ============================================================================
+
+/// One step of the task, as both prompt paths list it.
+///
+/// A skipped step used to be rendered `[ ]`, exactly like a pending one: the
+/// executing agent read it as work left to do and redid what had been ruled
+/// out (issue #1189). It keeps its line — the numbering and the `step_id` stay
+/// stable — with a mark of its own and the instruction spelled out.
+pub(crate) fn render_step(step: &crate::neo4j::models::StepNode) -> String {
+    let (mark, note) = match step.status {
+        StepStatus::Completed => ("[x]", ""),
+        StepStatus::Skipped => ("[-]", " — SKIPPED: ruled out, do not do it"),
+        StepStatus::Pending | StepStatus::InProgress => ("[ ]", ""),
+    };
+    let mut line = format!(
+        "{} {}. {}{} `[step_id: {}]`\n",
+        mark,
+        step.order + 1,
+        step.description,
+        note,
+        step.id
+    );
+    if let Some(ref verification) = step.verification {
+        line.push_str(&format!("   Verification: {}\n", verification));
+    }
+    line
+}
 
 /// Pre-read affected files and format them as markdown code blocks.
 ///
@@ -1758,6 +1758,51 @@ mod tests {
             assert!(prompt.contains("Test Task"));
             assert!(prompt.contains("## Acceptance Criteria"));
             assert!(prompt.contains("- [ ] Region is named for screen readers"));
+        }
+    }
+
+    #[test]
+    fn a_skipped_step_is_not_rendered_as_work_to_do() {
+        // Issue #1189: a skipped step was rendered `[ ]`, exactly like a pending
+        // one, so the executing agent redid what had been ruled out.
+        let step = |order: u32, description: &str, status: StepStatus| StepNode {
+            id: Uuid::new_v4(),
+            order,
+            description: description.to_string(),
+            status,
+            verification: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        };
+        let mut ctx = context_for(create_test_task());
+        ctx.steps = vec![
+            step(0, "Write the migration", StepStatus::Completed),
+            step(1, "Backfill the old rows", StepStatus::Skipped),
+            step(2, "Drop the column", StepStatus::Pending),
+        ];
+        let builder = mock_builder();
+
+        let plain = builder.generate_prompt(&ctx);
+        let enriched = builder.build_prompt_builder(&ctx).build();
+
+        for prompt in [&plain, &enriched] {
+            assert!(prompt.contains("[x] 1. Write the migration"), "{prompt}");
+            assert!(prompt.contains("[ ] 3. Drop the column"), "{prompt}");
+            let skipped = prompt
+                .lines()
+                .find(|l| l.contains("Backfill the old rows"))
+                .expect("the skipped step is still listed");
+            assert!(
+                !skipped.starts_with("[ ]"),
+                "a skipped step must not read as unchecked work: {skipped}"
+            );
+            assert!(
+                skipped.starts_with("[-]") && skipped.contains("SKIPPED"),
+                "a skipped step says so: {skipped}"
+            );
         }
     }
 
