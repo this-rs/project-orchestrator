@@ -594,27 +594,25 @@ pub struct ImpactAnalysis {
 /// "(and others)".
 const IMPACT_TARGET_MAX_LISTED: usize = 6;
 
-/// The file of the code graph an impact analysis is about.
+/// The file of the code graph an impact analysis is about. Used by BOTH
+/// `GET /api/code/impact` and `GET /api/code/impact/multi`, with the same rule.
 ///
-/// The graph stores absolute paths. A path that names no file used to go
-/// straight to the traversal, which found nothing and answered 200 with empty
-/// lists and `risk_level: low` — "no impact" for a file that was never looked
-/// at (issue #1189). The target is now resolved, in this order:
+/// The graph stores absolute paths. A target that names no file of the graph
+/// used to go straight to the traversal, which found nothing and answered 200
+/// with empty lists and `risk_level: low` — "no impact" for a file that was
+/// never looked at (issue #1189). The target is resolved, in this order:
 ///
 /// 1. `<project root>/<target>` when a project is given and the target is relative;
 /// 2. the target as written;
-/// 3. for a relative target, the one file of the graph (of the project, when
-///    given) whose path ends with `/<target>`.
+/// 3. for a relative target, the one file whose path ends with `/<target>`
+///    (of the project, when one is given; several are a 400 that lists them).
 ///
-/// With a project, a file found at step 1 or 2 must be CONTAINED by that
-/// project: the lookup by path is global, and with nested roots (`/r` and
-/// `/r/b`) the outer project's `<root>/b/src/lib.rs` is the inner project's file.
-/// Taking it would analyse another project's file with this project's scope and
-/// answer "no impact".
-///
-/// Several files at step 3 is a 400 that lists them; none is a 404. A path
-/// that has dependents is accepted even without a `File` node of its own, so a
-/// graph that answered before still answers.
+/// A file found at step 1 or 2 must be a `File` node of the graph. With a
+/// project, it must also be CONTAINED by that project (the `CONTAINS` relation):
+/// the lookup by path is global, and with nested roots (`/r` and `/r/b`) the
+/// outer project's `<root>/b/src/lib.rs` is the inner project's file. Taking it
+/// would analyse another project's file with this project's scope and answer
+/// "no impact". Otherwise the answer is a 404.
 async fn resolve_impact_file(
     neo4j: &dyn crate::neo4j::GraphStore,
     raw: &str,
@@ -629,16 +627,16 @@ async fn resolve_impact_file(
     }
     candidates.push(raw.to_string());
 
+    let mut outside_project = false;
     for candidate in &candidates {
         if neo4j.get_file(candidate).await?.is_none() {
             continue;
         }
-        let owned = match project_id {
-            Some(pid) => neo4j.project_contains_file(pid, candidate).await?,
-            None => true,
-        };
-        if owned {
-            return Ok(candidate.clone());
+        match project_id {
+            Some(pid) if !neo4j.project_contains_file(pid, candidate).await? => {
+                outside_project = true;
+            }
+            _ => return Ok(candidate.clone()),
         }
     }
 
@@ -646,8 +644,8 @@ async fn resolve_impact_file(
         let suffix = format!("/{}", raw.trim_start_matches("./"));
         // With a project, the filter is in the query: a LIMIT applied first would
         // let files of other projects with the same suffix hide the project's own
-        // (a false 404, or a false "ambiguous"). Without one, any two matches are
-        // already ambiguous, so a short page is enough.
+        // (a false 404, or a false "ambiguous"). Without one, the page is the
+        // same length either way; the store orders it by path, so it is stable.
         let mut matches: Vec<String> = match project_id {
             Some(pid) => {
                 neo4j
@@ -679,16 +677,12 @@ async fn resolve_impact_file(
         }
     }
 
-    for candidate in &candidates {
-        if !neo4j
-            .find_impacted_files(candidate, 1, project_id)
-            .await?
-            .is_empty()
-        {
-            return Ok(candidate.clone());
-        }
+    if outside_project {
+        return Err(AppError::NotFound(format!(
+            "file not found in graph for this project: '{raw}' is a file of the graph, but not of \
+             this project (it lies under another project's root, or belongs to another project)."
+        )));
     }
-
     Err(AppError::NotFound(format!(
         "file not found in graph: '{raw}' (looked up as {}). Pass an absolute path, or \
          project_slug with a path relative to the project root; sync the project if the file is new.",
@@ -1073,13 +1067,10 @@ pub async fn analyze_impact_v2(
     let project_id = project.id;
     let project_id_str = project_id.to_string();
 
-    // Resolve target path (relative → absolute)
-    let target = if !query.target.starts_with('/') {
-        let expanded = crate::expand_tilde(&project.root_path);
-        format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
-    } else {
-        query.target.clone()
-    };
+    // Resolve the target to a file of this project (the rule of `analyze_impact`):
+    // relative → absolute, a file the project does not contain is a 404.
+    let target =
+        resolve_impact_file(neo4j, &query.target, Some((project_id, &project.root_path))).await?;
 
     // Resolve analysis profile (built-in first, then Neo4j)
     let profile = if let Some(ref profile_ref) = query.profile {
@@ -6633,7 +6624,7 @@ mod tests {
             .unwrap();
         if shared {
             graph
-                .project_files
+                .file_contains
                 .write()
                 .await
                 .entry(outer.id)
@@ -6776,6 +6767,40 @@ mod tests {
             error.contains("/repo/app/src/lib.rs") && error.contains("/repo/other/src/lib.rs"),
             "{error}"
         );
+    }
+
+    /// The multi-signal endpoint follows the same rule as `analyze_impact`: a file
+    /// of the other nested project is a 404 for this project, not an analysis with
+    /// this project's scope (which answered "no impact" through this endpoint).
+    #[tokio::test]
+    async fn a_nested_projects_file_is_not_found_on_the_multi_endpoint() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact/multi?target=b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        let message = json["error"].as_str().unwrap();
+        assert!(message.contains("not of this project"), "{message}");
+    }
+
+    /// The same endpoint answers a file of its own project, with the absolute path.
+    #[tokio::test]
+    async fn the_multi_endpoint_finds_a_file_by_its_own_project() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact/multi?target=src/lib.rs&project_slug=inner",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs");
     }
 
     /// A file of the graph that nothing depends on is still a 200 with empty

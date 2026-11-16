@@ -297,6 +297,10 @@ pub struct MockGraphStore {
     pub plan_constraints: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_files: RwLock<HashMap<Uuid, Vec<String>>>,
+    /// The CONTAINS relation of files: written by `upsert_file` for the project a
+    /// file is written with, as Neo4j does. Membership reads use this, never the
+    /// `project_id` property of the file.
+    pub file_contains: RwLock<HashMap<Uuid, Vec<String>>>,
     /// `Project.paths_declared` — the marker `migrate file-paths --apply` sets
     /// (and `create_project` sets for a new project). Absent: canonical form.
     pub paths_declared: RwLock<HashMap<Uuid, bool>>,
@@ -583,6 +587,7 @@ impl MockGraphStore {
             plan_constraints: RwLock::new(HashMap::new()),
             project_plans: RwLock::new(HashMap::new()),
             project_files: RwLock::new(HashMap::new()),
+            file_contains: RwLock::new(HashMap::new()),
             paths_declared: RwLock::new(HashMap::new()),
             file_symbols: RwLock::new(HashMap::new()),
             file_signals: RwLock::new(HashMap::new()),
@@ -1016,6 +1021,34 @@ impl GraphStore for MockGraphStore {
 
 #[cfg(test)]
 mod tests {
+    /// Membership is the CONTAINS relation: a file whose `project_id` property names
+    /// a project, with no CONTAINS edge from it, is not contained by that project
+    /// (Neo4j answers the same). The earlier mock answered yes on the property.
+    #[tokio::test]
+    async fn a_project_property_without_a_contains_edge_is_not_membership() {
+        let store = MockGraphStore::new();
+        let project = Uuid::new_v4();
+        store.files.write().await.insert(
+            "/x/src/lib.rs".to_string(),
+            FileNode {
+                path: "/x/src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project),
+            },
+        );
+        assert!(!store
+            .project_contains_file(project, "/x/src/lib.rs")
+            .await
+            .unwrap());
+        assert!(store
+            .find_project_files_by_path_suffix(project, "/src/lib.rs", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     use super::*;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
@@ -7486,6 +7519,14 @@ impl CodeStore for MockGraphStore {
             .write()
             .await
             .insert(file.path.clone(), file.clone());
+        // As Neo4j: a file written with a project is CONTAINED by that project.
+        if let Some(project_id) = file.project_id {
+            let mut pf = self.file_contains.write().await;
+            let paths = pf.entry(project_id).or_default();
+            if !paths.contains(&file.path) {
+                paths.push(file.path.clone());
+            }
+        }
         Ok(())
     }
 
@@ -7525,23 +7566,18 @@ impl CodeStore for MockGraphStore {
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        // Membership is the CONTAINS relation (`file_contains`), not the
+        // `project_id` property of the file, as in Neo4j.
         let listed = self
-            .project_files
+            .file_contains
             .read()
             .await
             .get(&project_id)
             .cloned()
             .unwrap_or_default();
-        let mut out: Vec<String> = self
-            .files
-            .read()
-            .await
-            .values()
-            .filter(|f| {
-                f.path.ends_with(suffix)
-                    && (f.project_id == Some(project_id) || listed.contains(&f.path))
-            })
-            .map(|f| f.path.clone())
+        let mut out: Vec<String> = listed
+            .into_iter()
+            .filter(|path| path.ends_with(suffix))
             .collect();
         out.sort();
         out.truncate(limit);
@@ -7550,18 +7586,12 @@ impl CodeStore for MockGraphStore {
 
     async fn project_contains_file(&self, project_id: Uuid, path: &str) -> Result<bool> {
         let listed = self
-            .project_files
+            .file_contains
             .read()
             .await
             .get(&project_id)
             .is_some_and(|paths| paths.iter().any(|p| p == path));
-        let owned = self
-            .files
-            .read()
-            .await
-            .get(path)
-            .is_some_and(|f| f.project_id == Some(project_id));
-        Ok(listed || owned)
+        Ok(listed)
     }
 
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {

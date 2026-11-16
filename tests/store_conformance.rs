@@ -1068,6 +1068,45 @@ pub mod conformance {
         }
     }
 
+    /// Membership is the CONTAINS relation, not the project property, and the
+    /// suffix lookup over all projects is ordered by path before its limit (so the
+    /// answer is the same on every store). Issue #1189, review of 890609e6.
+    pub async fn check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path(
+        store: &dyn GraphStore,
+    ) {
+        let tag = Uuid::new_v4();
+        let suffix = format!("/{tag}/src/lib.rs");
+        let a = a_project("member-a");
+        let b = a_project("member-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+        let z_path = format!("conformance/z-{tag}{suffix}");
+        let a_path = format!("conformance/a-{tag}{suffix}");
+        store
+            .upsert_file(&a_file(&z_path, Some(a.id), "h"))
+            .await
+            .unwrap();
+        store
+            .upsert_file(&a_file(&a_path, Some(b.id), "h"))
+            .await
+            .unwrap();
+
+        // Each file is contained by the project it was written with, and by no other.
+        assert!(store.project_contains_file(a.id, &z_path).await.unwrap());
+        assert!(!store.project_contains_file(b.id, &z_path).await.unwrap());
+        assert!(store.project_contains_file(b.id, &a_path).await.unwrap());
+        assert!(!store.project_contains_file(a.id, &a_path).await.unwrap());
+
+        // Over all projects, the first page is the first paths in path order, not
+        // whichever the store happens to return first.
+        let first = store.find_files_by_path_suffix(&suffix, 1).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, a_path, "ordered by path before the limit");
+
+        store.delete_project(a.id, &a.name).await.unwrap();
+        store.delete_project(b.id, &b.name).await.unwrap();
+    }
+
     // ------------------------------------------------------------------
     // 7. Sorting of a filtered list.
     // ------------------------------------------------------------------
@@ -2356,6 +2395,7 @@ macro_rules! all_checks {
                 check_task_delete_reports_its_cascade,
                 check_empty_prompt_cache_reads_as_none,
                 check_project_scoped_suffix_lookup_filters_before_limit,
+                check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path,
                 check_sorting,
                 check_sorting_tie_break_paging,
                 check_pagination,

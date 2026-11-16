@@ -405,6 +405,7 @@ impl Neo4jClient {
             MATCH (f:File)
             WHERE f.path ENDS WITH $suffix
             RETURN f.path AS path, f.project_id AS project_id
+            ORDER BY f.path
             LIMIT $limit
             "#,
         )
