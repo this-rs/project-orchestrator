@@ -6922,10 +6922,9 @@ pub async fn get_plan_dependency_graph(
 
     // Batch-fetch enrichment data (counts + step details) for all tasks
     let task_ids: Vec<String> = tasks.iter().map(|t| t.id.to_string()).collect();
-    let enrichment = neo4j
-        .get_task_enrichment_data(&task_ids)
-        .await
-        .unwrap_or_default();
+    // A refusal must not become an empty enrichment: steps and counters at 0
+    // read as "nothing to do", which is a different answer from "cannot read".
+    let enrichment = neo4j.get_task_enrichment_data(&task_ids).await?;
 
     // Which of those sessions are actually running. This used to be read from
     // `cs.is_streaming` in Neo4j, a property nothing writes, so

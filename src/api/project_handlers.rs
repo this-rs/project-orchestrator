@@ -109,18 +109,18 @@ pub async fn list_projects(
 
     let mut responses = Vec::new();
     for project in &projects {
+        // A refusal must not become 0: 0 files and "cannot count" are two
+        // different answers, and the second one hides a hole in the portage.
         let file_count = state
             .orchestrator
             .neo4j()
             .count_project_files(project.id)
-            .await
-            .unwrap_or(0);
+            .await?;
         let plan_count = state
             .orchestrator
             .neo4j()
             .count_project_plans(project.id)
-            .await
-            .unwrap_or(0);
+            .await?;
 
         responses.push(ProjectResponse::from_node(
             project,
@@ -217,18 +217,17 @@ pub async fn get_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    // Same rule as the list route: a refusal is an error, not a 0.
     let file_count = state
         .orchestrator
         .neo4j()
         .count_project_files(project.id)
-        .await
-        .unwrap_or(0);
+        .await?;
     let plan_count = state
         .orchestrator
         .neo4j()
         .count_project_plans(project.id)
-        .await
-        .unwrap_or(0);
+        .await?;
 
     Ok(Json(ProjectResponse::from_node(
         &project,
@@ -944,6 +943,35 @@ mod tests {
                 .last_synced,
             None,
             "last_synced not set"
+        );
+    }
+
+    /// A count that cannot be read must not be displayed as 0. On obrain the file
+    /// domain refuses by name (`src/obrain/code.rs`), so `count_project_files`
+    /// answers a named refusal — and the list route must ANSWER IT, not render a
+    /// project with "0 files" that hides a hole in the portage.
+    ///
+    /// Red without the fix: the route returned 200 with `file_count == 0`.
+    #[cfg(feature = "obrain-backend")]
+    #[tokio::test]
+    async fn a_project_count_that_cannot_be_read_is_an_error_not_a_zero() {
+        let graph = Arc::new(crate::obrain::ObrainGraphStore::open_temporary().unwrap());
+        let mut app = crate::test_helpers::mock_app_state();
+        app.neo4j = graph.clone();
+        let project = crate::test_helpers::test_project_named("obrain counts");
+        graph.create_project(&project).await.unwrap();
+        let state = crate::api::handlers::tests::mock_server_state_from(app).await;
+
+        let answer = list_projects(State(state), Query(ProjectsListQuery::default())).await;
+        let Err(AppError::Internal(err)) = answer else {
+            panic!("un comptage refusé doit être une erreur, jamais 0");
+        };
+        assert_eq!(
+            err.chain()
+                .find_map(|c| c.downcast_ref::<crate::obrain::NonPorte>())
+                .copied(),
+            Some(crate::obrain::NonPorte("CodeStore::count_project_files")),
+            "le refus est nommé : {err:#}"
         );
     }
 
