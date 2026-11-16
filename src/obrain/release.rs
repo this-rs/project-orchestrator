@@ -427,9 +427,7 @@ fn texte_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<String> {
 }
 
 fn instant_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<DateTime<Utc>> {
-    let brut = chaine_pleine(get, cle).ok_or_else(|| anyhow!("{de} sans `{cle}`"))?;
-    brut.parse::<DateTime<Utc>>()
-        .with_context(|| format!("{de} : `{cle}` illisible (« {brut} »)"))
+    super::date_propriete(get, cle)?.ok_or_else(|| anyhow!("{de} sans `{cle}`"))
 }
 
 /// A `status` stored as snake_case (or PascalCase, from an older writer). Absent

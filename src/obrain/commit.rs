@@ -230,9 +230,8 @@ fn lire_commit(get: &dyn Fn(&str) -> Option<Value>) -> Result<CommitNode> {
         |cle: &str| chaine(cle).ok_or_else(|| anyhow!("commit {hash} sans propriété `{cle}`"));
     let message = requise("message")?;
     let author = requise("author")?;
-    let timestamp = requise("timestamp")?
-        .parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("commit {hash} : `timestamp` illisible : {e}"))?;
+    let timestamp = super::date_propriete(get, "timestamp")?
+        .ok_or_else(|| anyhow!("commit {hash} sans propriété `timestamp`"))?;
     Ok(CommitNode {
         hash,
         message,

@@ -99,9 +99,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -377,10 +376,8 @@ fn texte_requis(get: Lecture<'_>, cle: &str) -> Result<String> {
 
 fn lire_fichier(get: Lecture<'_>) -> Result<FileNode> {
     let path = texte_requis(get, "path")?;
-    let brut = texte_requis(get, "last_parsed")?;
-    let last_parsed = brut
-        .parse::<DateTime<Utc>>()
-        .with_context(|| format!("File {path} : `last_parsed` illisible (« {brut} »)"))?;
+    let last_parsed = super::date_propriete(get, "last_parsed")?
+        .ok_or_else(|| anyhow!("File {path} sans propriété `last_parsed`"))?;
     Ok(FileNode {
         language: texte_requis(get, "language")?,
         hash: texte_requis(get, "hash")?,

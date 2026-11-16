@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat};
 use obrain_common::types::{NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -166,11 +166,8 @@ fn lire_evenement(get: &dyn Fn(&str) -> Option<Value>) -> Result<SharingEvent> {
         .ok_or_else(|| anyhow!("nœud SharingEvent sans `id`"))?;
     let quoi = format!("événement {id}");
     let texte = |cle: &str| -> Result<String> { Ok(chaine(get, &quoi, cle)?.unwrap_or_default()) };
-    let brut =
-        chaine(get, &quoi, "timestamp")?.ok_or_else(|| anyhow!("{quoi} sans `timestamp`"))?;
-    let timestamp = brut
-        .parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("{quoi} : `timestamp` illisible ({brut}) : {e}"))?;
+    let timestamp = super::date_propriete(get, "timestamp")?
+        .ok_or_else(|| anyhow!("{quoi} sans `timestamp`"))?;
     let consent: SharingConsent = enumere(get, &quoi, "consent")?;
     let privacy_mode: PrivacyMode = enumere(get, &quoi, "privacy_mode")?;
     Ok(SharingEvent {
@@ -618,6 +615,7 @@ impl SharingStore for ObrainGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn depuis(props: Vec<(&'static str, Value)>) -> impl Fn(&str) -> Option<Value> {
         move |cle: &str| {

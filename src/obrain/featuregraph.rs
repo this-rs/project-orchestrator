@@ -149,11 +149,11 @@ fn lire_graphe(get: &dyn Fn(&str) -> Option<Value>) -> Result<FeatureGraphNode> 
     let requise = |cle: &str| {
         chaine(cle).ok_or_else(|| anyhow!("graphe de fonctionnalité {id} sans propriété `{cle}`"))
     };
+    // The three stored shapes (ISO string, Timestamp, ZonedDatetime): the
+    // migrator writes `ZonedDatetime`, which a string-only read could not see.
     let instant = |cle: &str| -> Result<DateTime<Utc>> {
-        let brut = requise(cle)?;
-        brut.parse().map_err(|e| {
-            anyhow!("graphe de fonctionnalité {id} : `{cle}` illisible (« {brut} ») : {e}")
-        })
+        super::date_propriete(get, cle)?
+            .ok_or_else(|| anyhow!("graphe de fonctionnalité {id} sans propriété `{cle}`"))
     };
     let project_id: Uuid = requise("project_id")?
         .parse()

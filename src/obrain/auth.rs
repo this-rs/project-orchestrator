@@ -137,9 +137,10 @@ fn requis(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<String> {
 }
 
 fn instant(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<DateTime<Utc>> {
-    let s = requis(get, cle)?;
-    s.parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("`{cle}` illisible : {e}"))
+    // The three stored shapes, not the string only: a token whose date cannot be
+    // read is an error, so the node is quarantined by name.
+    super::date_propriete(get, cle)?
+        .ok_or_else(|| anyhow!("nœud d'authentification sans propriété `{cle}` lisible"))
 }
 
 /// A boolean that must be one. Absent or of another type (`"true"`, `1`) is an

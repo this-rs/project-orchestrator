@@ -257,13 +257,8 @@ impl IndexFederation {
     }
 }
 
-fn instant(brut: Option<String>, cle: &str) -> Result<Option<DateTime<Utc>>> {
-    brut.filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"))
-        })
-        .transpose()
+fn instant(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<Option<DateTime<Utc>>> {
+    super::date_propriete(get, cle)
 }
 
 /// A `McpServer` from a property lookup: the counterpart of
@@ -285,8 +280,8 @@ fn lire_serveur(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpServerNode> {
         .map_err(|e| anyhow!("serveur MCP {id} : `project_id` illisible : {e}"))?;
     let server_id =
         texte("server_id").ok_or_else(|| anyhow!("serveur MCP {id} sans `server_id`"))?;
-    let created_at = instant(texte("created_at"), "created_at")?
-        .ok_or_else(|| anyhow!("serveur MCP {id} sans `created_at`"))?;
+    let created_at =
+        instant(get, "created_at")?.ok_or_else(|| anyhow!("serveur MCP {id} sans `created_at`"))?;
 
     Ok(McpServerNode {
         id,
@@ -307,10 +302,8 @@ fn lire_serveur(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpServerNode> {
             .max(0) as usize,
         created_at,
         // Optional: unreadable reads as absent, as Neo4j's `.ok()` (module doc).
-        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
-        last_connected_at: instant(texte("last_connected_at"), "last_connected_at")
-            .ok()
-            .flatten(),
+        updated_at: instant(get, "updated_at").ok().flatten(),
+        last_connected_at: instant(get, "last_connected_at").ok().flatten(),
     })
 }
 
@@ -325,8 +318,8 @@ fn lire_outil(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpToolNode> {
     let server_id = texte("server_id").ok_or_else(|| anyhow!("outil MCP {id} sans `server_id`"))?;
     let name = texte("name").ok_or_else(|| anyhow!("outil MCP {id} sans `name`"))?;
     let fqn = texte("fqn").ok_or_else(|| anyhow!("outil MCP {id} sans `fqn`"))?;
-    let created_at = instant(texte("created_at"), "created_at")?
-        .ok_or_else(|| anyhow!("outil MCP {id} sans `created_at`"))?;
+    let created_at =
+        instant(get, "created_at")?.ok_or_else(|| anyhow!("outil MCP {id} sans `created_at`"))?;
 
     Ok(McpToolNode {
         id,
@@ -338,7 +331,7 @@ fn lire_outil(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpToolNode> {
         category: texte("category").unwrap_or_else(|| "unknown".to_string()),
         embedding: texte("embedding").filter(|s| !s.is_empty()),
         created_at,
-        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
+        updated_at: instant(get, "updated_at").ok().flatten(),
     })
 }
 

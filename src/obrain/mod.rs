@@ -221,10 +221,16 @@ pub(crate) fn date_propriete(
     get: &dyn Fn(&str) -> Option<Value>,
     cle: &str,
 ) -> Result<Option<DateTime<Utc>>> {
-    let Some(v) = get(cle) else {
-        return Ok(None);
-    };
-    let micros = match &v {
+    match get(cle) {
+        Some(v) => date_valeur(&v, cle),
+        None => Ok(None),
+    }
+}
+
+/// The value-level half of [`date_propriete`], for the callers that already hold
+/// the `Value` (an open-time index scan, for instance).
+pub(crate) fn date_valeur(v: &Value, cle: &str) -> Result<Option<DateTime<Utc>>> {
+    let micros = match v {
         Value::Null => return Ok(None),
         Value::String(s) => {
             return s

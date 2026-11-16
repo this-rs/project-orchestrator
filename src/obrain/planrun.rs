@@ -553,8 +553,8 @@ impl IndexExecutions {
             let Some(v) = n.get_property(MARQUE).filter(|v| !matches!(v, Value::Null)) else {
                 continue;
             };
-            let marque = match v.as_str().map(|s| s.parse::<DateTime<Utc>>()) {
-                Some(Ok(d)) => Marque::Lue(entree.noeud, d),
+            let marque = match super::date_valeur(v, MARQUE) {
+                Ok(Some(d)) => Marque::Lue(entree.noeud, d),
                 _ => {
                     let raison = format!("plan {id} : `{MARQUE}` illisible ({v:?})");
                     rapport

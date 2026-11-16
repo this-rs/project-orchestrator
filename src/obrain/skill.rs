@@ -168,12 +168,7 @@ impl Lecture<'_> {
     }
 
     fn instant(&self, cle: &str) -> Result<Option<DateTime<Utc>>> {
-        self.chaine(cle)?
-            .map(|s| {
-                s.parse::<DateTime<Utc>>()
-                    .map_err(|e| anyhow!("{} : `{cle}` illisible ({s}) : {e}", self.quoi))
-            })
-            .transpose()
+        super::date_propriete(self.get, cle)
     }
 
     fn entier(&self, cle: &str) -> Result<Option<i64>> {
