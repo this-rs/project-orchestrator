@@ -219,7 +219,17 @@ pub fn refusees_sharing() -> &'static [&'static str] {
 /// waves, and the enrichment.
 /// (`plan.rs`; the causes of the task-side ones are in `task::REFUS`).
 pub fn refusees_plan() -> &'static [&'static str] {
-    plan::REFUSEES
+    // COMPOSED, never duplicated. `task::REFUS` is where the four task-and-step
+    // refusals are declared with their cause, `plan::REFUSEES` holds the
+    // plan-level ones. This account was emptied once while four methods still
+    // refused (`assign_task`, `analyze_task_impact`, the two enrichments): a
+    // hand-kept second list cannot be right, so it is derived now.
+    static COMPLET: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    COMPLET.get_or_init(|| {
+        let mut liste: Vec<&'static str> = plan::REFUSEES.to_vec();
+        liste.extend(task::REFUS.iter().map(|(m, _)| *m));
+        liste
+    })
 }
 
 /// The methods of `ProtocolRunStore` refused by name (the runs' links to notes,

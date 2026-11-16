@@ -110,8 +110,11 @@ const LABEL: &str = "Plan";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 
-/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`.
-/// Now empty: tasks, steps, constraints and links are all ported.
+/// The PLAN-level methods of `PlanStore` refused on every call, as
+/// `PlanStore::<method>`. The task-and-step refusals are not repeated here:
+/// they are declared with their cause in `task::REFUS`, and `refusees_plan()`
+/// composes the two (a hand-kept duplicate is what emptied this account while
+/// four methods still refused).
 pub const REFUSEES: &[&str] = &[];
 
 /// The Neo4j spelling of a status: the Rust variant name.

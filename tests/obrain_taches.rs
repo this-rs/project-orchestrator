@@ -396,12 +396,35 @@ async fn an_unreadable_task_is_quarantined_and_its_plan_refuses_a_partial_answer
         );
         db.create_edge(p, t, "HAS_TASK");
         // A decision informing a task: a domain whose task side is not ported.
-        let d = db.create_node_with_props(&["Decision"], vec![("id", Value::from("x"))]);
+        // A READABLE decision: its `id` must parse as a uuid, or the decision
+        // index quarantines it and this test counts two quarantines instead of
+        // the one it is about (the unreadable task).
+        // A READABLE decision: `id` must parse as a uuid, and `description` and
+        // `rationale` are decoded as required. Anything less and the decision
+        // index quarantines it, so this test counts two quarantines instead of
+        // the one it is about (the unreadable task).
+        let decision_id = Uuid::new_v4().to_string();
+        let d = db.create_node_with_props(
+            &["Decision"],
+            vec![
+                ("id", Value::from(decision_id.clone())),
+                ("description", Value::from("conformance decision")),
+                (
+                    "rationale",
+                    Value::from("the task side of INFORMED_BY is not ported"),
+                ),
+            ],
+        );
         db.create_edge(trouver("Task", cible), d, "INFORMED_BY");
     })
     .await;
     let store = open(&base).await;
-    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    assert_eq!(
+        store.rapport_d_ouverture().en_quarantaine.len(),
+        1,
+        "quarantaines : {:?}",
+        store.rapport_d_ouverture().en_quarantaine
+    );
     assert!(store.get_task(illisible).await.is_err());
     assert!(store.get_task(saine.id).await.unwrap().is_some());
     let err = store.get_plan_tasks(plan.id).await.unwrap_err();
@@ -486,13 +509,16 @@ async fn the_task_methods_still_refused_are_named_with_their_cause() {
     }
 }
 
-/// A value above the 256-byte threshold goes to obrain's blob column, which the WAL
-/// does not recover at this pin: every task and step write that carries one, or
-/// that replaces or removes one, pays the full flush before it is acknowledged.
+/// A value above the 256-byte threshold goes to obrain's blob column. It used to
+/// cost a FULL FLUSH per write, because that column was not recovered from the
+/// WAL; obrain #172/#175 fixed the recovery, and the `flush_complet` workaround
+/// was removed with it. The contract now is the opposite of what this test used
+/// to assert: a blob-sized value is acknowledged WITHOUT paying more fsyncs than
+/// an inline one, whether it is created, replaced or removed.
 /// Observed through the engine's own fsync counter, without any `close()` (which
 /// flushes everything, and so proves nothing here), as the project test does.
 #[tokio::test]
-async fn every_task_and_step_write_carrying_a_blob_sized_value_pays_the_full_flush() {
+async fn a_blob_sized_value_is_acknowledged_without_a_full_flush() {
     let store = tokio::task::spawn_blocking(ObrainGraphStore::open_temporary)
         .await
         .unwrap()
@@ -511,11 +537,14 @@ async fn every_task_and_step_write_carrying_a_blob_sized_value_pays_the_full_flu
             fsyncs() - t0
         }};
     }
+    // The point of #172/#175: the blob goes through the WAL like any other
+    // value, so a blob-sized write costs the same fsyncs as an inline one.
     let verifier = |quoi: &str, petit: u64, grand: u64| {
         assert!(petit >= 1, "{quoi}: the WAL fsync ran");
         assert!(
-            grand > petit,
-            "{quoi}: {grand} fsyncs against {petit}, no full flush"
+            grand <= petit,
+            "{quoi}: {grand} fsyncs against {petit} — a blob-sized value paid a \
+             full flush, which #172/#175 removed"
         );
     };
 
