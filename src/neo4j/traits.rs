@@ -508,6 +508,20 @@ pub trait CodeStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Paths of the files of ONE project whose path ends with `suffix` (at most
+    /// `limit`, in path order). The project filter is part of the query: applied
+    /// after a `LIMIT`, files of other projects with the same suffix could fill
+    /// the page and hide the project's own (issue #1189).
+    /// Defaults to no match for stores without file storage.
+    async fn find_project_files_by_path_suffix(
+        &self,
+        _project_id: Uuid,
+        _suffix: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// List files for a project
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
 

@@ -7519,6 +7519,25 @@ impl CodeStore for MockGraphStore {
         Ok(out)
     }
 
+    async fn find_project_files_by_path_suffix(
+        &self,
+        project_id: Uuid,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .files
+            .read()
+            .await
+            .values()
+            .filter(|f| f.path.ends_with(suffix) && f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+        out.sort();
+        out.truncate(limit);
+        Ok(out)
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         let pf = self.project_files.read().await;
         let files = self.files.read().await;

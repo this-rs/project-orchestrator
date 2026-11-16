@@ -629,13 +629,23 @@ async fn resolve_impact_file(
     let project_id = project.map(|(id, _)| id);
     if relative {
         let suffix = format!("/{}", raw.trim_start_matches("./"));
-        let mut matches: Vec<String> = neo4j
-            .find_files_by_path_suffix(&suffix, IMPACT_TARGET_CANDIDATES + 1)
-            .await?
-            .into_iter()
-            .filter(|(_, owner)| project_id.is_none() || *owner == project_id)
-            .map(|(path, _)| path)
-            .collect();
+        // With a project, the filter is in the query: a LIMIT applied first would
+        // let files of other projects with the same suffix hide the project's own
+        // (a false 404, or a false "ambiguous"). Without one, any two matches are
+        // already ambiguous, so a short page is enough.
+        let mut matches: Vec<String> = match project_id {
+            Some(pid) => {
+                neo4j
+                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_CANDIDATES + 1)
+                    .await?
+            }
+            None => neo4j
+                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_CANDIDATES + 1)
+                .await?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect(),
+        };
         matches.sort();
         matches.dedup();
         match matches.len() {
@@ -6426,6 +6436,105 @@ mod tests {
             serde_json::json!(["/repo/app/src/handler.rs"])
         );
         assert_eq!(json["caller_count"], 1);
+    }
+
+    /// A project and files named `src/lib.rs` in `others` other projects. The
+    /// project's own files sort AFTER the others'.
+    async fn impact_app_with_a_project_among_others(
+        own_files: &[&str],
+        others: usize,
+    ) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::test_helpers::mock_app_state_with;
+
+        let project = |slug: &str| ProjectNode {
+            id: uuid::Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            root_path: format!("/nowhere/{slug}"),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        };
+        let file = |path: String, project_id: uuid::Uuid| FileNode {
+            path,
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project_id),
+        };
+        let graph = MockGraphStore::new();
+        let wanted = project("wanted");
+        graph.create_project(&wanted).await.unwrap();
+        for i in 0..others {
+            let other = project(&format!("other{i}"));
+            graph.create_project(&other).await.unwrap();
+            graph
+                .upsert_file(&file(format!("/repo/a{i}/src/lib.rs"), other.id))
+                .await
+                .unwrap();
+        }
+        for path in own_files {
+            graph
+                .upsert_file(&file((*path).to_string(), wanted.id))
+                .await
+                .unwrap();
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    /// The project filter comes before the page limit: seven other projects own
+    /// a `src/lib.rs` that sorts first, and the wanted project's is still found
+    /// (it used to be a false 404).
+    #[tokio::test]
+    async fn a_relative_impact_target_is_found_among_other_projects_files_of_the_same_suffix() {
+        let app = impact_app_with_a_project_among_others(&["/repo/zz/src/lib.rs"], 7).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=wanted",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/zz/src/lib.rs");
+    }
+
+    /// An ambiguity inside the project lists the project's files only, not those
+    /// of the other projects that fill the first page (it used to be a false 404).
+    #[tokio::test]
+    async fn an_ambiguity_inside_a_project_lists_only_its_own_files() {
+        let app = impact_app_with_a_project_among_others(
+            &["/repo/zy/src/lib.rs", "/repo/zz/src/lib.rs"],
+            7,
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=wanted",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/zy/src/lib.rs") && error.contains("/repo/zz/src/lib.rs"),
+            "{error}"
+        );
+        assert!(!error.contains("/repo/a0/"), "{error}");
     }
 
     /// A suffix is matched on a path boundary: `lib.rs` is not `mylib.rs`.

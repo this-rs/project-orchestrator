@@ -1007,6 +1007,56 @@ pub mod conformance {
         store.delete_project(p.id, &p.name).await.unwrap();
     }
 
+    /// The project filter of `find_project_files_by_path_suffix` comes before the
+    /// limit: files of seven other projects with the same suffix, sorting first,
+    /// do not hide the wanted project's own (issue #1189), and another project
+    /// does not see them.
+    pub async fn check_project_scoped_suffix_lookup_filters_before_limit(store: &dyn GraphStore) {
+        let tag = Uuid::new_v4();
+        let suffix = format!("/{tag}/src/lib.rs");
+        let wanted = a_project("suffix-wanted");
+        store.create_project(&wanted).await.unwrap();
+        let mut projects = vec![wanted.clone()];
+        for i in 0..7 {
+            let other = a_project(&format!("suffix-other{i}"));
+            store.create_project(&other).await.unwrap();
+            store
+                .upsert_file(&a_file(
+                    &format!("conformance/a{i}{suffix}"),
+                    Some(other.id),
+                    "h",
+                ))
+                .await
+                .unwrap();
+            projects.push(other);
+        }
+        let wanted_path = format!("conformance/z-wanted{suffix}");
+        store
+            .upsert_file(&a_file(&wanted_path, Some(wanted.id), "h"))
+            .await
+            .unwrap();
+
+        let found = store
+            .find_project_files_by_path_suffix(wanted.id, &suffix, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![wanted_path.clone()],
+            "filtered before the limit"
+        );
+
+        let seen_by_another = store
+            .find_project_files_by_path_suffix(projects[1].id, &suffix, 2)
+            .await
+            .unwrap();
+        assert_eq!(seen_by_another, vec![format!("conformance/a0{suffix}")]);
+
+        for p in &projects {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
     // ------------------------------------------------------------------
     // 7. Sorting of a filtered list.
     // ------------------------------------------------------------------
@@ -2294,6 +2344,7 @@ macro_rules! all_checks {
                 check_cascade_delete_project,
                 check_task_delete_reports_its_cascade,
                 check_empty_prompt_cache_reads_as_none,
+                check_project_scoped_suffix_lookup_filters_before_limit,
                 check_sorting,
                 check_sorting_tie_break_paging,
                 check_pagination,

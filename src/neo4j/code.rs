@@ -424,6 +424,36 @@ impl Neo4jClient {
         Ok(out)
     }
 
+    /// Paths of the files of one project whose path ends with `suffix`, in path
+    /// order, at most `limit`. The project filter is in the query, before the
+    /// `LIMIT`: see [`GraphStore::find_project_files_by_path_suffix`].
+    pub async fn find_project_files_by_path_suffix(
+        &self,
+        project_id: Uuid,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.path ENDS WITH $suffix AND f.project_id = $project_id
+            RETURN f.path AS path
+            ORDER BY f.path
+            LIMIT $limit
+            "#,
+        )
+        .param("suffix", suffix.to_string())
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            out.push(row.get::<String>("path")?);
+        }
+        Ok(out)
+    }
+
     /// List files for a project
     pub async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         let q = query(

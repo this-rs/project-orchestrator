@@ -465,6 +465,16 @@ impl CodeStore for Neo4jClient {
         self.find_files_by_path_suffix(suffix, limit).await
     }
 
+    async fn find_project_files_by_path_suffix(
+        &self,
+        project_id: Uuid,
+        suffix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        self.find_project_files_by_path_suffix(project_id, suffix, limit)
+            .await
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> anyhow::Result<Vec<FileNode>> {
         self.list_project_files(project_id).await
     }

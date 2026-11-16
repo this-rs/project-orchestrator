@@ -14270,6 +14270,30 @@ pub(crate) mod tests {
         assert!(graph.get_task(task_id).await.unwrap().is_none());
     }
 
+    /// Pinned, not endorsed: through REST a decision may be superseded by itself
+    /// (204), while the MCP `decision supersede` refuses it (`supersede_self`).
+    /// Aligning REST would be one more contract change.
+    #[tokio::test]
+    async fn superseding_a_decision_with_itself_through_rest_is_still_accepted() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/decisions"),
+            serde_json::json!({ "description": "d", "rationale": "r" }),
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/decisions/{id}/supersedes/{id}"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
     /// POST /api/decisions/{new}/supersedes/{old} with an id that names no
     /// decision used to answer 204 and mark nothing.
     #[tokio::test]

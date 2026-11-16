@@ -2243,8 +2243,15 @@ impl ToolHandler {
                     .await?;
                 Ok(Some(if result.is_null() {
                     // Which one changed is part of the answer: a bare "ok" is
-                    // what let the inverted binding go unnoticed.
-                    json!({"status": "ok", "superseded": old_id, "superseded_by": new_id})
+                    // what let the inverted binding go unnoticed. `marked_superseded`
+                    // is the key the additive PR already answered with; `superseded`
+                    // says the same thing and is kept alongside it.
+                    json!({
+                        "status": "ok",
+                        "marked_superseded": old_id,
+                        "superseded": old_id,
+                        "superseded_by": new_id,
+                    })
                 } else {
                     result
                 }))
@@ -7994,6 +8001,119 @@ mod tests {
             json!(["acceptance_criteria", "affected_files"])
         );
         assert!(result.get("rejected_fields").is_none(), "{result}");
+    }
+
+    /// `decision supersede` against the real API: the answer names the decision
+    /// that was marked under `marked_superseded` (the key the additive PR already
+    /// answered with) and under `superseded`, and what it names is what changed.
+    #[tokio::test]
+    async fn supersede_answers_with_the_decision_marked_under_both_keys() {
+        use crate::neo4j::models::{DecisionNode, DecisionStatus};
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let decision = |label: &str| DecisionNode {
+            id: uuid::Uuid::new_v4(),
+            description: format!("decision {label}"),
+            rationale: "r".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "test".to_string(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let (old, new) = (decision("old"), decision("new"));
+        graph.create_decision(task_id, &old).await.unwrap();
+        graph.create_decision(task_id, &new).await.unwrap();
+
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": old.id.to_string(),
+                    "superseded_by_id": new.id.to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["marked_superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded_by"], new.id.to_string(), "{result}");
+        let old_after = graph.get_decision(old.id).await.unwrap().unwrap();
+        let new_after = graph.get_decision(new.id).await.unwrap().unwrap();
+        assert_eq!(old_after.status, DecisionStatus::Superseded);
+        assert_eq!(new_after.status, DecisionStatus::Accepted);
+    }
+
+    /// The keys `task update` and `step update` now refuse are the published
+    /// parameters of the tool that the update does not write: they used to be
+    /// ignored. The list is the one in the PR description; a new published
+    /// parameter changes it, and this test says so.
+    #[tokio::test]
+    async fn task_and_step_update_refuse_exactly_the_published_keys_they_do_not_write() {
+        let (handler, _) = make_http_handler().await;
+        let tools = crate::mcp::tools::all_tools();
+        let cases: [(&str, &str, &[&str]); 2] = [
+            (
+                "task",
+                "task_id",
+                &[
+                    "custom_sections",
+                    "dependency_id",
+                    "dependency_ids",
+                    "depends_on",
+                    "limit",
+                    "offset",
+                    "plan_id",
+                    "priority_max",
+                    "priority_min",
+                    "project_id",
+                    "sort_by",
+                    "sort_order",
+                    "steps",
+                    "workspace_slug",
+                ],
+            ),
+            ("step", "step_id", &["task_id"]),
+        ];
+        for (tool, id_key, expected) in cases {
+            let definition = tools
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("{tool} is published"));
+            let mut args = serde_json::Map::new();
+            for key in definition
+                .input_schema
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .expect("published properties")
+                .keys()
+            {
+                args.insert(key.clone(), json!("x"));
+            }
+            args.insert("action".to_string(), json!("update"));
+            args.insert(id_key.to_string(), json!(UUID1));
+
+            let err = handler
+                .handle(tool, Some(Value::Object(args)))
+                .await
+                .expect_err("keys the update does not write are refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "cannot write {} — nothing was changed",
+                    expected.join(", ")
+                )),
+                "{tool}: {msg}"
+            );
+        }
     }
 
     /// A list refused by name and nothing else: nothing was written, so the
