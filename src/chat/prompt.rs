@@ -764,7 +764,7 @@ Manage steps within tasks.
 |--------|---------------|-------------|
 | list | `task_id` (req) | List steps for task |
 | create | `task_id` (req), `description` (req), `verification` | Create a step |
-| update | `step_id` (req), `status` (pending/in_progress/completed/skipped), `description`, `verification` | Update a step; an unknown `step_id` is an error |
+| update | `step_id` (req), `status` (pending/in_progress/completed/skipped), `description`, `verification` | Update a step. An unknown `step_id` is an error (404). A published parameter it does not write (`task_id`) is refused (`unsupported_fields`). An update that writes nothing is refused (`empty_update`); a key the tool does not publish is ignored |
 | get | `step_id` (req) | Get step by UUID |
 | delete | `step_id` (req) | Delete a step |
 | get_progress | `task_id` (req) | Get step completion progress |

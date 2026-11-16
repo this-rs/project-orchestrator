@@ -116,7 +116,7 @@ Manage steps (sub-tasks) within tasks.
 |--------|-------------|----------------|
 | `list` | List steps for a task | `task_id` |
 | `create` | Add step to task | `task_id`, `description`, `verification` |
-| `update` | Update a step; an unknown `step_id` is an error | `step_id`, `status` (pending/in_progress/completed/skipped), `description`, `verification` |
+| `update` | Update a step. An unknown `step_id` is an error (404). A published parameter it does not write (`task_id`) is refused (`unsupported_fields`). An update that writes nothing is refused (`empty_update`); a key the tool does not publish is ignored | `step_id`, `status` (pending/in_progress/completed/skipped), `description`, `verification` |
 | `get` | Get step by ID | `step_id` |
 | `delete` | Delete step | `step_id` |
 | `get_progress` | Step completion progress | `task_id` |

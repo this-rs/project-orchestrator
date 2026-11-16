@@ -589,8 +589,9 @@ pub struct ImpactAnalysis {
     pub confidence: Option<crate::graph::confidence::ConfidenceScore>,
 }
 
-/// How many candidates an ambiguous relative target is answered with.
-const IMPACT_TARGET_CANDIDATES: usize = 5;
+/// Upper bound of the files listed when a relative target is ambiguous: the
+/// query fetches at most this many, so the answer lists at most this many.
+const IMPACT_TARGET_MAX_LISTED: usize = 6;
 
 /// The file of the code graph an impact analysis is about.
 ///
@@ -636,11 +637,11 @@ async fn resolve_impact_file(
         let mut matches: Vec<String> = match project_id {
             Some(pid) => {
                 neo4j
-                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_CANDIDATES + 1)
+                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_MAX_LISTED)
                     .await?
             }
             None => neo4j
-                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_CANDIDATES + 1)
+                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_MAX_LISTED)
                 .await?
                 .into_iter()
                 .map(|(path, _)| path)
