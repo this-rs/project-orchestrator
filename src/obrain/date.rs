@@ -11,22 +11,25 @@
 //!
 //! Reading by `Value::as_str()` only answered for the first: on a migrated base
 //! every node whose `created_at` was required was quarantined, and an optional
-//! date read as absent — or as "now".
+//! date read as absent, or as "now", without a word.
 //!
-//! The rules, the same for every domain:
+//! Two kinds of property, two rules:
 //!
-//! - ABSENT (no property, or null) is `None` for an optional date and an error
-//!   for a required one;
-//! - the EMPTY STRING is absent for an optional date (the repo convention: `""`
-//!   means "none"), and unreadable for a required one;
-//! - PRESENT but not a date (another variant, or a string that does not parse) is
-//!   an error that NAMES the property and the variant received. It is never read
-//!   as absent, and never replaced by `Utc::now()`: the caller quarantines the
-//!   node (or refuses the read).
+//! - an OPTIONAL date (`facultative`): absent, null or the empty string is `None`.
+//!   A value that does not read as a date is read ABSENT, as the readers always
+//!   did, and a warning names the property, the entity and what was found — so
+//!   the node is still served, and nothing is lost without a trace;
+//! - a REQUIRED date (`requise`, `ou_maintenant_si_absente`): absent is an error
+//!   (or, where the Neo4j adapter defaults an absent property to "now", that
+//!   default — and ONLY for an absent property), and a value present that does
+//!   not read as a date is an error that NAMES the property, the entity and the
+//!   variant received. The caller quarantines the node: a stored date is never
+//!   replaced by "now", and the node is never served with a date it does not have.
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use obrain_common::types::Value;
+use tracing::warn;
 
 /// A property lookup: `None` for an absent property (the lookups of this backend
 /// also answer `None` for a null).
@@ -55,7 +58,56 @@ fn illisible(quoi: &str, cle: &str, pourquoi: String) -> anyhow::Error {
     anyhow!("{quoi} : `{cle}` illisible : {pourquoi}")
 }
 
-/// An optional date already looked up (a node or an EDGE property).
+/// A REQUIRED date: absent is an error, and so is a value that is not a date
+/// (the empty string included). The error names the property and what was found.
+pub(super) fn requise(get: Lire<'_>, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
+    match get(cle) {
+        None | Some(Value::Null) => Err(anyhow!("{quoi} sans propriété `{cle}`")),
+        Some(v) => decoder(&v).map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
+    }
+}
+
+/// An OPTIONAL date: absent, null or the empty string is `None`. A value that is
+/// present and does not read as a date reads ABSENT (what the readers did before
+/// the three forms were read), and a warning names the property, the entity and
+/// what was found, so the loss is visible in the logs.
+pub(super) fn facultative(get: Lire<'_>, cle: &str, quoi: &str) -> Result<Option<DateTime<Utc>>> {
+    match get(cle) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(v) => match decoder(&v) {
+            Ok(d) => Ok(Some(d)),
+            Err(pourquoi) => {
+                warn!(
+                    propriete = cle,
+                    entite = quoi,
+                    "date optionnelle illisible, lue absente : {pourquoi}"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// A REQUIRED date that the Neo4j adapter reads as "now" when the property is
+/// ABSENT (`node_to_decision`, the chat sessions and events). That default is
+/// kept, for an absent property ONLY: a stored value is read under its three
+/// forms, and one that is not a date is an error, never replaced by "now".
+pub(super) fn ou_maintenant_si_absente(
+    get: Lire<'_>,
+    cle: &str,
+    quoi: &str,
+) -> Result<DateTime<Utc>> {
+    match get(cle) {
+        None | Some(Value::Null) => Ok(Utc::now()),
+        Some(Value::String(s)) if s.is_empty() => Ok(Utc::now()),
+        Some(v) => decoder(&v).map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
+    }
+}
+
+/// A date already looked up on an EDGE, for a field that is required (the edge's
+/// `last_verified`): absent, null or empty is `None`; a value present that is not
+/// a date is an error, naming the property and the variant.
 pub(super) fn de_valeur(v: Option<&Value>, cle: &str, quoi: &str) -> Result<Option<DateTime<Utc>>> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -64,34 +116,6 @@ pub(super) fn de_valeur(v: Option<&Value>, cle: &str, quoi: &str) -> Result<Opti
             .map(Some)
             .map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
     }
-}
-
-/// An optional date: absent, null or the empty string is `None`; anything else
-/// that is not a date is an error naming `cle` and the variant.
-pub(super) fn facultative(get: Lire<'_>, cle: &str, quoi: &str) -> Result<Option<DateTime<Utc>>> {
-    de_valeur(get(cle).as_ref(), cle, quoi)
-}
-
-/// A required date: absent is an error, and so is anything that is not a date
-/// (the empty string included).
-pub(super) fn requise(get: Lire<'_>, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
-    match get(cle) {
-        None | Some(Value::Null) => Err(anyhow!("{quoi} sans propriété `{cle}`")),
-        Some(v) => decoder(&v).map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
-    }
-}
-
-/// A date whose domain value is not optional and that the Neo4j adapter reads as
-/// "now" when the property is ABSENT (`node_to_decision`, the chat sessions and
-/// events): that default is kept, for an absent property ONLY. A stored value is
-/// read under its three forms, and one that is not a date is an error: what is
-/// in the base is never replaced by "now".
-pub(super) fn ou_maintenant_si_absente(
-    get: Lire<'_>,
-    cle: &str,
-    quoi: &str,
-) -> Result<DateTime<Utc>> {
-    Ok(facultative(get, cle, quoi)?.unwrap_or_else(Utc::now))
 }
 
 /// A date kept as TEXT by its domain value (a sort key, a `toString(…)` of the
@@ -158,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn ce_qui_n_est_pas_une_date_nomme_la_propriete_et_la_variante() {
+    fn un_requis_illisible_nomme_la_propriete_et_la_variante() {
         let get = |cle: &str| match cle {
             "entier" => Some(Value::Int64(5)),
             "texte" => Some(Value::from("pas une date")),
@@ -170,16 +194,11 @@ mod tests {
             e.contains("projet X") && e.contains("`entier`") && e.contains("INT64"),
             "{e}"
         );
-        let e = format!("{:#}", facultative(&get, "entier", "projet X").unwrap_err());
-        assert!(e.contains("`entier`") && e.contains("INT64"), "{e}");
-        let e = format!("{:#}", facultative(&get, "texte", "projet X").unwrap_err());
+        let e = format!("{:#}", requise(&get, "texte", "projet X").unwrap_err());
         assert!(
             e.contains("`texte`") && e.contains("STRING") && e.contains("pas une date"),
             "{e}"
         );
-        // Absent and empty: `None` when optional, an error when required.
-        assert_eq!(facultative(&get, "absente", "projet X").unwrap(), None);
-        assert_eq!(facultative(&get, "vide", "projet X").unwrap(), None);
         let e = format!("{:#}", requise(&get, "absente", "projet X").unwrap_err());
         assert!(e.contains("sans propriété `absente`"), "{e}");
         let e = format!("{:#}", requise(&get, "vide", "projet X").unwrap_err());
@@ -187,6 +206,47 @@ mod tests {
             e.contains("`vide` illisible") && e.contains("STRING"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn un_optionnel_illisible_est_absent_et_absent_ou_vide_aussi() {
+        let get = |cle: &str| match cle {
+            "entier" => Some(Value::Int64(5)),
+            "texte" => Some(Value::from("pas une date")),
+            "vide" => Some(Value::from("")),
+            _ => None,
+        };
+        // Read as absent (the service keeps going), not quarantined.
+        assert_eq!(facultative(&get, "entier", "projet X").unwrap(), None);
+        assert_eq!(facultative(&get, "texte", "projet X").unwrap(), None);
+        assert_eq!(facultative(&get, "absente", "projet X").unwrap(), None);
+        assert_eq!(facultative(&get, "vide", "projet X").unwrap(), None);
+        // A valid value is still read, whatever its form.
+        let valide =
+            |cle: &str| (cle == "t").then(|| Value::Timestamp(Timestamp::from_nanos(NANOS)));
+        assert_eq!(
+            facultative(&valide, "t", "projet X").unwrap(),
+            Some(DateTime::from_timestamp_nanos(NANOS))
+        );
+    }
+
+    #[test]
+    fn un_defaut_maintenant_ne_s_applique_qu_a_l_absence() {
+        let get = |cle: &str| match cle {
+            "texte" => Some(Value::from("pas une date")),
+            "vide" => Some(Value::from("")),
+            _ => None,
+        };
+        let avant = Utc::now();
+        let absente = ou_maintenant_si_absente(&get, "absente", "décision X").unwrap();
+        assert!(absente >= avant);
+        assert!(ou_maintenant_si_absente(&get, "vide", "décision X").unwrap() >= avant);
+        // Present and not a date: an error, never "now".
+        let e = format!(
+            "{:#}",
+            ou_maintenant_si_absente(&get, "texte", "décision X").unwrap_err()
+        );
+        assert!(e.contains("`texte`") && e.contains("pas une date"), "{e}");
     }
 
     #[test]

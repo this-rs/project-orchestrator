@@ -167,6 +167,11 @@ impl Lecture<'_> {
             .ok_or_else(|| anyhow!("{} sans propriété `{cle}`", self.quoi))
     }
 
+    /// A required date: absent, or not a date, is an error naming the property.
+    fn instant_requis(&self, cle: &str) -> Result<DateTime<Utc>> {
+        super::date::requise(self.get, cle, &self.quoi)
+    }
+
     fn instant(&self, cle: &str) -> Result<Option<DateTime<Utc>>> {
         super::date::facultative(self.get, cle, &self.quoi)
     }
@@ -387,12 +392,8 @@ fn lire_skill(get: &dyn Fn(&str) -> Option<Value>) -> Result<SkillNode> {
         imported_at: l.instant("imported_at")?,
         is_validated: l.booleen("is_validated")?.unwrap_or(false),
         tags: l.liste_de_chaines("tags")?,
-        created_at: l
-            .instant("created_at")?
-            .ok_or_else(|| anyhow!("skill {id} sans propriété `created_at`"))?,
-        updated_at: l
-            .instant("updated_at")?
-            .ok_or_else(|| anyhow!("skill {id} sans propriété `updated_at`"))?,
+        created_at: l.instant_requis("created_at")?,
+        updated_at: l.instant_requis("updated_at")?,
     })
 }
 
@@ -501,9 +502,7 @@ fn lire_publiee(get: &dyn Fn(&str) -> Option<Value>) -> Result<PublishedSkill> {
         published_by: l
             .chaine("published_by")?
             .unwrap_or_else(|| "unknown".to_string()),
-        published_at: l
-            .instant("published_at")?
-            .ok_or_else(|| anyhow!("skill publié {id} sans propriété `published_at`"))?,
+        published_at: l.instant_requis("published_at")?,
         import_count: l.entier("import_count")?.unwrap_or(0),
     })
 }

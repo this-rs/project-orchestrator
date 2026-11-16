@@ -7660,46 +7660,49 @@ mod with_the_feature {
         une_base_aux_dates_sous(FormeDate::Iso).await;
     }
 
-    /// A date that is there but is not a date: the node is quarantined and the
-    /// message names the property and the variant received. Never "now", never
-    /// absent.
+    /// Trouve le nœud de `label` dont la propriété `id` vaut `id` (base écrite à la main).
+    fn noeud_d_id(
+        db: &obrain_engine::ObrainDB,
+        label: &str,
+        id: &str,
+    ) -> obrain_common::types::NodeId {
+        db.store()
+            .nodes_by_label(label)
+            .into_iter()
+            .find(|n| {
+                db.get_node(*n)
+                    .and_then(|n| {
+                        n.get_property("id")
+                            .and_then(|v| v.as_str().map(|s| s == id))
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap()
+    }
+
+    /// A REQUIRED date that is present but is not a date (here a non-date string, and
+    /// a value of another variant) quarantines the node, and the message names the
+    /// property. A required date is never read as absent, and never as "now".
     #[tokio::test]
-    async fn une_date_presente_mais_illisible_met_en_quarantaine_et_nomme_sa_variante() {
+    async fn une_date_requise_illisible_met_en_quarantaine_et_nomme_la_propriete() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let store = open(&base).await;
-        let p = a_project("date illisible");
+        let p = a_project("date requise illisible");
         store.create_project(&p).await.unwrap();
-        let persona = a_persona(None, "date illisible", 0.5);
-        store.create_persona(&persona).await.unwrap();
         store.close().await.unwrap();
         drop(store);
 
-        let (pid, perso, did) = (p.id.to_string(), persona.id.to_string(), Uuid::new_v4());
+        let (pid, did) = (p.id.to_string(), Uuid::new_v4());
         write_foreign(&base, move |db| {
-            let noeud_de = |label: &str, id: &str| {
-                db.store()
-                    .nodes_by_label(label)
-                    .into_iter()
-                    .find(|n| {
-                        db.get_node(*n)
-                            .and_then(|n| {
-                                n.get_property("id")
-                                    .and_then(|v| v.as_str().map(|s| s == id))
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap()
-            };
-            // Required, of another type.
-            db.set_node_property(noeud_de("Project", &pid), "created_at", Value::Int64(5));
-            // Optional, of another type.
+            // Required, a string that is not a date.
             db.set_node_property(
-                noeud_de("Persona", &perso),
-                "updated_at",
-                Value::Float64(1.5),
+                noeud_d_id(db, "Project", &pid),
+                "created_at",
+                Value::from("pas une date"),
             );
-            // The one that used to read as "now".
+            // Required-with-default (the adapter reads an ABSENT one as "now"), present
+            // but a string that is not a date: it must not become "now".
             db.create_node_with_props(
                 &["Decision"],
                 vec![
@@ -7707,7 +7710,7 @@ mod with_the_feature {
                     ("description", Value::from("d")),
                     ("rationale", Value::from("r")),
                     ("status", Value::from("accepted")),
-                    ("decided_at", Value::Bool(true)),
+                    ("decided_at", Value::from("pas une date")),
                 ],
             );
         })
@@ -7715,21 +7718,188 @@ mod with_the_feature {
 
         let store = open(&base).await;
         let quarantaine = store.rapport_d_ouverture().en_quarantaine.clone();
-        assert_eq!(quarantaine.len(), 3, "{quarantaine:#?}");
-        for (label, propriete, variante) in [
-            ("Project", "`created_at`", "INT64"),
-            ("Persona", "`updated_at`", "FLOAT64"),
-            ("Decision", "`decided_at`", "BOOL"),
-        ] {
+        for (label, propriete) in [("Project", "`created_at`"), ("Decision", "`decided_at`")] {
             assert!(
-                quarantaine
-                    .iter()
-                    .any(|m| m.contains(label) && m.contains(propriete) && m.contains(variante)),
-                "aucun message ne nomme {label} {propriete} {variante} : {quarantaine:#?}"
+                quarantaine.iter().any(|m| m.contains(label)
+                    && m.contains(propriete)
+                    && m.contains("pas une date")),
+                "aucun message ne nomme {label} {propriete} : {quarantaine:#?}"
             );
         }
         assert!(store.get_project(p.id).await.unwrap().is_none());
         assert!(!matches!(store.get_decision(did).await, Ok(Some(_))));
-        assert!(!matches!(store.get_persona(persona.id).await, Ok(Some(_))));
+    }
+
+    /// An OPTIONAL date that is present but is not a date reads ABSENT: the node is
+    /// served with that field empty, and is not quarantined (a project, a task or a
+    /// persona must not vanish for one unreadable optional stamp).
+    #[tokio::test]
+    async fn une_date_optionnelle_illisible_est_lue_absente_et_le_noeud_reste_servi() {
+        use project_orchestrator::neo4j::models::{PlanNode, PlanStatus, TaskNode, TaskStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("optionnelle illisible");
+        store.create_project(&p).await.unwrap();
+        let plan = PlanNode {
+            id: Uuid::new_v4(),
+            title: "plan".into(),
+            description: "d".into(),
+            status: PlanStatus::Draft,
+            created_at: Utc::now(),
+            created_by: "test".into(),
+            priority: 0,
+            project_id: Some(p.id),
+            execution_context: None,
+            persona: None,
+        };
+        store.create_plan(&plan).await.unwrap();
+        let tache = TaskNode {
+            id: Uuid::new_v4(),
+            title: Some("tâche".into()),
+            description: "d".into(),
+            status: TaskStatus::Pending,
+            assigned_to: None,
+            interrupted_at: None,
+            interrupted_reason: None,
+            priority: Some(1),
+            tags: vec![],
+            acceptance_criteria: vec![],
+            affected_files: vec![],
+            estimated_complexity: None,
+            actual_complexity: None,
+            due_date: None,
+            estimated_minutes: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            started_at: None,
+            completed_at: None,
+            frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
+        };
+        store.create_task(plan.id, &tache).await.unwrap();
+        let persona = a_persona(None, "optionnelle illisible", 0.5);
+        store.create_persona(&persona).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let (pid, tid, perso) = (
+            p.id.to_string(),
+            tache.id.to_string(),
+            persona.id.to_string(),
+        );
+        write_foreign(&base, move |db| {
+            db.set_node_property(
+                noeud_d_id(db, "Project", &pid),
+                "last_synced",
+                Value::from("pas une date"),
+            );
+            db.set_node_property(
+                noeud_d_id(db, "Task", &tid),
+                "started_at",
+                Value::from("pas une date"),
+            );
+            db.set_node_property(
+                noeud_d_id(db, "Persona", &perso),
+                "updated_at",
+                Value::from("pas une date"),
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(rapport.en_quarantaine.is_empty(), "{rapport:#?}");
+        let projet = store.get_project(p.id).await.unwrap().expect("served");
+        assert_eq!(projet.last_synced, None);
+        let lue = store.get_task(tache.id).await.unwrap().expect("served");
+        assert_eq!(lue.started_at, None);
+        let persona = store
+            .get_persona(persona.id)
+            .await
+            .unwrap()
+            .expect("served");
+        assert_eq!(persona.updated_at, None);
+    }
+
+    /// A value of another variant in a REQUIRED date quarantines the node, and the
+    /// message names the property and the variant received.
+    #[tokio::test]
+    async fn une_date_requise_d_une_autre_variante_met_en_quarantaine_et_nomme_sa_variante() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("variante illisible");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let pid = p.id.to_string();
+        write_foreign(&base, move |db| {
+            db.set_node_property(
+                noeud_d_id(db, "Project", &pid),
+                "created_at",
+                Value::Int64(5),
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        let quarantaine = store.rapport_d_ouverture().en_quarantaine.clone();
+        assert!(
+            quarantaine.iter().any(|m| m.contains("Project")
+                && m.contains("`created_at`")
+                && m.contains("INT64")),
+            "{quarantaine:#?}"
+        );
+        assert!(store.get_project(p.id).await.unwrap().is_none());
+    }
+
+    /// A Timestamp and a ZonedDatetime in an OPTIONAL date are READ, not dropped:
+    /// the value is the instant written.
+    #[tokio::test]
+    async fn une_date_optionnelle_en_timestamp_ou_zoned_est_lue() {
+        use obrain_common::types::{Timestamp, ZonedDatetime};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("optionnelle lue");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let instant = Utc::now().timestamp_micros();
+        let nanos = instant * 1000;
+        let pid = p.id.to_string();
+        write_foreign(&base, move |db| {
+            db.set_node_property(
+                noeud_d_id(db, "Project", &pid),
+                "last_synced",
+                Value::Timestamp(Timestamp::from_nanos(nanos)),
+            );
+            db.set_node_property(
+                noeud_d_id(db, "Project", &pid),
+                "analytics_computed_at",
+                Value::ZonedDatetime(ZonedDatetime::from_timestamp_offset(
+                    Timestamp::from_nanos(nanos),
+                    3600,
+                )),
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        let projet = store.get_project(p.id).await.unwrap().expect("served");
+        assert_eq!(
+            projet.last_synced.map(|d| d.timestamp_micros()),
+            Some(instant)
+        );
+        assert_eq!(
+            projet.analytics_computed_at.map(|d| d.timestamp_micros()),
+            Some(instant)
+        );
     }
 }

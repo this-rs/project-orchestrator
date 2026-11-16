@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat};
+use chrono::SecondsFormat;
 use obrain_common::types::{NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -206,17 +206,9 @@ fn lire_tombe(get: &dyn Fn(&str) -> Option<Value>) -> Result<SignedTombstone> {
     Ok(SignedTombstone {
         issuer_did: texte("issuer_did")?,
         signature_hex: texte("signature_hex")?,
-        // Neo4j's stated rule (`tombstone_from_stored`): the epoch, never "now".
-        // Read by the one decoder (`date.rs`), under its three forms. Absent, or a
-        // STRING that does not parse: the epoch, never "now" — Neo4j's stated rule
-        // (`tombstone_from_stored`): deterministic, and it fails the verification.
-        // Another variant is an error, as it was.
-        issued_at: match get("issued_at") {
-            None => DateTime::UNIX_EPOCH,
-            Some(v @ Value::String(_)) => super::date::decoder(&v).unwrap_or(DateTime::UNIX_EPOCH),
-            Some(v) => super::date::decoder(&v)
-                .map_err(|pourquoi| anyhow!("{quoi} : `issued_at` illisible : {pourquoi}"))?,
-        },
+        // Required: written with every tombstone. Absent, or not a date, is an error
+        // naming it, never the epoch (a signed value invented from nothing).
+        issued_at: super::date::requise(get, "issued_at", &quoi)?,
         reason: Some(texte("reason")?).filter(|r| !r.is_empty()),
         content_hash: hash,
     })
@@ -699,12 +691,11 @@ mod tests {
         inconnue.issuer_did = "did:local:unknown".into();
         assert!(!tombe_effective(&inconnue));
 
-        // An unreadable `issued_at` is the epoch (deterministic, unverifiable).
+        // An unreadable `issued_at` is an error naming it: never the epoch.
         let mut p = proprietes_tombe(&t);
         p.retain(|(k, _)| *k != "issued_at");
         p.push(("issued_at", Value::from("jamais")));
-        let epoque = lire_tombe(&depuis(p)).unwrap();
-        assert_eq!(epoque.issued_at, DateTime::UNIX_EPOCH);
-        assert!(!crate::sharing::tombstone::verify_tombstone(&epoque));
+        let e = format!("{:#}", lire_tombe(&depuis(p)).unwrap_err());
+        assert!(e.contains("issued_at") && e.contains("jamais"), "{e}");
     }
 }
