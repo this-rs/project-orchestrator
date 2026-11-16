@@ -96,7 +96,7 @@ Manage tasks within plans.
 | `list` | List tasks with filters | `plan_id`, `search`, `status`, `tags`, `assigned_to`, `limit`, `offset` |
 | `create` | Create a task | `plan_id`, `title`, `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `get` | Get task details | `task_id` |
-| `update` | Update task fields. A field it cannot write is refused, not dropped. `acceptance_criteria: []` and `affected_files: []` clear the lists. `updated` is `false` when only a refused list was given | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
+| `update` | Update task fields. A published parameter this update does not write is refused (`unsupported_fields`), not dropped. A key the tool does not publish is ignored. An update that writes nothing is refused (`empty_update`). `acceptance_criteria: []` and `affected_files: []` clear the lists. `updated` is `false` when only a refused list was given | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `delete` | Delete task, with its steps and its decisions (the answer lists `deleted_decision_ids`) | `task_id` |
 | `get_next` | Next unblocked task (highest priority) | `plan_id` |
 | `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |

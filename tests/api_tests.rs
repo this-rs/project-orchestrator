@@ -617,10 +617,9 @@ async fn test_code_impact() {
     // empty analysis (issue #1189).
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         let error: Value = resp.json().await.unwrap();
-        assert!(error["error"]
-            .as_str()
-            .unwrap()
-            .contains("file not found in graph"));
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("file not found in graph"), "{message}");
+        assert!(message.contains("src/lib.rs"), "{message}");
         return;
     }
     assert!(resp.status().is_success());

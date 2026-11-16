@@ -187,7 +187,10 @@ fn refuse_unwritable_fields(
             writable.join(", ")
         ));
     }
-    if given.is_empty() {
+    // Counted on the keys the update WRITES: a key the tool does not publish
+    // (`order`, `due_date`) is ignored, so it does not make the update non-empty.
+    // Without this the call went through with an empty body and answered success.
+    if !given.iter().any(|key| writable.contains(key)) {
         return Err(anyhow!(
             "empty_update: {what} was given no field to write — nothing was changed. It writes: {}",
             writable.join(", ")
@@ -8172,6 +8175,44 @@ mod tests {
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(stored.title.as_deref(), Some("new title"));
         assert_eq!(stored.due_date, None, "ignored, as before");
+    }
+
+    /// A key the tool does not publish (`order` on a step) does not make an update
+    /// non-empty: nothing is written, so the update is refused by name, before any
+    /// request. It used to go through with an empty body and answer `updated: true`.
+    #[tokio::test]
+    async fn step_update_with_only_an_unpublished_key_is_refused_as_empty() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({"action": "update", "step_id": UUID1, "order": 3})),
+            )
+            .await
+            .expect_err("nothing is written");
+        assert!(err.to_string().contains("empty_update"), "{err}");
+    }
+
+    /// The same on a task, against the real API: `due_date` is written by the
+    /// API but not published by the tool, so this update writes nothing.
+    #[tokio::test]
+    async fn task_update_with_only_an_unpublished_key_is_refused_as_empty() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "due_date": "2026-12-01",
+                })),
+            )
+            .await
+            .expect_err("nothing is written");
+        assert!(err.to_string().contains("empty_update"), "{err}");
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.due_date, None);
     }
 
     /// A list refused by name and nothing else: nothing was written, so the
