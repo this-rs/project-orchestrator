@@ -116,7 +116,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -218,9 +218,14 @@ fn lire_decision(get: &dyn Fn(&str) -> Option<Value>) -> Result<DecisionNode> {
         .unwrap_or_default();
     let chosen_option = chaine("chosen_option").filter(|s| !s.is_empty());
     let decided_by = chaine("decided_by").unwrap_or_default();
-    let decided_at = chaine("decided_at")
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-        .unwrap_or_else(Utc::now);
+    // ABSENT keeps Neo4j's own default; PRESENT-but-unreadable is an error, so
+    // the decision is quarantined by name instead of being dated with the time
+    // of the read. The migrator writes `ZonedDatetime`, which `as_str()` — the
+    // shape this used — could not see at all.
+    let decided_at = match super::date_propriete(get, "decided_at")? {
+        Some(d) => d,
+        None => Utc::now(),
+    };
     // Neo4j's `node_to_decision` defaults a missing status to `Accepted`.
     let status = chaine("status")
         .and_then(|s| s.parse().ok())
@@ -480,11 +485,11 @@ impl DecisionStore for ObrainGraphStore {
                 w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
-                for (k, (cle, valeur)) in proprietes.into_iter().enumerate() {
+                for (_k, (cle, valeur)) in proprietes.into_iter().enumerate() {
                     w.etape()?;
                     w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
-                    w.point(Interruption::ApresLaPropriete(k + 1))?;
+                    w.point(Interruption::ApresLaPropriete(_k + 1))?;
                 }
                 if let Some(projet) = projet_noeud {
                     let _ = w.db.create_edge(projet, noeud, APPARTIENT);

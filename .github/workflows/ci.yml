@@ -758,8 +758,11 @@ jobs:
       # A portage suite nothing runs is worse than no suite: it reads as
       # coverage. No filter: every test of the file runs, and the compilation is
       # already warm from the step above.
-      - name: Run the task-and-step portage tests
-        run: cargo test --features obrain-backend --test obrain_taches
+      # `obrain_dates` rides along: it proves a migrated `ZonedDatetime` is READ
+      # (not replaced by `Utc::now()`), and the two suites are the same kind of
+      # guard — a portage behaviour nothing else asserts.
+      - name: Run the task-and-step and date portage tests
+        run: cargo test --features obrain-backend --test obrain_taches --test obrain_dates
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

@@ -138,6 +138,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -200,6 +201,49 @@ pub fn refusees_chat() -> &'static [&'static str] {
 /// AFFECTS edges to code entities, and the three embedding methods.
 pub fn refusees_decision() -> &'static [&'static str] {
     decision::REFUSEES
+}
+
+/// A stored date, decoded from the three shapes the corpus actually holds:
+/// an ISO 8601 string (what Neo4j worked with, and what this portage writes),
+/// a `Timestamp` (obrain's own `datetime()`), and a `ZonedDatetime` (what the
+/// migrator writes, faithful to Neo4j's zoned `DateTime`).
+///
+/// `Ok(None)` means ABSENT: the caller decides what an absent date means, and
+/// matches Neo4j's own default where that default is documented.
+///
+/// A value that is PRESENT but cannot be read is an `Err`, which quarantines
+/// the node BY NAME at open. That distinction is the whole point: the previous
+/// shape was `as_str()`, so a `ZonedDatetime` was indistinguishable from a
+/// missing property — every migrated node was read as "no date" (130 713 of
+/// them quarantined) and `decided_at` was then replaced by the time of the
+/// read, silently. A default that hides a present value is an invention.
+pub(crate) fn date_propriete(
+    get: &dyn Fn(&str) -> Option<Value>,
+    cle: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let Some(v) = get(cle) else {
+        return Ok(None);
+    };
+    let micros = match &v {
+        Value::Null => return Ok(None),
+        Value::String(s) => {
+            return s
+                .parse::<DateTime<Utc>>()
+                .map(Some)
+                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"))
+        }
+        Value::Timestamp(t) => t.as_micros(),
+        Value::ZonedDatetime(z) => z.as_timestamp().as_micros(),
+        _ => {
+            return Err(anyhow!(
+                "`{cle}` : type inattendu pour une date (attendu chaîne ISO, Timestamp ou \
+                 ZonedDatetime)"
+            ))
+        }
+    };
+    DateTime::<Utc>::from_timestamp_micros(micros)
+        .map(Some)
+        .ok_or_else(|| anyhow!("`{cle}` : date hors bornes ({micros} µs depuis l'époque)"))
 }
 
 /// The methods of `SkillStore` refused on every call, as `SkillStore::<method>`
