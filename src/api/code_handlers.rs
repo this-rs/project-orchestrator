@@ -589,6 +589,85 @@ pub struct ImpactAnalysis {
     pub confidence: Option<crate::graph::confidence::ConfidenceScore>,
 }
 
+/// How many candidates an ambiguous relative target is answered with.
+const IMPACT_TARGET_CANDIDATES: usize = 5;
+
+/// The file of the code graph an impact analysis is about.
+///
+/// The graph stores absolute paths. A path that names no file used to go
+/// straight to the traversal, which found nothing and answered 200 with empty
+/// lists and `risk_level: low` — "no impact" for a file that was never looked
+/// at (issue #1189). The target is now resolved, in this order:
+///
+/// 1. `<project root>/<target>` when a project is given and the target is relative;
+/// 2. the target as written;
+/// 3. for a relative target, the one file of the graph (of the project, when
+///    given) whose path ends with `/<target>`.
+///
+/// Several files at step 3 is a 400 that lists them; none is a 404. A path
+/// that has dependents is accepted even without a `File` node of its own, so a
+/// graph that answered before still answers.
+async fn resolve_impact_file(
+    neo4j: &dyn crate::neo4j::GraphStore,
+    raw: &str,
+    project: Option<(uuid::Uuid, &str)>,
+) -> Result<String, AppError> {
+    let relative = !raw.starts_with('/');
+    let mut candidates: Vec<String> = Vec::new();
+    if let (true, Some((_, root))) = (relative, project) {
+        let expanded = crate::expand_tilde(root);
+        candidates.push(format!("{}/{}", expanded.trim_end_matches('/'), raw));
+    }
+    candidates.push(raw.to_string());
+
+    for candidate in &candidates {
+        if neo4j.get_file(candidate).await?.is_some() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let project_id = project.map(|(id, _)| id);
+    if relative {
+        let suffix = format!("/{}", raw.trim_start_matches("./"));
+        let mut matches: Vec<String> = neo4j
+            .find_files_by_path_suffix(&suffix, IMPACT_TARGET_CANDIDATES + 1)
+            .await?
+            .into_iter()
+            .filter(|(_, owner)| project_id.is_none() || *owner == project_id)
+            .map(|(path, _)| path)
+            .collect();
+        matches.sort();
+        matches.dedup();
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.remove(0)),
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "ambiguous target '{raw}': it names several files of the graph ({}). \
+                     Pass an absolute path, or project_slug with a path relative to the project root.",
+                    matches.join(", ")
+                )))
+            }
+        }
+    }
+
+    for candidate in &candidates {
+        if !neo4j
+            .find_impacted_files(candidate, 1, project_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(candidate.clone());
+        }
+    }
+
+    Err(AppError::NotFound(format!(
+        "file not found in graph: '{raw}' (looked up as {}). Pass an absolute path, or \
+         project_slug with a path relative to the project root; sync the project if the file is new.",
+        candidates.join(", ")
+    )))
+}
+
 /// Analyze impact of changing a file or function
 pub async fn analyze_impact(
     State(state): State<OrchestratorState>,
@@ -631,14 +710,14 @@ pub async fn analyze_impact(
         None
     };
 
-    // Resolve relative file paths to absolute using project root_path
-    let target = if target_type == "file" && !query.target.starts_with('/') {
-        if let Some(ref root) = project_root {
-            let expanded = crate::expand_tilde(root);
-            format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
-        } else {
-            query.target.clone()
-        }
+    // A file target is resolved to a file of the graph, or refused by name.
+    let target = if target_type == "file" {
+        resolve_impact_file(
+            state.orchestrator.neo4j(),
+            &query.target,
+            project_id.zip(project_root.as_deref()),
+        )
+        .await?
     } else {
         query.target.clone()
     };
@@ -6272,27 +6351,128 @@ mod tests {
     // GET /api/code/impact — analyze_impact additional coverage
     // ====================================================================
 
+    /// A graph that holds `<root>/src/lib.rs` imported by `<root>/src/handler.rs`
+    /// for each given root — the absolute paths a synced project has.
+    async fn impact_app_with_roots(roots: &[&str]) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        for root in roots {
+            for name in ["src/lib.rs", "src/handler.rs"] {
+                graph
+                    .upsert_file(&FileNode {
+                        path: format!("{root}/{name}"),
+                        language: "rust".to_string(),
+                        hash: "h".to_string(),
+                        last_parsed: chrono::Utc::now(),
+                        project_id: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            graph
+                .create_import_relationship(
+                    &format!("{root}/src/handler.rs"),
+                    &format!("{root}/src/lib.rs"),
+                    "lib",
+                )
+                .await
+                .unwrap();
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    async fn json_of(resp: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Issue #1189: a target that names no file of the graph answered 200 with
+    /// empty lists and `risk_level: low` — which reads "no impact".
     #[tokio::test]
     async fn test_analyze_impact_file_not_in_graph() {
-        // analyze_impact for a file with no relationships → empty lists, low risk
         let app = test_app().await;
         let resp = app
             .oneshot(auth_get("/api/code/impact?target=src/unknown.rs"))
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("file not found in graph"), "{error}");
+        assert!(error.contains("src/unknown.rs"), "{error}");
+    }
+
+    /// A relative target without `project_slug` is resolved to the one file of
+    /// the graph it names, and the answer says which absolute path was analysed.
+    #[tokio::test]
+    async fn a_relative_impact_target_is_resolved_to_the_file_it_names() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["target"], "src/unknown.rs");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/app/src/lib.rs");
+        assert_eq!(
+            json["directly_affected"],
+            serde_json::json!(["/repo/app/src/handler.rs"])
+        );
+        assert_eq!(json["caller_count"], 1);
+    }
+
+    /// A suffix is matched on a path boundary: `lib.rs` is not `mylib.rs`.
+    #[tokio::test]
+    async fn a_relative_impact_target_matches_whole_path_segments() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=rc/lib.rs"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A relative target that names a file in two places is refused with the
+    /// candidates, not answered for one of them.
+    #[tokio::test]
+    async fn an_ambiguous_relative_impact_target_is_refused_with_its_candidates() {
+        let app = impact_app_with_roots(&["/repo/app", "/repo/other"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/app/src/lib.rs") && error.contains("/repo/other/src/lib.rs"),
+            "{error}"
+        );
+    }
+
+    /// A file of the graph that nothing depends on is still a 200 with empty
+    /// lists: "no impact" is a legitimate answer when the file is known.
+    #[tokio::test]
+    async fn a_known_file_without_dependents_still_answers_no_impact() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=/repo/app/src/handler.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/app/src/handler.rs");
         assert!(json["directly_affected"].as_array().unwrap().is_empty());
-        assert!(json["transitively_affected"].as_array().unwrap().is_empty());
-        assert!(json["test_files_affected"].as_array().unwrap().is_empty());
-        assert_eq!(json["caller_count"], 0);
-        assert_eq!(json["risk_level"], "low");
     }
 
     #[tokio::test]

@@ -639,30 +639,41 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
+/// What `DELETE /api/tasks/{id}` removed.
+#[derive(Debug, Serialize)]
+pub struct DeleteTaskResponse {
+    pub deleted: bool,
+    /// Steps deleted with the task.
+    pub steps_deleted: usize,
+    /// Decisions deleted with the task (`deleted_decision_ids.len()`).
+    pub decisions_deleted: usize,
+    pub deleted_decision_ids: Vec<Uuid>,
+}
+
 /// Delete a task and all its related data.
 ///
 /// The task's steps and decisions go with it — the same ownership rule as
-/// deleting a plan or a project. The answer stays an empty 204; what went with
-/// the task is logged here, so the cascade is at least on the record.
+/// deleting a plan or a project. The answer used to be an empty 204, so the
+/// loss of the decisions was discovered later, by a 404 (issue #1189): it now
+/// says how many went and which ones.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<DeleteTaskResponse>, AppError> {
     let report = state
         .orchestrator
         .plan_manager()
         .delete_task(task_id)
         .await?;
-    tracing::info!(
-        %task_id,
-        steps_deleted = report.steps_deleted,
-        decisions_deleted = report.deleted_decision_ids.len(),
-        "task deleted with its steps and decisions"
-    );
     state
         .event_bus
         .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(DeleteTaskResponse {
+        deleted: true,
+        steps_deleted: report.steps_deleted,
+        decisions_deleted: report.deleted_decision_ids.len(),
+        deleted_decision_ids: report.deleted_decision_ids,
+    }))
 }
 
 /// Update task status
@@ -787,6 +798,17 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The store's update matches nothing for an unknown id and reports success:
+    // without this read, a mistyped id is answered 204 (issue #1189).
+    if state
+        .orchestrator
+        .neo4j()
+        .get_task(task_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!("Task not found: {task_id}")));
+    }
     // The task's model alias (A16): it must name a defined alias; an empty
     // string clears it. Stored in the provider settings, not on the task node.
     if let Some(alias) = req.model_alias.as_deref() {
@@ -3296,6 +3318,13 @@ pub async fn supersede_decision(
     State(state): State<OrchestratorState>,
     Path((new_id, old_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    // The store's `MATCH (new) MATCH (old)` writes nothing when either is
+    // missing and reports success (issue #1189).
+    for id in [new_id, old_id] {
+        if state.orchestrator.neo4j().get_decision(id).await?.is_none() {
+            return Err(AppError::NotFound(format!("Decision not found: {id}")));
+        }
+    }
     state
         .orchestrator
         .neo4j()
@@ -3841,6 +3870,17 @@ pub async fn update_step(
     Path(step_id): Path<Uuid>,
     Json(req): Json<UpdateStepRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The store's update matches nothing for an unknown id and reports success:
+    // without this read, a mistyped id is answered 204 (issue #1189).
+    if state
+        .orchestrator
+        .neo4j()
+        .get_step(step_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!("Step not found: {step_id}")));
+    }
     if let Some(status) = req.status.clone() {
         state
             .orchestrator
@@ -14034,27 +14074,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Kept as it is on main, on purpose: superseding two ids that name no
-    /// decision answers 204 and writes nothing. Refusing it is a contract
-    /// change, made in the contract PR, not here.
-    #[tokio::test]
-    async fn superseding_two_unknown_ids_still_answers_204() {
-        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let (app, _bus) = test_app_parts(graph).await;
-        let resp = app
-            .oneshot(auth_post_json(
-                &format!(
-                    "/api/decisions/{}/supersedes/{}",
-                    Uuid::new_v4(),
-                    Uuid::new_v4()
-                ),
-                serde_json::json!({}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
     /// A task in the mock store, with its id.
     async fn seeded_task(graph: &crate::neo4j::mock::MockGraphStore) -> Uuid {
         let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
@@ -14070,6 +14089,222 @@ pub(crate) mod tests {
             .unwrap();
         assert!(resp.status().is_success(), "POST {uri}: {}", resp.status());
         resp_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    /// PATCH /api/steps/{id} on an id that names no step used to answer 204,
+    /// which the MCP tool turned into `updated: true`.
+    #[tokio::test]
+    async fn patching_a_step_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+        let ghost = Uuid::new_v4();
+
+        for body in [
+            serde_json::json!({ "description": "never written" }),
+            serde_json::json!({ "status": "completed" }),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(auth_patch_json(
+                    &format!("/api/steps/{ghost}"),
+                    body.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "body {body}");
+        }
+    }
+
+    /// The same silence on PATCH /api/tasks/{id}.
+    #[tokio::test]
+    async fn patching_a_task_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{}", Uuid::new_v4()),
+                serde_json::json!({ "acceptance_criteria": ["never written"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PATCH /api/tasks/{id} writes the criteria and the files, and a step that
+    /// exists is still updated (the 404 above is not a blanket refusal).
+    #[tokio::test]
+    async fn patching_an_existing_task_and_step_still_writes() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{task_id}"),
+                serde_json::json!({
+                    "acceptance_criteria": ["The export is complete"],
+                    "affected_files": ["src/export.rs"],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.acceptance_criteria, vec!["The export is complete"]);
+        assert_eq!(stored.affected_files, vec!["src/export.rs"]);
+
+        let step_id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "first wording" }),
+        )
+        .await;
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/steps/{step_id}"),
+                serde_json::json!({ "description": "second wording", "status": "skipped" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let step = graph
+            .get_step(step_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.description, "second wording");
+        assert_eq!(step.status, crate::neo4j::models::StepStatus::Skipped);
+    }
+
+    /// DELETE /api/tasks/{id} takes the task's steps and decisions with it. It
+    /// used to do so behind an empty 204: the caller learned of the lost
+    /// decisions when `decision get` answered 404.
+    #[tokio::test]
+    async fn deleting_a_task_says_which_decisions_went_with_it() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let bystander = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let decision = serde_json::json!({ "description": "d", "rationale": "r" });
+        let mut lost = Vec::new();
+        for _ in 0..2 {
+            lost.push(
+                posted_id(
+                    &app,
+                    &format!("/api/tasks/{task_id}/decisions"),
+                    decision.clone(),
+                )
+                .await,
+            );
+        }
+        let kept = posted_id(
+            &app,
+            &format!("/api/tasks/{bystander}/decisions"),
+            decision.clone(),
+        )
+        .await;
+        posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "a step" }),
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp_json(resp).await;
+        assert_eq!(json["deleted"], true);
+        assert_eq!(json["decisions_deleted"], 2);
+        assert_eq!(json["steps_deleted"], 1);
+        let mut reported: Vec<String> = json["deleted_decision_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        reported.sort();
+        lost.sort();
+        assert_eq!(reported, lost);
+
+        // What the answer says is what happened.
+        for id in &lost {
+            assert!(graph
+                .get_decision(id.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(graph
+            .get_decision(kept.parse().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// A task without decisions: the same answer, with zeros.
+    #[tokio::test]
+    async fn deleting_a_task_without_decisions_reports_zero() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp_json(resp).await;
+        assert_eq!(json["deleted"], true);
+        assert_eq!(json["decisions_deleted"], 0);
+        assert_eq!(json["steps_deleted"], 0);
+        assert!(graph.get_task(task_id).await.unwrap().is_none());
+    }
+
+    /// POST /api/decisions/{new}/supersedes/{old} with an id that names no
+    /// decision used to answer 204 and mark nothing.
+    #[tokio::test]
+    async fn superseding_with_a_decision_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let real = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/decisions"),
+            serde_json::json!({ "description": "d", "rationale": "r" }),
+        )
+        .await;
+        let ghost = Uuid::new_v4();
+
+        for uri in [
+            format!("/api/decisions/{ghost}/supersedes/{real}"),
+            format!("/api/decisions/{real}/supersedes/{ghost}"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(auth_post_json(&uri, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let untouched = graph
+            .get_decision(real.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            untouched.status,
+            crate::neo4j::models::DecisionStatus::Superseded
+        );
     }
 }
 
