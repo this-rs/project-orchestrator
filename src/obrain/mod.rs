@@ -233,10 +233,19 @@ pub(crate) fn date_valeur(v: &Value, cle: &str) -> Result<Option<DateTime<Utc>>>
     let micros = match v {
         Value::Null => return Ok(None),
         Value::String(s) => {
+            // The portage WRITES `""` for an absent optional date (`trigger.rs`
+            // and `persona.rs` writers do `d.map(instant).unwrap_or_else(|| texte(""))`).
+            // An empty string is therefore the stored shape of "no date", not a
+            // corrupt value: read as absent, or every node carrying an unset
+            // optional date is quarantined at open. Measured: 15 tests of
+            // `obrain_backend` fell on `human_confirmed_at` «  ».
+            if s.trim().is_empty() {
+                return Ok(None);
+            }
             return s
                 .parse::<DateTime<Utc>>()
                 .map(Some)
-                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"))
+                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"));
         }
         Value::Timestamp(t) => t.as_micros(),
         Value::ZonedDatetime(z) => z.as_timestamp().as_micros(),
