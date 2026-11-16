@@ -96,7 +96,7 @@ Manage tasks within plans.
 | `list` | List tasks with filters | `plan_id`, `search`, `status`, `tags`, `assigned_to`, `limit`, `offset` |
 | `create` | Create a task | `plan_id`, `title`, `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `get` | Get task details | `task_id` |
-| `update` | Update task fields | `task_id`, `status`, `assigned_to`, `priority`, `tags` |
+| `update` | Update task fields | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `delete` | Delete task | `task_id` |
 | `get_next` | Next unblocked task (highest priority) | `plan_id` |
 | `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |
@@ -116,7 +116,7 @@ Manage steps (sub-tasks) within tasks.
 |--------|-------------|----------------|
 | `list` | List steps for a task | `task_id` |
 | `create` | Add step to task | `task_id`, `description`, `verification` |
-| `update` | Update step status | `step_id`, `status` (pending/in_progress/completed/skipped) |
+| `update` | Update a step | `step_id`, `status` (pending/in_progress/completed/skipped), `description`, `verification` |
 | `get` | Get step by ID | `step_id` |
 | `delete` | Delete step | `step_id` |
 | `get_progress` | Step completion progress | `task_id` |

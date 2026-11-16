@@ -1316,15 +1316,21 @@ impl ObrainGraphStore {
             .map(|_| ())
     }
 
-    pub(super) async fn tache_supprimer(&self, task_id: Uuid) -> Result<()> {
+    pub(super) async fn tache_supprimer(&self, task_id: Uuid) -> Result<TaskDeletion> {
         self.ecrire(
-            || (),
-            move |(), w: &mut Ecriture<'_>| {
+            || TaskDeletion {
+                steps_deleted: 0,
+                deleted_decision_ids: Vec::new(),
+            },
+            move |_, w: &mut Ecriture<'_>| {
                 let (noeud, etapes) = {
                     let etat = w.index()?;
                     let idx = &etat.taches;
                     let Some(e) = idx.tache(task_id)? else {
-                        return Ok(());
+                        return Ok(TaskDeletion {
+                            steps_deleted: 0,
+                            deleted_decision_ids: Vec::new(),
+                        });
                     };
                     idx.complet(task_id)?;
                     let etapes: Vec<&EntreeEtape> = idx
@@ -1353,6 +1359,8 @@ impl ObrainGraphStore {
                     }
                     (e.noeud, etapes.iter().map(|s| s.noeud).collect::<Vec<_>>())
                 };
+                // Reported before `etapes` is consumed by the loop below.
+                let nb_etapes = etapes.len();
                 ecritures(w, |w| {
                     w.etape()?;
                     w.poser(noeud, SUPPRESSION, Value::from(true));
@@ -1370,7 +1378,15 @@ impl ObrainGraphStore {
                 })?;
                 w.rendre_durable()?;
                 w.index_mut()?.taches.retirer_tache(task_id);
-                Ok(())
+                // Neo4j's `delete_task` also deletes the decisions behind
+                // `INFORMED_BY` and reports their ids. This portage refuses that
+                // case above (non-empty `hors`) instead of deleting them, so a
+                // success here means there was none: empty is the true report,
+                // never an invented one.
+                Ok(TaskDeletion {
+                    steps_deleted: nb_etapes,
+                    deleted_decision_ids: Vec::new(),
+                })
             },
         )
         .await

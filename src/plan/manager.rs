@@ -239,6 +239,23 @@ impl PlanManager {
         // Update all other fields via the full update method
         self.neo4j.update_task(task_id, &req).await?;
 
+        // Everything but the status, the assignee and the session link may be
+        // rendered in the task's prompt: the prompt cached by `task enrich`
+        // no longer says what the task says.
+        let changes_the_prompt = req.title.is_some()
+            || req.description.is_some()
+            || req.priority.is_some()
+            || req.tags.is_some()
+            || req.acceptance_criteria.is_some()
+            || req.affected_files.is_some()
+            || req.estimated_complexity.is_some()
+            || req.actual_complexity.is_some()
+            || req.due_date.is_some()
+            || req.estimated_minutes.is_some();
+        if changes_the_prompt {
+            self.drop_cached_prompt(task_id).await?;
+        }
+
         self.emit(
             CrudEvent::new(EntityType::Task, CrudAction::Updated, task_id.to_string())
                 .with_payload(serde_json::to_value(&req).unwrap_or_default()),
@@ -247,15 +264,16 @@ impl PlanManager {
         Ok(())
     }
 
-    /// Delete a task and all its related data (steps, decisions)
-    pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        self.neo4j.delete_task(task_id).await?;
+    /// Delete a task and all its related data (steps, decisions), and report
+    /// what went with it.
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion> {
+        let report = self.neo4j.delete_task(task_id).await?;
         self.emit(CrudEvent::new(
             EntityType::Task,
             CrudAction::Deleted,
             task_id.to_string(),
         ));
-        Ok(())
+        Ok(report)
     }
 
     /// Get next available task from a plan
@@ -272,9 +290,31 @@ impl PlanManager {
     // Step operations
     // ========================================================================
 
+    /// Drop the prompt `task enrich` cached on the task.
+    ///
+    /// The runner serves `prompt_cache` as is when it is set. A write that
+    /// changes what the prompt renders (criteria, statement, steps) and leaves
+    /// the cache in place never reaches the executing agent (issue #1189). An
+    /// empty string is how the cache is cleared: the store reads it back as
+    /// "no cache", and the runner then builds the prompt from the graph.
+    async fn drop_cached_prompt(&self, task_id: Uuid) -> Result<()> {
+        self.neo4j
+            .update_task_enrichment(task_id, None, None, Some(""))
+            .await
+    }
+
+    /// [`Self::drop_cached_prompt`] for the task a step belongs to, if any.
+    async fn drop_cached_prompt_of_step(&self, step_id: Uuid) -> Result<()> {
+        if let Some(task_id) = self.neo4j.get_step_parent_task_id(step_id).await? {
+            self.drop_cached_prompt(task_id).await?;
+        }
+        Ok(())
+    }
+
     /// Add a step to a task
     pub async fn add_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
         self.neo4j.create_step(task_id, step).await?;
+        self.drop_cached_prompt(task_id).await?;
         self.emit(
             CrudEvent::new(EntityType::Step, CrudAction::Created, step.id.to_string())
                 .with_payload(
@@ -287,6 +327,7 @@ impl PlanManager {
     /// Update step fields (description, verification)
     pub async fn update_step(&self, step_id: Uuid, req: &UpdateStepRequest) -> Result<()> {
         self.neo4j.update_step(step_id, req).await?;
+        self.drop_cached_prompt_of_step(step_id).await?;
         self.emit(
             CrudEvent::new(EntityType::Step, CrudAction::Updated, step_id.to_string())
                 .with_payload(serde_json::to_value(req).unwrap_or_default()),
@@ -312,6 +353,7 @@ impl PlanManager {
         self.neo4j
             .update_step_status(step_id, status.clone())
             .await?;
+        self.drop_cached_prompt_of_step(step_id).await?;
         let mut payload = serde_json::json!({
             "old_status": previous_status,
             "new_status": status,

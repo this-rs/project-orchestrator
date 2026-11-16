@@ -677,7 +677,7 @@ impl PlanStore for ObrainGraphStore {
             .await
     }
 
-    async fn delete_task(&self, task_id: Uuid) -> Result<()> {
+    async fn delete_task(&self, task_id: Uuid) -> Result<TaskDeletion> {
         self.tache_supprimer(task_id).await
     }
 

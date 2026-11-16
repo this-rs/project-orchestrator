@@ -1148,7 +1148,10 @@ impl PlanStore for Neo4jClient {
             .await
     }
 
-    async fn delete_task(&self, task_id: Uuid) -> anyhow::Result<()> {
+    async fn delete_task(
+        &self,
+        task_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::TaskDeletion> {
         self.delete_task(task_id).await
     }
 

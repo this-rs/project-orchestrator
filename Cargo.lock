@@ -5575,7 +5575,7 @@ dependencies = [
 [[package]]
 name = "obrain-adapters"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
+source = "git+https://github.com/obrain-db/obrain.git?rev=a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac#a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac"
 dependencies = [
  "arcstr",
  "bincode",
@@ -5601,7 +5601,7 @@ dependencies = [
 [[package]]
 name = "obrain-common"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
+source = "git+https://github.com/obrain-db/obrain.git?rev=a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac#a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac"
 dependencies = [
  "arcstr",
  "bincode",
@@ -5622,7 +5622,7 @@ dependencies = [
 [[package]]
 name = "obrain-core"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
+source = "git+https://github.com/obrain-db/obrain.git?rev=a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac#a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac"
 dependencies = [
  "arcstr",
  "byteorder",
@@ -5648,7 +5648,7 @@ dependencies = [
 [[package]]
 name = "obrain-engine"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
+source = "git+https://github.com/obrain-db/obrain.git?rev=a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac#a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -5675,7 +5675,7 @@ dependencies = [
 [[package]]
 name = "obrain-substrate"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
+source = "git+https://github.com/obrain-db/obrain.git?rev=a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac#a88b6b3217d4a64fdbdb6c3a8b407e32e2e74bac"
 dependencies = [
  "arcstr",
  "bincode",

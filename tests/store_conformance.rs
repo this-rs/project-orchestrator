@@ -56,11 +56,12 @@ pub mod conformance {
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::file_uid::PathPolicy;
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, CommitNode, ComponentType, ComponentUpdate, DeploymentNode,
-        DeploymentStatus, DerivedComponentWrite, EnvironmentKind, EnvironmentNode, FileNode,
-        MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile,
-        ReleaseNode, ReleaseStatus, ResourceNode, ResourceType, StepNode, StepStatus, TaskNode,
-        TaskStatus, WorkspaceMilestoneNode, WorkspaceNode,
+        AlertNode, AlertSeverity, CommitNode, ComponentType, ComponentUpdate, DecisionNode,
+        DecisionStatus, DeploymentNode, DeploymentStatus, DerivedComponentWrite, EnvironmentKind,
+        EnvironmentNode, FileNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
+        ProjectNode, ProjectProfile, ReleaseNode, ReleaseStatus, ResourceNode, ResourceType,
+        StepNode, StepStatus, TaskDeletion, TaskNode, TaskStatus, WorkspaceMilestoneNode,
+        WorkspaceNode,
     };
     use project_orchestrator::neo4j::GraphStore;
     use project_orchestrator::notes::{
@@ -790,7 +791,11 @@ pub mod conformance {
             )
             .await
             .unwrap();
-        store.delete_task(id).await.unwrap();
+        assert_eq!(
+            store.delete_task(id).await.unwrap(),
+            TaskDeletion::default(),
+            "deleting no task reports nothing deleted"
+        );
         assert!(store.get_task_dependencies(id).await.unwrap().is_empty());
         assert_eq!(store.increment_frustration(id, 0.3).await.unwrap(), 0.0);
         assert_eq!(store.decrement_frustration(id, 0.3).await.unwrap(), 0.0);
@@ -893,6 +898,121 @@ pub mod conformance {
         );
 
         assert!(store.delete_note(note.id).await.unwrap());
+    }
+
+    /// Deleting a task deletes its steps and its decisions, and SAYS so: the
+    /// report names the decisions that went, and only those (issue #1189 — the
+    /// cascade used to be silent). A decision of another task, and a decision
+    /// attached to no task, are left alone and not reported.
+    pub async fn check_task_delete_reports_its_cascade(store: &dyn GraphStore) {
+        let a_decision = |label: &str| DecisionNode {
+            id: Uuid::new_v4(),
+            description: format!("conformance decision {label}"),
+            rationale: "r".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "conformance".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let a_step = |order: u32| StepNode {
+            id: Uuid::new_v4(),
+            order,
+            description: format!("conformance step {order}"),
+            status: StepStatus::Pending,
+            verification: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        };
+
+        let p = a_project("task-delete");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "task delete plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        let doomed = a_task(Some("doomed"));
+        let bystander = a_task(Some("bystander"));
+        store.create_task(plan.id, &doomed).await.unwrap();
+        store.create_task(plan.id, &bystander).await.unwrap();
+
+        let (d1, d2) = (a_decision("one"), a_decision("two"));
+        let (kept, loose) = (a_decision("kept"), a_decision("loose"));
+        store.create_decision(doomed.id, &d1).await.unwrap();
+        store.create_decision(doomed.id, &d2).await.unwrap();
+        store.create_decision(bystander.id, &kept).await.unwrap();
+        store.create_decision_global(&loose, None).await.unwrap();
+        for order in 0..3 {
+            store.create_step(doomed.id, &a_step(order)).await.unwrap();
+        }
+        let kept_step = a_step(0);
+        store.create_step(bystander.id, &kept_step).await.unwrap();
+
+        let report = store.delete_task(doomed.id).await.unwrap();
+
+        assert_eq!(report.steps_deleted, 3);
+        let reported: HashSet<Uuid> = report.deleted_decision_ids.iter().copied().collect();
+        assert_eq!(report.deleted_decision_ids.len(), 2, "{report:?}");
+        assert_eq!(reported, HashSet::from([d1.id, d2.id]));
+
+        // What the report says is what happened — no more, no less.
+        assert!(store.get_task(doomed.id).await.unwrap().is_none());
+        for gone in [d1.id, d2.id] {
+            assert!(store.get_decision(gone).await.unwrap().is_none());
+        }
+        for stays in [kept.id, loose.id] {
+            assert!(store.get_decision(stays).await.unwrap().is_some());
+        }
+        assert!(store.get_step(kept_step.id).await.unwrap().is_some());
+        assert!(store.get_task_steps(doomed.id).await.unwrap().is_empty());
+
+        // A second delete finds nothing and says so.
+        assert_eq!(
+            store.delete_task(doomed.id).await.unwrap(),
+            TaskDeletion::default()
+        );
+
+        store.delete_decision(loose.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// The prompt `task enrich` caches on a task is cleared by writing an
+    /// empty string: it reads back as "no cache" (what `PlanManager` relies on
+    /// to drop a stale prompt, issue #1189), and the other enrichment fields
+    /// are left alone.
+    pub async fn check_empty_prompt_cache_reads_as_none(store: &dyn GraphStore) {
+        let p = a_project("prompt-cache");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "prompt cache plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        let task = a_task(Some("cached"));
+        store.create_task(plan.id, &task).await.unwrap();
+
+        store
+            .update_task_enrichment(task.id, Some("{\"ctx\":1}"), None, Some("CACHED PROMPT"))
+            .await
+            .unwrap();
+        let cached = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(cached.prompt_cache.as_deref(), Some("CACHED PROMPT"));
+
+        store
+            .update_task_enrichment(task.id, None, None, Some(""))
+            .await
+            .unwrap();
+        let cleared = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(cleared.prompt_cache, None, "an empty cache is no cache");
+        assert_eq!(
+            cleared.execution_context.as_deref(),
+            Some("{\"ctx\":1}"),
+            "the other enrichment fields are untouched"
+        );
+
+        store.delete_project(p.id, &p.name).await.unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -5833,6 +5953,8 @@ macro_rules! all_checks {
                 check_atomic_increments,
                 check_absent_entity_matrix,
                 check_cascade_delete_project,
+                check_task_delete_reports_its_cascade,
+                check_empty_prompt_cache_reads_as_none,
                 check_sorting,
                 check_sorting_tie_break_paging,
                 check_pagination,
