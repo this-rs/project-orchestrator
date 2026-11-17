@@ -1,0 +1,57 @@
+name: PO test image (cluster registry)
+
+# Builds the Project Orchestrator backend image for linux/amd64 on the self-hosted
+# ffs runner (native build, no emulation) and pushes it to the cluster registry
+# (NodePort 30500, see kube-infra docs/runbook.md). Manual only: this image feeds the
+# po-test namespace, a comparison environment, not a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or branch to build (defaults to the one selected)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: po-test-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and push po/backend (amd64)
+    runs-on: ${{ vars.CI_SELF_HOSTED_LABEL != '' && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to the cluster registry
+        uses: docker/login-action@v4
+        with:
+          registry: 127.0.0.1:30500
+          username: ${{ secrets.PO_TEST_REGISTRY_USER }}
+          password: ${{ secrets.PO_TEST_REGISTRY_PASSWORD }}
+
+      - name: Build and push
+        # The registry is node-local over HTTP: insecure is required here, and only here.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: |
+            127.0.0.1:30500/po/backend:${{ github.sha }}
+            127.0.0.1:30500/po/backend:po-test
+          outputs: type=registry,registry.insecure=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
