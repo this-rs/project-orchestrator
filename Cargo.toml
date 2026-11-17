@@ -187,11 +187,11 @@ nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "9710c9866f3
 # nor links it. Pinned by git rev like nexus (the repo is public, so cargo fetches it without a
 # sibling checkout); `pins.toml` carries the same sha for the local checkout. `obrain-common` is
 # direct because the adapter names its types (`Value`, `NodeId`).
-obrain-engine = { git = "https://github.com/obrain-db/obrain.git", rev = "3263bf7bb2bd1303393702cac34711a86b9b955b", optional = true }
-obrain-common = { git = "https://github.com/obrain-db/obrain.git", rev = "3263bf7bb2bd1303393702cac34711a86b9b955b", optional = true }
+obrain-engine = { git = "https://github.com/obrain-db/obrain.git", rev = "82467ff155dea9d698d6d676fa8a39c4375d0f00", optional = true }
+obrain-common = { git = "https://github.com/obrain-db/obrain.git", rev = "82467ff155dea9d698d6d676fa8a39c4375d0f00", optional = true }
 # `obrain-core` is direct for ONE name the engine does not re-export: `graph::Direction`, the
 # argument of `GraphStore::edges_from` (note.rs enumerates the edges of a node). Same rev as above.
-obrain-core = { git = "https://github.com/obrain-db/obrain.git", rev = "3263bf7bb2bd1303393702cac34711a86b9b955b", optional = true }
+obrain-core = { git = "https://github.com/obrain-db/obrain.git", rev = "82467ff155dea9d698d6d676fa8a39c4375d0f00", optional = true }
 tokio-stream = { workspace = true }
 
 # Auth
