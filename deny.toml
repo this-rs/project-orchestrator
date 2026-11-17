@@ -65,6 +65,19 @@ ignore = [
     # reconsider the whole `pdf` feature if it does not.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via pdf_oxide behind the opt-in `pdf` feature. Upstream is migrating to skrifa, already present in the same tree." },
     { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Transitive via bitstream-io ← rav1e ← ravif ← image ← fastembed. Pinned by upstream image crate; no upgrade path available. Surfaced as `yanked = warn` in [advisories]." },
+    # ── chrono unmaintained — RUSTSEC-2026-0543 / -0555 / -0559, publiées le
+    #    17/11/2026. `chrono`, `chrono-tz` et `chrono-tz-build` sont déclarés non
+    #    maintenus, TOUTES versions affectées ; l'alternative recommandée est jiff.
+    #    Ce ne sont pas des vulnérabilités : aucun CVE, aucun chemin de sécurité.
+    #    Pourquoi on n'y répond pas dans une PR : chrono porte toute la couche
+    #    temporelle du serveur (horodatages de session, requêtes Cypher, dates
+    #    persistées en base) et des dates déjà sérialisées vivent dans les bases
+    #    existantes. Migrer vers jiff est un chantier transverse avec migration de
+    #    données, pas un correctif de dépendance. C'est donc une DETTE NOMMÉE, avec
+    #    sa raison écrite ici — pas une advisory éteinte en silence.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (toutes versions). Migration vers jiff = chantier transverse (dates persistées en base). Aucune CVE, aucun chemin de sécurité." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (toutes versions), suit chrono dans la même dette. Aucune CVE." },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build unmaintained (toutes versions), proc-macro de chrono-tz. Aucune CVE." },
     # ── gtk-rs GTK3 bindings unmaintained — transitive via Tauri's Linux desktop
     #    stack (tauri → gtk/gdk/atk → *-sys). No fix until Tauri's GTK4 migration
     #    lands upstream; the bindings are not in any security-sensitive code path.
