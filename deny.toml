@@ -91,6 +91,11 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained — transitive via zbus (Tauri Linux DBus stack). Not in any security-sensitive path on macOS or Linux." },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained — transitive via zbus (Tauri Linux DBus stack). Informational, no security impact." },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained — proc-macro of zvariant, same Tauri Linux DBus chain. Informational." },
+    # chrono 0.4.45 (direct dependency, also chrono-tz-build via chrono-tz 0.8.6) is flagged
+    # unmaintained, with no vulnerability. Informational. Migration to jiff is tracked as debt.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (direct dep). Informational, no vulnerability; migration to jiff tracked as debt." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (chrono-tz 0.8.6 via chrono). Informational, no vulnerability; tracked with the chrono migration." },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build unmaintained (build dep of chrono-tz). Informational, no vulnerability; tracked with the chrono migration." },
     # ── quick-xml DoS advisories — no upgrade path (fix requires quick-xml >= 0.40).
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic duplicate-attribute check DoS. Transitive via plist 1.9.0 ← tauri; latest plist still pins quick-xml 0.39. Only used to read trusted macOS Info.plist bundle metadata — never untrusted XML. Revisit when plist bumps quick-xml >= 0.40." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml parsing-cost DoS (same family as RUSTSEC-2026-0194). Same transitive chain and justification: plist ← tauri, trusted local Info.plist input only." },

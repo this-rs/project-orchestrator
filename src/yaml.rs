@@ -125,7 +125,27 @@ fn check_size(input: &str) -> Result<(), YamlError> {
 /// Parse one YAML document into `T`, within the limits of this module.
 pub fn from_str<T: DeserializeOwned>(input: &str) -> Result<T, YamlError> {
     check_size(input)?;
-    Ok(serde_saphyr::from_str_with_options(input, options())?)
+    match serde_saphyr::from_str_with_options(input, options()) {
+        Ok(value) => Ok(value),
+        // serde-saphyr 2.1 refuses a null document (`---`, `~`, `null`, or only
+        // comments) where a mapping is expected. Such a document is the empty
+        // mapping, as serde_yaml read it and as the config loader documents it.
+        Err(err) if is_null_document(input) => {
+            serde_saphyr::from_str_with_options("{}", options()).map_err(|_| err.into())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// True when every line of `input` is blank, a comment, or a null marker (`---`,
+/// `...`, `~`, `null`). Textual on purpose: it parses nothing, so it cannot
+/// recurse into this function or expand an alias of a refused document.
+fn is_null_document(input: &str) -> bool {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .all(|l| matches!(l, "---" | "..." | "~" | "null" | "Null" | "NULL"))
 }
 
 /// Write `value` as a YAML document.
