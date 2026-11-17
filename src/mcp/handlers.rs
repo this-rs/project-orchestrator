@@ -140,11 +140,70 @@ const TASK_UPDATE_KEYS: &[&str] = &[
 /// Fields `step(action: "update")` writes.
 const STEP_UPDATE_KEYS: &[&str] = &["status", "description", "verification"];
 
+/// Refuse, before any request, an update that would answer `updated: true`
+/// without doing what it was asked:
+///
+/// - `unsupported_fields`: an argument the update cannot write. It used to be
+///   dropped, and the answer said the update had happened.
+/// - `empty_update`: no writable field at all, so nothing would change.
+///
+/// A `null` value and a `_`-prefixed key (client metadata) are not fields.
+fn refuse_unwritable_fields(
+    args: &Value,
+    tool: &str,
+    writable: &[&str],
+    what: &str,
+    id_key: &str,
+) -> Result<()> {
+    // Only the parameters the tool publishes are refused. A key the API writes
+    // but the tool does not publish (`due_date`, `model_alias`, …) keeps being
+    // ignored, as on main: refusing it would be a contract change of its own.
+    let published: Vec<String> = super::tools::all_tools()
+        .into_iter()
+        .find(|t| t.name == tool)
+        .and_then(|t| t.input_schema.properties)
+        .and_then(|p| p.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default();
+    let given: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| {
+            let key = key.as_str();
+            !value.is_null() && key != "action" && key != id_key && !key.starts_with('_')
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let mut unsupported: Vec<&str> = given
+        .iter()
+        .copied()
+        .filter(|key| !writable.contains(key) && published.iter().any(|p| p == key))
+        .collect();
+    unsupported.sort_unstable();
+    if !unsupported.is_empty() {
+        return Err(anyhow!(
+            "unsupported_fields: {what} cannot write {} — nothing was changed. It writes: {}",
+            unsupported.join(", "),
+            writable.join(", ")
+        ));
+    }
+    // Counted on the keys the update WRITES: a key the tool does not publish
+    // (`order`, `due_date`) is ignored, so it does not make the update non-empty.
+    // Without this the call went through with an empty body and answered success.
+    if !given.iter().any(|key| writable.contains(key)) {
+        return Err(anyhow!(
+            "empty_update: {what} was given no field to write — nothing was changed. It writes: {}",
+            writable.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// The body of an update, and the names of the fields it writes.
 ///
-/// Only the keys in `writable` are copied, as before; the answer names them so
-/// a caller can see what was written. Keys the update does not write are not
-/// copied and not refused here: refusing them is a contract change (#1189).
+/// Only the keys in `writable` are copied; the answer names them so
+/// a caller can see what was written. Keys the update does not write never
+/// get here: [`refuse_unwritable_fields`] refuses them first.
 ///
 /// A `null` writes nothing (the API reads it as "absent"), so it is neither
 /// sent nor named. `session_id` is sent — it is the link the API makes when a
@@ -177,13 +236,9 @@ fn take_malformed_string_lists(
 ) -> serde_json::Map<String, Value> {
     let mut rejected = serde_json::Map::new();
     for key in keys {
-        // `[]` is refused here too: clearing a list is a contract change
-        // (#1223), not part of this PR. It is named, not silently dropped.
+        // `[]` is a value: it clears the list (a contract change, see the PR).
         let reason = match body.get(*key) {
             None => continue,
-            Some(Value::Array(items)) if items.is_empty() => {
-                "not written: [] is not sent by this version (clearing a list is a contract change)"
-            }
             Some(Value::Array(items)) if items.iter().all(Value::is_string) => continue,
             Some(_) => "not written: must be an array of strings",
         };
@@ -1710,17 +1765,20 @@ impl ToolHandler {
 
             "update_task" => {
                 let task_id = extract_id(args, "task_id")?;
+                refuse_unwritable_fields(args, "task", TASK_UPDATE_KEYS, "task update", "task_id")?;
                 let (mut body, mut fields) = written_update_body(args, TASK_UPDATE_KEYS);
                 let rejected = take_malformed_string_lists(
                     &mut body,
                     &["acceptance_criteria", "affected_files"],
                 );
                 fields.retain(|field| !rejected.contains_key(field));
+                // `updated` says something was written: a refused list alone is not.
+                let written_any = !body.is_empty();
                 let result = http
                     .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
                     .await?;
                 Ok(Some(if result.is_null() {
-                    let mut answer = json!({"updated": true, "updated_fields": fields});
+                    let mut answer = json!({"updated": written_any, "updated_fields": fields});
                     if !rejected.is_empty() {
                         answer["rejected_fields"] = Value::Object(rejected);
                     }
@@ -1989,6 +2047,7 @@ impl ToolHandler {
 
             "update_step" => {
                 let step_id = extract_id(args, "step_id")?;
+                refuse_unwritable_fields(args, "step", STEP_UPDATE_KEYS, "step update", "step_id")?;
                 let (body, fields) = written_update_body(args, STEP_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
@@ -2176,12 +2235,22 @@ impl ToolHandler {
             }
 
             "supersede_decision" => {
-                // REST: /api/decisions/{new}/supersedes/{old}, which marks `old`.
-                // The MCP names are bound as they always were, so the decision
-                // marked superseded is `superseded_by_id`. Which one it is comes
-                // back in the answer: a change of direction is a separate change.
-                let new_id = extract_id(args, "decision_id")?;
-                let old_id = extract_id(args, "superseded_by_id")?;
+                // `decision_id: A, superseded_by_id: B` reads "A is superseded by
+                // B": A is the OLD decision, B the one that replaces it. The two
+                // were bound the other way round, so B — the new decision — was
+                // the one marked `superseded` (issue #1189).
+                // Compared as UUIDs: `extract_id` validates the format and returns the
+                // text, so `…ABC` and `…abc` are one decision, and the REST path
+                // (which normalises the id) would supersede it by itself.
+                let old_id = uuid::Uuid::parse_str(&extract_id(args, "decision_id")?)?;
+                let new_id = uuid::Uuid::parse_str(&extract_id(args, "superseded_by_id")?)?;
+                if old_id == new_id {
+                    return Err(anyhow!(
+                        "supersede_self: decision_id and superseded_by_id are the same \
+                         decision ({old_id}) — nothing was changed"
+                    ));
+                }
+                // REST: /api/decisions/{new}/supersedes/{old}
                 let result = http
                     .post(
                         &format!("/api/decisions/{}/supersedes/{}", new_id, old_id),
@@ -2189,15 +2258,21 @@ impl ToolHandler {
                     )
                     .await?;
                 Ok(Some(if result.is_null() {
+                    // Which one changed is part of the answer: a bare "ok" is
+                    // what let the inverted binding go unnoticed. `marked_superseded`
+                    // is the key the additive PR already answered with; `superseded`
+                    // says the same thing and is kept alongside it.
                     json!({
                         "status": "ok",
-                        "marked_superseded": old_id.to_string(),
-                        "superseded_by": new_id.to_string(),
+                        "marked_superseded": old_id,
+                        "superseded": old_id,
+                        "superseded_by": new_id,
                     })
                 } else {
                     result
                 }))
             }
+
             "get_decision_timeline" => {
                 let mut query = Vec::new();
                 if let Some(tid) = extract_optional_string(args, "task_id") {
@@ -7915,10 +7990,11 @@ mod tests {
         }
     }
 
-    /// `[]` is named in `rejected_fields` and clears nothing in this PR: the
-    /// clearing is a contract change, kept for the contract PR (#1223).
+    /// `[]` clears the list, as documented: `acceptance_criteria: []` and
+    /// `affected_files: []` are the way to empty them. This is a contract change
+    /// (a `[]` used to be dropped), so it lives in this PR only.
     #[tokio::test]
-    async fn an_empty_list_is_refused_by_name_and_clears_nothing() {
+    async fn an_empty_list_clears_the_criteria_and_the_files() {
         use crate::neo4j::traits::*;
         let (handler, graph, task_id) = real_handler_with_task().await;
         let result = handler
@@ -7934,17 +8010,240 @@ mod tests {
             .await
             .unwrap();
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
-        assert_eq!(stored.acceptance_criteria, vec!["old criterion"]);
-        assert_eq!(stored.affected_files, vec!["src/old.rs"]);
-        assert_eq!(result["updated_fields"], json!([]));
-        for key in ["acceptance_criteria", "affected_files"] {
+        assert!(stored.acceptance_criteria.is_empty());
+        assert!(stored.affected_files.is_empty());
+        assert_eq!(
+            result["updated_fields"],
+            json!(["acceptance_criteria", "affected_files"])
+        );
+        assert!(result.get("rejected_fields").is_none(), "{result}");
+    }
+
+    /// `decision supersede` against the real API: the answer names the decision
+    /// that was marked under `marked_superseded` (the key the additive PR already
+    /// answered with) and under `superseded`, and what it names is what changed.
+    #[tokio::test]
+    async fn supersede_answers_with_the_decision_marked_under_both_keys() {
+        use crate::neo4j::models::{DecisionNode, DecisionStatus};
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let decision = |label: &str| DecisionNode {
+            id: uuid::Uuid::new_v4(),
+            description: format!("decision {label}"),
+            rationale: "r".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "test".to_string(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let (old, new) = (decision("old"), decision("new"));
+        graph.create_decision(task_id, &old).await.unwrap();
+        graph.create_decision(task_id, &new).await.unwrap();
+
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": old.id.to_string(),
+                    "superseded_by_id": new.id.to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["marked_superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded_by"], new.id.to_string(), "{result}");
+        let old_after = graph.get_decision(old.id).await.unwrap().unwrap();
+        let new_after = graph.get_decision(new.id).await.unwrap().unwrap();
+        assert_eq!(old_after.status, DecisionStatus::Superseded);
+        assert_eq!(new_after.status, DecisionStatus::Accepted);
+    }
+
+    /// The keys `task update` and `step update` now refuse are the published
+    /// parameters of the tool that the update does not write: they used to be
+    /// ignored. The list is the one in the PR description; a new published
+    /// parameter changes it, and this test says so.
+    #[tokio::test]
+    async fn task_and_step_update_refuse_exactly_the_published_keys_they_do_not_write() {
+        let (handler, _) = make_http_handler().await;
+        let tools = crate::mcp::tools::all_tools();
+        let cases: [(&str, &str, &[&str]); 2] = [
+            (
+                "task",
+                "task_id",
+                &[
+                    "custom_sections",
+                    "dependency_id",
+                    "dependency_ids",
+                    "depends_on",
+                    "limit",
+                    "offset",
+                    "plan_id",
+                    "priority_max",
+                    "priority_min",
+                    "project_id",
+                    "sort_by",
+                    "sort_order",
+                    "steps",
+                    "workspace_slug",
+                ],
+            ),
+            ("step", "step_id", &["task_id"]),
+        ];
+        for (tool, id_key, expected) in cases {
+            let definition = tools
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("{tool} is published"));
+            let mut args = serde_json::Map::new();
+            for key in definition
+                .input_schema
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .expect("published properties")
+                .keys()
+            {
+                args.insert(key.clone(), json!("x"));
+            }
+            args.insert("action".to_string(), json!("update"));
+            args.insert(id_key.to_string(), json!(UUID1));
+
+            let err = handler
+                .handle(tool, Some(Value::Object(args)))
+                .await
+                .expect_err("keys the update does not write are refused");
+            let msg = err.to_string();
             assert!(
-                result["rejected_fields"][key]
-                    .as_str()
-                    .is_some_and(|why| why.contains("[]")),
-                "{key}: {result}"
+                msg.contains(&format!(
+                    "cannot write {} — nothing was changed",
+                    expected.join(", ")
+                )),
+                "{tool}: {msg}"
             );
         }
+    }
+
+    /// The same decision written in two cases is still the same decision: the
+    /// guard compares UUIDs, not text. Without it the request reached REST, which
+    /// normalises the id, and the decision was marked superseded by itself.
+    #[tokio::test]
+    async fn supersede_refuses_the_same_decision_whatever_the_case_of_its_uuid() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "superseded_by_id": "550E8400-E29B-41D4-A716-446655440000",
+                })),
+            )
+            .await
+            .expect_err("the same decision in two cases");
+        assert!(err.to_string().contains("supersede_self"), "{err}");
+    }
+
+    /// A key the API writes but the tool does not publish (`due_date`) keeps
+    /// being ignored, as on main: the update goes through, the key is not
+    /// refused and not written.
+    #[tokio::test]
+    async fn an_unpublished_key_the_api_writes_is_still_ignored_not_refused() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "title": "new title",
+                    "due_date": "2026-12-01",
+                })),
+            )
+            .await
+            .expect("an unpublished key is not a refusal");
+        assert_eq!(result["updated_fields"], json!(["title"]), "{result}");
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.title.as_deref(), Some("new title"));
+        assert_eq!(stored.due_date, None, "ignored, as before");
+    }
+
+    /// A key the tool does not publish (`order` on a step) does not make an update
+    /// non-empty: nothing is written, so the update is refused by name, before any
+    /// request. It used to go through with an empty body and answer `updated: true`.
+    #[tokio::test]
+    async fn step_update_with_only_an_unpublished_key_is_refused_as_empty() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({"action": "update", "step_id": UUID1, "order": 3})),
+            )
+            .await
+            .expect_err("nothing is written");
+        assert!(err.to_string().contains("empty_update"), "{err}");
+    }
+
+    /// The same on a task, against the real API: `due_date` is written by the
+    /// API but not published by the tool, so this update writes nothing.
+    #[tokio::test]
+    async fn task_update_with_only_an_unpublished_key_is_refused_as_empty() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "due_date": "2026-12-01",
+                })),
+            )
+            .await
+            .expect_err("nothing is written");
+        assert!(err.to_string().contains("empty_update"), "{err}");
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.due_date, None);
+    }
+
+    /// A list refused by name and nothing else: nothing was written, so the
+    /// answer says `updated: false` (in #1221 it said `true`, as on main).
+    #[tokio::test]
+    async fn a_refused_list_alone_answers_updated_false() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "acceptance_criteria": "one plain string",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["updated"], false, "{result}");
+        assert_eq!(result["updated_fields"], json!([]));
+        assert!(result["rejected_fields"]["acceptance_criteria"].is_string());
+        assert_eq!(
+            graph
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .acceptance_criteria,
+            vec!["old criterion"]
+        );
     }
 
     /// `updated_fields` names what was written, and only that: a `null` writes
@@ -7978,6 +8277,108 @@ mod tests {
         assert_eq!(stored.acceptance_criteria, vec!["new criterion"]);
         assert_eq!(stored.priority, before.priority, "null wrote nothing");
         assert_eq!(stored.tags, before.tags, "null wrote nothing");
+    }
+
+    /// A field `update` cannot write is refused by name, before any request.
+    #[tokio::test]
+    async fn task_update_refuses_a_field_it_cannot_write() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": UUID1,
+                    "title": "t",
+                    "steps": [{"description": "s"}],
+                    "depends_on": [UUID2],
+                })),
+            )
+            .await
+            .expect_err("steps and depends_on are not written by update");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported_fields"), "{msg}");
+        // The refused fields are named, and only they are.
+        assert!(
+            msg.contains("cannot write depends_on, steps — nothing was changed"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_update_refuses_a_field_it_cannot_write() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({
+                    "action": "update",
+                    "step_id": UUID1,
+                    "description": "d",
+                    "task_id": UUID2,
+                })),
+            )
+            .await
+            .expect_err("task_id is a published parameter that step update does not write");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported_fields"), "{msg}");
+        assert!(msg.contains("task_id"), "{msg}");
+    }
+
+    /// `decision_id: A, superseded_by_id: B` reads "A is superseded by B". The
+    /// handler sent it the other way round: B was marked superseded.
+    #[tokio::test]
+    async fn supersede_marks_decision_id_as_superseded_by_superseded_by_id() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": UUID1,
+                    "superseded_by_id": UUID2,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        // REST: /api/decisions/{new}/supersedes/{old}
+        assert_eq!(
+            result["path"],
+            format!("/api/decisions/{UUID2}/supersedes/{UUID1}")
+        );
+    }
+
+    /// A decision does not supersede itself: refused before any request.
+    #[tokio::test]
+    async fn supersede_refuses_the_same_decision_on_both_sides() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": UUID1,
+                    "superseded_by_id": UUID1,
+                })),
+            )
+            .await
+            .expect_err("same id on both sides");
+        assert!(err.to_string().contains("supersede_self"), "{err}");
+    }
+
+    /// An update that names no writable field changes nothing: it is refused,
+    /// not answered `updated: true`.
+    #[tokio::test]
+    async fn an_update_without_any_writable_field_is_refused() {
+        let (handler, _) = make_http_handler().await;
+        for (tool, id_key) in [("task", "task_id"), ("step", "step_id")] {
+            let err = handler
+                .handle(tool, Some(json!({"action": "update", id_key: UUID1})))
+                .await
+                .expect_err("nothing to write");
+            assert!(err.to_string().contains("empty_update"), "{tool}: {err}");
+        }
     }
 
     #[tokio::test]
