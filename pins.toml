@@ -21,7 +21,7 @@ rev  = "61040a2c631aa1c2dc97cfc2be02078df74563b5"
 [repo.obrain]
 path = "obrain/obrain-db"
 url  = "https://github.com/obrain-db/obrain.git"
-rev  = "9c89f9894c36572c0af353a63a2a1fafd67e2641"
+rev  = "3263bf7bb2bd1303393702cac34711a86b9b955b"
 
 [repo.atelier]
 path = "this-rs/atelier"
