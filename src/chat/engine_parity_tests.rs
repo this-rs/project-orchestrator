@@ -3207,6 +3207,9 @@ fn precompact_instructions(line: &str) -> String {
 
 /// The scenario twice: Claude Code on the historical engine, then on the agent engine
 /// (each run on its own stage, CLI and endpoint); the native column is the first run's.
+// QUARANTAINE : échec intermittent préexistant (déjà rouge sur 7f9ccfd1, vert sur le même SHA
+// ailleurs) — le relais Codex reste muet après `initialized`. À réactiver après diagnostic.
+#[ignore = "quarantaine : hang intermittent du relais Codex, voir la PR de quarantaine"]
 #[test]
 fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     // A thread of its own with a large stack: the scenario's future outgrew the test
