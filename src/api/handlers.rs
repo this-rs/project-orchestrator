@@ -2018,7 +2018,7 @@ async fn listen_delegation_result(
         std::time::Duration::from_secs(limits.timeout_secs)
     };
 
-    let closure = DelegationClosure {
+    let mut closure = DelegationClosure {
         task_id,
         task_title,
         event_bus,
@@ -2027,20 +2027,51 @@ async fn listen_delegation_result(
         owner,
         limits,
         halt,
+        close_child: false,
     };
 
-    // Every `break` leaves `execution` to drop: closed `failed` (channel closed without a
-    // result). Every other end — a `Result`, the delay — goes through ONE closure
-    // (`DelegationClosure::finish`, PYSR-3b).
+    // A `Result` closes a TURN, not a session (#1188). A delegated child that ends its turn
+    // while it waits on something — a `run_in_background` command it started, a turn still
+    // open — is woken again and goes on working. Closing the delegation
+    // on its FIRST `Result` told the parent « completed » while the child kept running; the
+    // parent re-delegated the same task, and two agents worked one task in one worktree. The
+    // delegation ends when the child has nothing left to do, on the LAST `Result` it gave —
+    // the spend it states is cumulative, so the later one is also the true total.
+    //
+    // Every `break` leaves `execution` to drop: closed `failed` (channel closed with nothing
+    // to close on). Every other end — a `Result` with nothing left behind it, the child's
+    // death, the delay — goes through ONE closure (`DelegationClosure::finish`, PYSR-3b).
+    let mut ended_turn: Option<(DelegationEnd, Option<serde_json::Value>)> = None;
+    // Whether a NEW turn began since `ended_turn` (#1239). Decided on the ORDER of the events
+    // of this one channel — `StreamingStatus { true }` (emitted when a turn starts) comes
+    // before the `SessionError` of a CLI that dies in that turn — and not on a state read
+    // after the fact (`is_turn_running`): the runtime resets its streaming flag with no
+    // synchronisation with the emission of the death, so a late read could see « no turn ».
+    let mut new_turn_since_end = false;
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             tracing::warn!(task_id = %task_id, timeout_secs = limits.timeout_secs, "Delegation past its delay: the child is stopped");
+            // Whether a turn runs NOW, asked before the interrupt (which ends it). A finished
+            // turn (`ended_turn`) is the last one only if no later turn began since: the child
+            // woken by its background work runs a new turn whose `Result` is the one to read.
+            let turn_running = new_turn_since_end || delegation_turn_running(&closure.halt).await;
             // Stop the CHILD, not only the listening: its running turn is interrupted, and
             // what it spent up to there is read from the `Result` that interrupted turn gives
             // (bounded wait). The session is closed by the closure, its descendants with it.
             if let Some(halt) = &closure.halt {
                 halt.interrupt().await;
+            }
+            // A turn already ended and the child only waited on its background work: no turn
+            // is running, so the interrupt gives no `Result` to wait for. The delegation closes
+            // on that finished turn — its answer and its spend — and the background work the
+            // interrupt stopped does not make it a failure. The child is closed all the same
+            // (PYSR-3b), with what it spawned, although the status stays `completed`.
+            if !turn_running {
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    closure.close_child = true;
+                    return closure.finish(end, cost_detail, execution).await;
+                }
             }
             let ended = result_after_interrupt(&mut rx).await;
             let duration_secs = start.elapsed().as_secs_f64();
@@ -2071,28 +2102,123 @@ async fn listen_delegation_result(
             return closure.finish(end, cost_detail, execution).await;
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+        // Once a turn has ended but the child may still be working, look again soon enough
+        // that a delegation which really ended is not held back by a finished task's last
+        // bookkeeping. The rest of the time, the 10 s tick is enough.
+        let tick = if ended_turn.is_some() {
+            DELEGATION_SETTLE_TICK
+        } else {
+            DELEGATION_LISTEN_TICK
+        };
+        match tokio::time::timeout(tick, rx.recv()).await {
             Ok(Ok(result @ crate::chat::types::ChatEvent::Result { .. })) => {
                 let (end, cost_detail) =
                     end_of_result(result, &limits, start.elapsed().as_secs_f64());
+                // This `Result` is the newest turn's end: no turn began since it.
+                new_turn_since_end = false;
+                if delegation_child_has_work(&closure.halt).await {
+                    ended_turn = Some((end, cost_detail));
+                    continue;
+                }
                 return closure.finish(end, cost_detail, execution).await;
+            }
+            Ok(Ok(crate::chat::types::ChatEvent::SessionError {
+                reason, message, ..
+            })) => {
+                // The child's session is gone for good (`SessionError`: every later message on
+                // it is a silent no-op), so no turn will ever end and the delegation used to
+                // wait for its delay while the parent believed the work was going on (#1188
+                // §3). Its death is reported as a FAILED delegation — unless a turn had already
+                // ended AND no later turn was running when it died (that turn's death is not a
+                // success): the work it did stands, and the delegation closes on it.
+                let turn_running =
+                    new_turn_since_end || delegation_turn_running(&closure.halt).await;
+                if let Some((end, cost_detail)) = ended_turn.take().filter(|_| !turn_running) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        reason = %reason,
+                        "Delegation: the child's session ended ({message}) after a finished turn; closing on that turn"
+                    );
+                    return closure.finish(end, cost_detail, execution).await;
+                }
+                tracing::warn!(
+                    task_id = %task_id,
+                    reason = %reason,
+                    "Delegation: the child's session ended ({message}); closing it failed"
+                );
+                let end = DelegationEnd {
+                    duration_secs: Some(start.elapsed().as_secs_f64()),
+                    ..DelegationEnd::failed()
+                };
+                // The session is dead: closing it frees what it spawned, and changes no status.
+                closure.close_child = true;
+                return closure.finish(end, None, execution).await;
+            }
+            Ok(Ok(crate::chat::types::ChatEvent::StreamingStatus { is_streaming })) => {
+                // A turn began (`true`) after the finished one, or this turn ended (`false`).
+                new_turn_since_end = is_streaming && ended_turn.is_some();
             }
             Ok(Ok(_)) => {
                 // Other event types — keep listening
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!("Delegation listener lagged by {} events", n);
+                // Events were missed, among them perhaps the start of a turn: take the
+                // prudent path (a death or the delay is then not read as the end of T1).
+                new_turn_since_end = true;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                // The child left with nothing more to say: close on its last finished turn,
+                // otherwise `failed` (the `execution` drop, below).
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    return closure.finish(end, cost_detail, execution).await;
+                }
                 tracing::warn!(task_id = %task_id, "Delegation channel closed");
                 break;
             }
             Err(_) => {
-                // 10s poll timeout — loop again
+                // The tick: close on the finished turn once the child has nothing left to do
+                // (the background task it waited on is over), else keep waiting for its wake.
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    if delegation_child_has_work(&closure.halt).await {
+                        ended_turn = Some((end, cost_detail));
+                    } else {
+                        return closure.finish(end, cost_detail, execution).await;
+                    }
+                }
             }
         }
     }
     None
+}
+
+/// How often the listener polls its channel while the child works and says nothing.
+const DELEGATION_LISTEN_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the listener looks again once a turn ended but the child may still be working
+/// (a background task it waits on, a queued message): short, so a delegation that really
+/// ended is closed at once instead of on the next [`DELEGATION_LISTEN_TICK`].
+const DELEGATION_SETTLE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the child of a delegation still has work: a turn running, or a background task its
+/// provider still reports ([`ChatManager::is_session_working`]). A `Result` that arrives while
+/// it does closes a turn, not the delegation (#1188).
+async fn delegation_child_has_work(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_working().await,
+        // No handle on the child (a delegation nobody opened from a session): the `Result` is
+        // the end, as it was before.
+        None => false,
+    }
+}
+
+/// Whether a turn of the child runs right now ([`ChatManager::is_session_streaming`]): a
+/// background task alone is not a turn. Without a handle on the child, none.
+async fn delegation_turn_running(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_turn_running().await,
+        None => false,
+    }
 }
 
 /// How long the listener waits, once it interrupted a delegation past its delay, for the
@@ -2176,6 +2302,9 @@ struct DelegationClosure<'a> {
     owner: DelegationOwner,
     limits: crate::runner::DelegationLimits,
     halt: Option<Arc<dyn DelegationHalt>>,
+    /// Close the child (cascade) even when no stop is recorded: the delay found it with a
+    /// finished turn and only background work left — `completed`, yet not left open.
+    close_child: bool,
 }
 
 impl DelegationClosure<'_> {
@@ -2288,8 +2417,9 @@ impl DelegationClosure<'_> {
             }
         }
 
-        // Stopped by its own limits: the child does not stay open, nor anything it spawned.
-        if end.stop.is_some() {
+        // Stopped by its own limits (or by the delay after a finished turn): the child does not
+        // stay open, nor anything it spawned.
+        if end.stop.is_some() || self.close_child {
             if let Some(halt) = &self.halt {
                 halt.close().await;
             }
@@ -2326,6 +2456,13 @@ fn delegation_stop_reason(
 pub(crate) trait DelegationHalt: Send + Sync {
     /// The running turn is interrupted (the session stays, so its last `Result` comes).
     async fn interrupt(&self);
+    /// Whether the child still has work: a turn running, or a background task its provider
+    /// still reports. A `Result` that arrives while it does closes a TURN, not the
+    /// delegation (#1188).
+    async fn is_working(&self) -> bool;
+    /// Whether a turn runs right now (not a background task alone): a `Result` already seen
+    /// is then not the last one.
+    async fn is_turn_running(&self) -> bool;
     /// The session is closed with every session it spawned (cascade): a sub-agent of the
     /// child does not outlive the stop.
     async fn close(&self);
@@ -2339,6 +2476,14 @@ struct HaltSession {
 
 #[async_trait::async_trait]
 impl DelegationHalt for HaltSession {
+    async fn is_working(&self) -> bool {
+        self.manager.is_session_working(&self.session_id).await
+    }
+
+    async fn is_turn_running(&self) -> bool {
+        self.manager.is_session_streaming(&self.session_id).await
+    }
+
     async fn interrupt(&self) {
         if let Err(e) = self.manager.interrupt(&self.session_id).await {
             tracing::debug!(session_id = %self.session_id, "interrupting the delegation past its limit: {e}");
@@ -2445,6 +2590,11 @@ fn delegation_wake(
 /// the two can never disagree.
 fn delegation_notification(task_id: Uuid, task_title: &str, end: &DelegationEnd) -> String {
     let status = if end.is_error { "failed" } else { "completed" };
+    let verb = if end.is_error {
+        "stopped without finishing"
+    } else {
+        "ended"
+    };
     let mut detail = String::new();
     if let Some(secs) = end.duration_secs {
         detail.push_str(&format!(" in {secs:.0}s"));
@@ -2458,10 +2608,19 @@ fn delegation_notification(task_id: Uuid, task_title: &str, end: &DelegationEnd)
             crate::chat::provider::event_map::stop_reason_name(*stop)
         ));
     }
+    // `completed` means the child is idle with nothing left to do (#1188): what it answered is
+    // on the task. `failed` means it stopped without finishing — the parent must not read that
+    // as done, so the two say different things.
+    let tail = if end.is_error {
+        " The work is NOT finished as far as the task and its AgentExecution show: read them \
+         with task(action: \"get\") and decide — delegate it again, or do it yourself."
+    } else {
+        " Its answer is on the task and its AgentExecution: read them with task(action: \
+         \"get\"), then carry on with what it was needed for."
+    };
     format!(
         "<task-notification task_id=\"{task_id}\" status=\"{status}\">Delegated task \
-         «{task_title}» ended{detail}. Its answer is on the task and its AgentExecution: read \
-         them with task(action: \"get\"), then carry on with what it was needed for.\
+         «{task_title}» {verb}{detail}.{tail}\
          </task-notification>"
     )
 }
@@ -9169,6 +9328,232 @@ pub(crate) mod tests {
         }
     }
 
+    /// A turn of the fake provider that ended well, with the cumulative spend it states.
+    fn a_finished_turn(cost_usd: f64) -> nexus_claude::agent::AgentEvent {
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+        AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some("done".into()),
+            usage: Default::default(),
+            cost: Cost {
+                usd: Some(cost_usd),
+                basis: CostBasis::Reported,
+            },
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m".into()),
+            provider_session_id: Some("p-1".into()),
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    /// A `run_in_background` command the child started and still waits on.
+    fn a_running_shell_task() -> nexus_claude::agent::BackgroundTask {
+        use nexus_claude::agent::{BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus};
+        BackgroundTask {
+            id: "nt-1".into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "sleep 30".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: Some("c7".into()),
+            parent: None,
+            pid: Some(4242),
+        }
+    }
+
+    /// Waits until the fake provider opened its `n`-th turn.
+    async fn wait_for_turns(fake: &crate::chat::agent_runtime::fake::FakeProvider, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if fake.state.turns_started.lock().unwrap().len() >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake provider never opened turn {n}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// What the parent was told about the delegation within `within`, if anything: the
+    /// notification names the task.
+    async fn delegation_told_within(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        within: std::time::Duration,
+        task_id: Uuid,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task_id.to_string()) =>
+                {
+                    return Some(content)
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The rig of a delegation that OPENS on the in-process fake provider: the parent (a
+    /// session a person drives) is live and listened to, its child runs on the fake, and the
+    /// fake's queue is what a test pushes that child's events into. Returns the manager, the
+    /// fake, the parent's events, the delegated task and the child's session id.
+    #[allow(clippy::type_complexity)]
+    async fn open_a_delegation_on_the_fake() -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        Uuid,
+        String,
+    ) {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        // The parent is live (a child only opens under a live parent) and listened to.
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state =
+            crate::test_helpers::server_state_with_chat(manager.clone(), mock.clone()).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        let req = DelegateTaskRequest {
+            cwd: parent.cwd.clone(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+
+        let response = super::delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the delegation opens on the fake provider: {e:?}"));
+        let (status, Json(outcome)) = response;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        let DelegateTaskOutcome::Launched(launched) = outcome else {
+            panic!("no execution place was asked for: nothing to confirm")
+        };
+        (manager, fake, rx, task.id, launched.session_id)
+    }
+
+    /// #1188 §1: a `Result` closes a TURN, not the delegation. A child that ends its turn
+    /// while it still waits on a `run_in_background` command is woken again and goes on
+    /// working; reporting « completed » there made the parent re-delegate the same task into
+    /// the same worktree, and two agents worked one task at once.
+    #[tokio::test]
+    async fn a_delegation_is_not_over_while_its_child_still_has_work() {
+        use nexus_claude::agent::AgentEvent;
+
+        let (manager, fake, mut rx, task_id, child) = open_a_delegation_on_the_fake().await;
+        wait_for_turns(&fake, 1).await;
+        // The child started a background command and ends its turn waiting on it.
+        fake.state.push(AgentEvent::BackgroundTasks {
+            tasks: vec![a_running_shell_task()],
+        });
+        fake.state.push(a_finished_turn(0.01));
+
+        assert!(
+            delegation_told_within(&mut rx, std::time::Duration::from_millis(2500), task_id)
+                .await
+                .is_none(),
+            "a child that still has a background task running was reported over (#1188 §1)"
+        );
+
+        // The task ends, the child is woken and finishes: THIS is the end of the delegation.
+        manager
+            .send_message(&child, "the task ended, carry on")
+            .await
+            .unwrap();
+        wait_for_turns(&fake, 2).await;
+        fake.state
+            .push(AgentEvent::BackgroundTasks { tasks: vec![] });
+        fake.state.push(a_finished_turn(0.02));
+
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_id)
+            .await
+            .expect("the end of the delegation never reached the parent");
+        assert!(told.contains("status=\"completed\""), "{told}");
+        assert!(
+            told.contains("$0.0200"),
+            "the spend closed on is the cumulative one, not the first turn's: {told}"
+        );
+    }
+
+    /// #1188 §3: a delegated child whose provider process dies is reported FAILED. Its death
+    /// used to reach nobody — the task stayed `in_progress` and the delegation waited for its
+    /// delay while the parent believed the work was going on.
+    #[tokio::test]
+    async fn a_delegation_whose_child_dies_is_reported_failed() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+
+        let (_manager, fake, mut rx, task_id, _child) = open_a_delegation_on_the_fake().await;
+        wait_for_turns(&fake, 1).await;
+        fake.state.push(AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: Some(137) },
+        });
+
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_id)
+            .await
+            .expect("the death of the child never reached the parent");
+        assert!(told.contains("status=\"failed\""), "{told}");
+        assert!(told.contains("NOT finished"), "{told}");
+    }
+
     /// The stored execution, once it is no longer `running` (the drop path
     /// writes from a spawned task).
     async fn closed_execution(
@@ -9431,10 +9816,19 @@ pub(crate) mod tests {
     /// A `DelegationHalt` that records what it was asked (`interrupted`, `closed`) and, when
     /// it holds the child's channel, answers the interrupt with the `Result` an interrupted
     /// turn gives.
+    ///
+    /// Its child has nothing left to do unless the test says so ([`Self::still_working`]),
+    /// which is what a `Result` in the middle of a session looks like (#1188 §1).
     #[derive(Default)]
     struct HaltRecorder {
         interrupted: std::sync::atomic::AtomicBool,
         closed: std::sync::atomic::AtomicBool,
+        /// Whether the child still has work — a background task, a turn still open.
+        working: std::sync::atomic::AtomicBool,
+        /// Whether a turn runs (a new turn began after a finished one).
+        turn_running: std::sync::atomic::AtomicBool,
+        /// How many times the listener asked: a test waits for the question, then answers it.
+        work_checks: std::sync::atomic::AtomicUsize,
         on_interrupt:
             std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>>>,
         result: std::sync::Mutex<Option<crate::chat::types::ChatEvent>>,
@@ -9451,6 +9845,23 @@ pub(crate) mod tests {
                 ..Default::default()
             }
         }
+        /// The child still has work until the test says otherwise ([`Self::stopped_working`]).
+        fn still_working(self) -> Self {
+            self.working
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        /// A new turn is running (the child was woken by its background work).
+        fn in_a_turn(self) -> Self {
+            self.turn_running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        /// The work the child was waiting on is over: the next turn is its last.
+        fn stopped_working(&self) {
+            self.working
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         fn interrupted(&self) -> bool {
             self.interrupted.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -9461,6 +9872,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl super::DelegationHalt for HaltRecorder {
+        async fn is_turn_running(&self) -> bool {
+            self.turn_running.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn is_working(&self) -> bool {
+            self.work_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.working.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn interrupt(&self) {
             self.interrupted
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9511,6 +9930,119 @@ pub(crate) mod tests {
             }
         }
         None
+    }
+
+    /// #1239 — with the REAL `ChatManager` (not `HaltRecorder`): a child that finished a
+    /// turn (while a background task of it still runs) and began a NEW turn, whose CLI then
+    /// dies. The death reaches the listener as the `SessionError` the out-of-band listener
+    /// publishes (`emit_subprocess_death`); while the new turn's own stream is closing on the
+    /// same dead output. The delegation is `failed`: the dead turn's work is not a success.
+    /// Since #1239 the verdict does not depend on `is_session_streaming` at the read (the
+    /// runtime resets it in `next_queued`/`drive` with no synchronisation with the death's
+    /// emission): the `StreamingStatus { true }` of T2 on the channel, before the
+    /// `SessionError`, is what says a new turn began.
+    #[tokio::test]
+    async fn a_child_whose_cli_dies_in_a_new_turn_fails_its_delegation_with_the_real_manager() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        use crate::neo4j::GraphStore;
+        use nexus_claude::Message;
+
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            graph,
+            search,
+            crate::chat::manager::test_support::chat_config(),
+        ));
+        let sid = Uuid::new_v4().to_string();
+        let cli =
+            crate::chat::manager::test_support::insert_dying_cli_session(&manager, &sid).await;
+        // The child waits on a background task of its own, so a `Result` is a turn's end.
+        crate::chat::manager::test_support::set_cli_background_tasks(&manager, &sid, 1).await;
+        let rx = manager.subscribe(&sid).await.unwrap();
+        // What the manager says at the instant the `SessionError` is published.
+        let mut probe = manager.subscribe(&sid).await.unwrap();
+        let probe_manager = manager.clone();
+        let probe_sid = sid.clone();
+        let streaming_at_death = tokio::spawn(async move {
+            loop {
+                if let Ok(crate::chat::types::ChatEvent::SessionError { .. }) = probe.recv().await {
+                    return probe_manager.is_session_streaming(&probe_sid).await;
+                }
+            }
+        });
+
+        let result = || Message::Result {
+            subtype: "success".into(),
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            session_id: "cli-1".into(),
+            total_cost_usd: Some(0.1),
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        let halt = Arc::new(HaltSession {
+            manager: manager.clone(),
+            session_id: sid.clone(),
+        });
+        let listener = tokio::spawn(super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt),
+        ));
+
+        // T1 runs and ends: the listener keeps the finished turn, the child still has work.
+        manager.send_message(&sid, "t1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cli.say(result());
+        wait_until(|| async { !manager.is_session_streaming(&sid).await }).await;
+        // T2 begins, and the CLI dies in it.
+        manager.send_message(&sid, "t2").await.unwrap();
+        wait_until(|| async { manager.is_session_streaming(&sid).await }).await;
+        cli.die();
+
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(15), listener)
+            .await
+            .expect("the delegation ends")
+            .unwrap();
+        let streaming = streaming_at_death.await.unwrap();
+
+        let stored = closed_execution(&mock, id).await;
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(
+            stored.status,
+            AgentExecutionStatus::Failed,
+            "stop={stop:?} streaming_at_death={streaming} event={event}"
+        );
+        assert_eq!(event["event"], "delegation_failed");
+    }
+
+    /// Polls `condition` for up to 10 s.
+    async fn wait_until<F, Fut>(condition: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the condition never held");
     }
 
     /// PYSR-3b — a delegation stopped by its DELAY goes through the same closure as one that
@@ -9676,6 +10208,412 @@ pub(crate) mod tests {
         assert!(!halt.closed() && !halt.interrupted());
         let task = mock.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(task.status, crate::neo4j::models::TaskStatus::InProgress);
+    }
+
+    /// #1188 §1 — a `Result` that arrives while the child still has work closes a TURN, not
+    /// the delegation: the listener keeps waiting, and what it closes on is the CUMULATIVE
+    /// spend of the LAST turn (the parent used to be told « completed » on the first one and
+    /// re-delegated the same task, so two agents worked one task in one worktree).
+    #[tokio::test]
+    async fn a_result_while_the_child_still_works_closes_a_turn_not_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+
+        let listening = tokio::spawn({
+            let halt = halt.clone();
+            let event_bus = Arc::new(crate::events::HybridEmitter::new(bus));
+            async move {
+                super::listen_delegation_result(
+                    rx,
+                    task_id,
+                    "delegated",
+                    event_bus,
+                    None,
+                    None,
+                    execution,
+                    super::DelegationOwner::default(),
+                    crate::runner::DelegationLimits::default(),
+                    Some(halt),
+                )
+                .await
+            }
+        });
+
+        // The first `Result` reached the listener, which asked whether the child still works.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while halt.work_checks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never asked whether the child still works"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            delegation_event(&mut events).is_none(),
+            "a turn's `Result` was reported as the end of the delegation (#1188 §1)"
+        );
+
+        // The command the child waited on is over; its last turn states the total spent.
+        halt.stopped_working();
+        tx.send(reported(0.9)).unwrap();
+
+        let stop = listening.await.unwrap();
+        assert_eq!(stop, None, "the delegation ended on its own");
+        assert!(!halt.closed() && !halt.interrupted());
+        let event = delegation_event(&mut events).expect("the end of the delegation is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(
+            event["cost_usd"], 0.9,
+            "the delegation closes on the last turn's cumulative spend: {event}"
+        );
+    }
+
+    /// #1188 — the delay expires while the child, its turn ended, only waits on background
+    /// work: no turn is running, so the interrupt gives no `Result`. The delegation closes on
+    /// the finished turn (completed, its spend), at once. Red before: the listener waited the
+    /// whole `INTERRUPT_RESULT_GRACE` for a `Result` that never comes, then closed `failed`
+    /// at an unknown cost.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        let start = tokio::time::Instant::now();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        let waited = start.elapsed();
+        drop(tx);
+
+        assert!(halt.interrupted(), "the background work is stopped");
+        assert!(halt.closed(), "the child is closed, with what it spawned");
+        assert_eq!(stop, None, "the finished turn is the delegation's end");
+        assert!(
+            waited < std::time::Duration::from_secs(90) + super::INTERRUPT_RESULT_GRACE,
+            "no grace is waited for a `Result` no turn will give: {waited:?}"
+        );
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 §3 — the child's session dies AFTER a finished turn (it only waited on
+    /// background work): the work it did stands, the delegation closes on that turn,
+    /// completed. Red before: any `SessionError` closed the delegation `failed`.
+    #[tokio::test]
+    async fn a_session_error_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, None);
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 — T1 ended, the background work finished, the child woke and T2 RUNS when the
+    /// delay expires: T2 is interrupted and its `Result` read (its cumulative spend), the
+    /// delegation closes `Interrupted`, the child closed. Red before: the listener closed
+    /// `completed` on T1's spend and dropped T2's.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_during_a_new_turn_reads_that_turns_result() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.9)).in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        halt.working
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        assert!(halt.interrupted() && halt.closed());
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed");
+        assert_eq!(
+            event["cost_usd"], 0.9,
+            "T2's cumulative spend is read, not T1's: {event}"
+        );
+    }
+
+    /// #1188 — the child's session dies while a NEW turn runs, after a finished one: that
+    /// turn's death is a failure, not a success on T1. Red before: `completed` at T1's spend.
+    #[tokio::test]
+    async fn a_session_error_during_a_new_turn_fails_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working().in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
+    }
+
+    /// #1239 — the DANGEROUS ORDER, forced: T1 ended, T2 began (`StreamingStatus { true }` on
+    /// the channel), and the runtime's streaming flag is ALREADY back to `false` (the halt says
+    /// « no turn ») when the `SessionError` is read. The order of the events decides, not the
+    /// flag: the delegation is `failed`. Red before: `completed` on T1's answer.
+    #[tokio::test]
+    async fn a_session_error_after_a_new_turn_began_fails_even_if_the_flag_is_already_reset() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        // Working (so T1's `Result` is a turn's end), no turn running at the read.
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
+        assert!(halt.closed(), "the dead child is closed");
+    }
+
+    /// #1239 — a turn that began and ENDED (`StreamingStatus { false }`) before the death is
+    /// not a running one: the delegation closes on T1's last `Result`, as before.
+    #[tokio::test]
+    async fn a_session_error_after_the_new_turn_ended_closes_on_the_last_result() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+        tx.send(reported(0.6)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus {
+            is_streaming: false,
+        })
+        .unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        halt.working
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed", "{event}");
+        assert_eq!(event["cost_usd"], 0.6, "{event}");
+    }
+
+    /// #1239 — the same order for the DELAY: a new turn began (seen on the channel) while the
+    /// streaming flag already reads `false`: the turn is interrupted and its `Result` read
+    /// (`Interrupted`, T2's spend), not closed `completed` on T1. Red before: `completed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_after_a_new_turn_began_interrupts_even_if_the_flag_is_already_reset() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.9)).still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["cost_usd"], 0.9, "{event}");
+    }
+
+    /// #1239 — a `Lagged` broadcast may have swallowed the start of a turn: the death is then
+    /// read the prudent way (`failed`).
+    #[tokio::test]
+    async fn a_session_error_after_a_lag_fails_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        let listener = tokio::spawn(super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        ));
+        // The listener kept T1's `Result` (it asked whether the child works).
+        wait_until(|| async { halt.work_checks.load(std::sync::atomic::Ordering::SeqCst) > 0 })
+            .await;
+        // The buffer overflows with the listener not reading: it lags, losing the start of
+        // a turn, then reads the death.
+        for _ in 0..4 {
+            tx.send(crate::chat::types::ChatEvent::StreamDelta {
+                text: "x".into(),
+                parent_tool_use_id: None,
+            })
+            .unwrap();
+        }
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        listener.await.unwrap();
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
     }
 
     /// PYSR-3b — the halt of a delegation closes the child AND what the child spawned (a
