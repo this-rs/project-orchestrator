@@ -783,24 +783,26 @@ async fn handle_ws_chat_loop(
             // streaming, which is exactly what `streaming_status` means. It is a
             // transient event (never persisted, never in the snapshot), and the
             // client's handler for it is idempotent.
+            // One door out for a dead socket, not two: the beat stays alive only
+            // if every frame it writes lands. Splitting it in two branches would
+            // add a second `break` that no test can reach deterministically (a
+            // client that goes away is seen by the read arm first), i.e. a line
+            // nobody can ever prove.
             _ = ping_interval.tick() => {
-                if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
-                    debug!("Ping failed, client disconnected");
-                    break;
-                }
-                if chat_manager.is_session_streaming(&session_id).await {
+                let mut alive = ws_sender.send(Message::Ping(vec![].into())).await.is_ok();
+                if alive && chat_manager.is_session_streaming(&session_id).await {
                     let keepalive = serde_json::json!({
                         "type": "streaming_status",
                         "is_streaming": true,
                     });
-                    if ws_sender
+                    alive = ws_sender
                         .send(Message::Text(keepalive.to_string().into()))
                         .await
-                        .is_err()
-                    {
-                        debug!("Keepalive failed, client disconnected");
-                        break;
-                    }
+                        .is_ok();
+                }
+                if !alive {
+                    debug!("Ping failed, client disconnected");
+                    break;
                 }
             }
 
