@@ -31,6 +31,15 @@ use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// How often this connection pings its client — and, while a turn is running,
+/// says so (see the ping arm of the loop). 30 s is what the socket has always
+/// used; a test cannot wait that long for the frame it asserts, so it gets a
+/// shorter beat. Nothing else depends on the value.
+#[cfg(not(test))]
+const WS_PING_EVERY: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WS_PING_EVERY: Duration = Duration::from_millis(250);
+
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
 pub struct WsChatQuery {
@@ -579,8 +588,7 @@ async fn handle_ws_chat_loop(
             .await;
     }
 
-    // Ping interval (30s)
-    let mut ping_interval = interval(Duration::from_secs(30));
+    let mut ping_interval = interval(WS_PING_EVERY);
     ping_interval.tick().await; // skip first immediate tick
 
     // Track responded permission request IDs to prevent double-click bugs.
@@ -757,11 +765,42 @@ async fn handle_ws_chat_loop(
                 }
             }
 
-            // Send periodic pings to detect dead clients
+            // Send periodic pings to detect dead clients, and — while a turn is
+            // running — one frame that refreshes the client's liveness clock.
+            //
+            // A ping never reaches JavaScript: the page answers it below the
+            // socket API. So for the client, a turn that has nothing to say is
+            // indistinguishable from a dead link, and its own stall watchdog
+            // (60 s of silence on a streaming session, front
+            // `chatWebSocket.ts`) reconnects the socket. On a native harness that
+            // is every few minutes: measured 18/11/2026 on a deepseek
+            // conversation, the parent said nothing for 659 s then 273 s while a
+            // delegated sub-agent worked, and the page reconnected eight times in
+            // eleven minutes, each time replaying the whole mid-stream snapshot —
+            // the thread sat on "…" throughout.
+            //
+            // Saying the truth costs one small frame per beat: the turn IS
+            // streaming, which is exactly what `streaming_status` means. It is a
+            // transient event (never persisted, never in the snapshot), and the
+            // client's handler for it is idempotent.
             _ = ping_interval.tick() => {
                 if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
                     debug!("Ping failed, client disconnected");
                     break;
+                }
+                if chat_manager.is_session_streaming(&session_id).await {
+                    let keepalive = serde_json::json!({
+                        "type": "streaming_status",
+                        "is_streaming": true,
+                    });
+                    if ws_sender
+                        .send(Message::Text(keepalive.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        debug!("Keepalive failed, client disconnected");
+                        break;
+                    }
                 }
             }
 
