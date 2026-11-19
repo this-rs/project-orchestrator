@@ -222,6 +222,12 @@ pub enum Signal {
     ToolEnd {
         id: String,
     },
+    /// The tool call was CANCELLED (an interrupt, the dead-tool sweep). Unlike a
+    /// `tool_result`, which for a question is only its acknowledgement, this says nobody
+    /// will ever answer it: a question it belongs to is dead, not waiting.
+    ToolCancelled {
+        id: String,
+    },
     QuestionAsked {
         id: String,
     },
@@ -269,9 +275,10 @@ pub fn signal_of(event: &ChatEvent) -> Option<Signal> {
             top_level: parent_tool_use_id.is_none(),
         },
         ChatEvent::ToolUse { id, .. } => Signal::ToolStart { id: id.clone() },
-        ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
-            Signal::ToolEnd { id: id.clone() }
-        }
+        // A cancellation is NOT a result: it is the only harness signal that proves a
+        // question will never be answered (see `classify`).
+        ChatEvent::ToolCancelled { id, .. } => Signal::ToolCancelled { id: id.clone() },
+        ChatEvent::ToolResult { id, .. } => Signal::ToolEnd { id: id.clone() },
         ChatEvent::AskUserQuestion { tool_call_id, .. } => Signal::QuestionAsked {
             id: tool_call_id.clone(),
         },
@@ -447,6 +454,7 @@ pub fn classify(
     }
     let mut ended_tools = BTreeSet::new();
     let mut resolved_secrets = BTreeSet::new();
+    let mut cancelled_tools = BTreeSet::new();
     let mut open_tool: Option<&TailEvent> = None;
     // The `tool_call_id` of every question this tail asked. A question is closed by the
     // PERSON, never by the harness: the `tool_result` of an `ask_user_question` is an
@@ -473,12 +481,19 @@ pub fn classify(
             Signal::ToolEnd { id } if !asked_questions.contains(id.as_str()) => {
                 ended_tools.insert(id.as_str());
             }
+            // A cancellation, on the other hand, is proof that nobody will answer: the tool
+            // call is gone (lock-free interrupt, dead-tool sweep), so a question it carried
+            // must not stay clickable — its answer would go to a tool that no longer exists.
+            Signal::ToolCancelled { id } => {
+                ended_tools.insert(id.as_str());
+                cancelled_tools.insert(id.as_str());
+            }
             Signal::SecretResolved { id } => {
                 resolved_secrets.insert(id.as_str());
             }
             // No `ended_tools` guard: nothing the HARNESS emits closes a question — only
-            // the person's `Input` or a stop do (both break the walk).
-            Signal::QuestionAsked { .. } => {
+            // the person's `Input`, a stop, or the cancellation of its tool call do.
+            Signal::QuestionAsked { id } if !cancelled_tools.contains(id.as_str()) => {
                 return v(SessionState::WaitingOnPerson, Rule::QuestionOpen, Some(e));
             }
             Signal::SecretAsked { id } if !resolved_secrets.contains(id.as_str()) => {
@@ -493,11 +508,13 @@ pub fn classify(
             {
                 open_tool = Some(e);
             }
-            // An interrupted turn closes what it had open: a question it asked never gets its
-            // `tool_result` (measured 10/11/2026: none, and no `tool_cancelled`), so the end
-            // of the turn is the only witness that nobody is waited on any more.
+            // An interrupted or FAILED turn closes what it had open: a question it asked
+            // never gets its `tool_result` (measured 10/11/2026: none, and no
+            // `tool_cancelled`), so the end of the turn is the only witness that nobody is
+            // waited on any more. `Failed` counts too: the tool call died with the turn,
+            // and a card left clickable would answer a tool that no longer exists.
             Signal::Ended {
-                how: TurnEnd::Interrupted,
+                how: TurnEnd::Interrupted | TurnEnd::Failed,
                 ..
             } => break,
             // A question answered as a user turn (a provider without native questions)
@@ -1141,7 +1158,9 @@ mod tests {
                 id: "a".into(),
                 parent_tool_use_id: None,
             }),
-            Some(Signal::ToolEnd { id: "a".into() })
+            // Its own signal: a cancellation is not a result (`classify` closes a question
+            // on one and never on the other).
+            Some(Signal::ToolCancelled { id: "a".into() })
         );
         assert_eq!(
             s(&E::ToolUse {
@@ -1320,8 +1339,43 @@ mod tests {
         }
     }
 
-    /// The person's answer closes the question, and so does a stop — both arrive as a
-    /// signal that stops the backward walk, whatever the harness acknowledged before.
+    /// A question whose tool call was CANCELLED, or whose turn DIED, is not waited on any
+    /// more. Without this, opening the question on its acknowledgement alone would leave it
+    /// clickable for ever whenever the turn ends badly: the answer would go to a tool that no
+    /// longer exists (the very failure the frontend gate was built to prevent).
+    #[test]
+    fn a_cancelled_question_or_a_dead_turn_is_not_waited_on() {
+        let question = ev(
+            T0 + 1,
+            "ask_user_question",
+            Signal::QuestionAsked { id: "q".into() },
+        );
+        let cancelled = vec![
+            input(T0),
+            question.clone(),
+            result(T0 + 2, "q"),
+            ev(
+                T0 + 3,
+                "tool_cancelled",
+                Signal::ToolCancelled { id: "q".into() },
+            ),
+        ];
+        let failed = vec![
+            input(T0),
+            question.clone(),
+            result(T0 + 2, "q"),
+            end(T0 + 3, TurnEnd::Failed, false),
+        ];
+        for (name, tail) in [("cancelled", cancelled), ("failed", failed)] {
+            for activity in [streaming(), idle()] {
+                let got = classify(&tail, T0, &activity, T0 + 4);
+                assert_ne!(got.reason.rule, Rule::QuestionOpen, "{name}: {got:?}");
+            }
+        }
+    }
+
+    /// A question answered as a user turn (a provider without native questions) is closed
+    /// by that input, the acknowledgement before it notwithstanding.
     #[test]
     fn the_persons_answer_or_a_stop_closes_an_acknowledged_question() {
         let question = ev(
