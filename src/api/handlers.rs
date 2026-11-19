@@ -1396,6 +1396,9 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
+    // #1188 §1b: refused before anything is built or opened (a refusal costs nothing).
+    refuse_task_already_in_flight(graph.as_ref(), chat_manager, task_id).await?;
+
     // Step 0: the spawn envelope (decision A17). When the caller is a chat
     // session, the parent is read from its signed token and the child stays
     // inside it: same project, a directory the parent can see, a permission
@@ -1488,6 +1491,36 @@ pub(crate) struct PreparedDelegation {
     pub stated_class: Option<String>,
     pub parent_session_id: Option<Uuid>,
     pub custom_sections: Vec<String>,
+}
+
+/// #1188 §1b: a task already being delegated is not delegated again. A delegation is
+/// « in flight » while its `AgentExecution` is `running` AND its child session still works
+/// ([`ChatManager::is_session_working`]): a delegation closed (completed, failed, timeout,
+/// interrupted) never blocks a retry, and an execution left `running` by a dead process
+/// (its session is gone) does not block it forever. Delegations of OTHER tasks are not
+/// looked at. Two agents on one task shared one worktree and overwrote each other.
+async fn refuse_task_already_in_flight(
+    graph: &dyn crate::neo4j::GraphStore,
+    chat_manager: &ChatManager,
+    task_id: Uuid,
+) -> Result<(), AppError> {
+    let running = graph
+        .list_running_agent_executions()
+        .await
+        .map_err(AppError::Internal)?;
+    for execution in running.iter().filter(|e| e.task_id == task_id) {
+        let Some(session) = execution.session_id else {
+            continue;
+        };
+        let session = session.to_string();
+        if chat_manager.is_session_working(&session).await {
+            return Err(AppError::Conflict(format!(
+                "Task {task_id} is already being delegated: session {session} has not finished. \
+                 Wait for its end (or stop it) before delegating this task again."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Open the session of a prepared delegation and send it its prompt. `place`: the ephemeral
@@ -9489,6 +9522,150 @@ pub(crate) mod tests {
             panic!("no execution place was asked for: nothing to confirm")
         };
         (manager, fake, rx, task.id, launched.session_id)
+    }
+
+    /// The rig of the re-delegation tests (#1188 §1b): like [`open_a_delegation_on_the_fake`],
+    /// but nothing is delegated yet and the plan holds TWO tasks.
+    #[allow(clippy::type_complexity)]
+    async fn a_rig_to_delegate_twice() -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        OrchestratorState,
+        axum::http::HeaderMap,
+        Uuid,
+        [Uuid; 2],
+        String,
+    ) {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task_a = crate::test_helpers::test_task();
+        let task_b = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task_a).await.unwrap();
+        mock.create_task(plan.id, &task_b).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state =
+            crate::test_helpers::server_state_with_chat(manager.clone(), mock.clone()).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        (
+            manager,
+            fake,
+            rx,
+            state,
+            headers,
+            plan.id,
+            [task_a.id, task_b.id],
+            parent.cwd.clone(),
+        )
+    }
+
+    /// Delegates `task` as the rig's parent; the child's session id, or the refusal.
+    async fn delegate_in_the_rig(
+        state: &OrchestratorState,
+        headers: &axum::http::HeaderMap,
+        plan: Uuid,
+        task: Uuid,
+        cwd: &str,
+    ) -> Result<String, AppError> {
+        let req = DelegateTaskRequest {
+            cwd: cwd.to_string(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+        let (_, Json(outcome)) = super::delegate_task(
+            State(state.clone()),
+            None,
+            headers.clone(),
+            Path((plan, task)),
+            Json(req),
+        )
+        .await?;
+        let DelegateTaskOutcome::Launched(launched) = outcome else {
+            panic!("no execution place was asked for")
+        };
+        Ok(launched.session_id)
+    }
+
+    /// #1188 §1b: a task whose delegation is still in flight is not delegated again (two agents
+    /// worked one task in one worktree); another task still can be delegated at the same time.
+    #[tokio::test]
+    async fn a_task_already_being_delegated_is_refused_but_another_task_is_not() {
+        let (_manager, fake, _rx, state, headers, plan, [task_a, task_b], cwd) =
+            a_rig_to_delegate_twice().await;
+
+        let first = delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("the first delegation of a task opens");
+        wait_for_turns(&fake, 1).await;
+
+        let second = delegate_in_the_rig(&state, &headers, plan, task_a, &cwd).await;
+        match second {
+            Err(AppError::Conflict(message)) => assert!(
+                message.contains(&first),
+                "the refusal names the session already on the task: {message}"
+            ),
+            other => panic!("the same task was delegated twice (#1188 §1b): {other:?}"),
+        }
+
+        delegate_in_the_rig(&state, &headers, plan, task_b, &cwd)
+            .await
+            .expect("a delegation of ANOTHER task in parallel stays allowed");
+    }
+
+    /// #1188 §1b: a delegation that is over does not block the next attempt (a legitimate retry).
+    #[tokio::test]
+    async fn a_task_whose_delegation_is_over_can_be_delegated_again() {
+        let (_manager, fake, mut rx, state, headers, plan, [task_a, _], cwd) =
+            a_rig_to_delegate_twice().await;
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("the first delegation opens");
+        wait_for_turns(&fake, 1).await;
+        fake.state.push(a_finished_turn(0.01));
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_a)
+            .await
+            .expect("the end of the delegation never reached the parent");
+        assert!(told.contains("status=\"completed\""), "{told}");
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("a finished delegation must not block a retry");
     }
 
     /// #1188 §1: a `Result` closes a TURN, not the delegation. A child that ends its turn
