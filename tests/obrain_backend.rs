@@ -1,4 +1,4 @@
-//! The obrain storage backend behind the factory (`src/storage.rs`,
+//! The obrain storage backend behind the factory (`src/storage/`,
 //! `src/obrain/`).
 //!
 //! What the cross-backend conformance suite (`tests/store_conformance.rs`,

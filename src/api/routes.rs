@@ -46,7 +46,7 @@ use crate::auth::middleware::require_auth;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
-    middleware::from_fn_with_state,
+    middleware::{from_fn, from_fn_with_state},
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -54,6 +54,42 @@ use tower_http::cors::CorsLayer;
 #[cfg(not(feature = "embedded-frontend"))]
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
+
+/// Refuse every mutating route with a named 503 while the storage-migration
+/// gate is read-only (`storage.migration` in flight, see
+/// [`crate::storage::migrate`]). Read routes and non-mutating methods
+/// (GET/HEAD/OPTIONS) pass through untouched, so an instance mid-migration can
+/// still answer health and reads, but never modify the source or the target.
+async fn read_only_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if crate::storage::migrate::is_read_only() && is_write_method(req.method()) {
+        let status = axum::http::StatusCode::from_u16(crate::storage::migrate::READ_ONLY_STATUS)
+            .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        return (
+            status,
+            axum::Json(serde_json::json!({
+                "error": "migration in progress — writes are refused",
+                "code": crate::storage::migrate::READ_ONLY_CODE,
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// Whether an HTTP method mutates server state, and is therefore refused while
+/// the migration gate is read-only.
+fn is_write_method(method: &axum::http::Method) -> bool {
+    use axum::http::Method;
+    *method == Method::POST
+        || *method == Method::PUT
+        || *method == Method::PATCH
+        || *method == Method::DELETE
+}
 
 /// Create the API router with public + protected route groups.
 ///
@@ -129,6 +165,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .merge(bounded_public)
         .merge(websocket_routes())
         .merge(protected)
+        .layer(from_fn(read_only_guard))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state.clone());
@@ -3184,5 +3221,51 @@ mod tests {
             cache_control.is_some(),
             "Static assets must have Cache-Control header"
         );
+    }
+
+    // ── Migration read-only guard ────────────────────────────────────────
+
+    /// A minimal router with the migration guard, one read and one write route.
+    fn migration_guard_router() -> Router {
+        Router::new()
+            .route("/read", get(|| async { "ok" }))
+            .route("/write", post(|| async { "written" }))
+            .layer(from_fn(read_only_guard))
+    }
+
+    #[tokio::test]
+    async fn the_migration_gate_refuses_writes_with_a_named_code_and_allows_reads() {
+        // One test touches the process-wide gate, so it cannot race with
+        // itself or any other test.
+        crate::storage::migrate::set_read_only(true);
+
+        // A write is refused with the named code.
+        let app = migration_guard_router();
+        let req = Request::post("/write").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["code"],
+            crate::storage::migrate::READ_ONLY_CODE,
+            "the refusal must carry the named code: {json}"
+        );
+
+        // A read still passes while read-only.
+        let app = migration_guard_router();
+        let req = Request::get("/read").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Leaving the read-only state lets writes through again.
+        crate::storage::migrate::set_read_only(false);
+        let app = migration_guard_router();
+        let req = Request::post("/write").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

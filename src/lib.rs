@@ -259,6 +259,50 @@ pub struct StorageYamlConfig {
     /// `obrain` backend refuses to start without it rather than guess a
     /// location (a guessed path is how a test binary once opened a live base).
     pub obrain_path: Option<String>,
+    /// Startup migration of the storage backend (optional — how PO switches
+    /// from the source backend to a requested target).
+    pub migration: MigrationYamlConfig,
+}
+
+/// Startup storage-migration configuration. Each flag has an environment
+/// variable that wins over the YAML only when it parses ([`env_flag_over`]);
+/// see [`crate::storage::migrate`] for what each one guards.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct MigrationYamlConfig {
+    /// Stay on the source backend even if a target is requested: the rollback.
+    /// Priority: env var (STORAGE_MIGRATION_ROLLBACK) > YAML > false.
+    pub rollback: Option<bool>,
+    /// Run the migration against a disposable COPY of the source, never the
+    /// source itself. Priority: env var (STORAGE_MIGRATION_DISPOSABLE) > YAML
+    /// > false.
+    pub disposable: Option<bool>,
+    /// Gate the switch on a per-type (nodes + links) source == target check.
+    /// Priority: env var (STORAGE_MIGRATION_VERIFY_BY_TYPE) > YAML > true.
+    pub verify_by_type: Option<bool>,
+}
+
+/// Resolved startup-migration configuration (see [`MigrationYamlConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageMigrationConfig {
+    /// Stay on the source backend: the rollback demanded by configuration.
+    pub rollback: bool,
+    /// Migrate a disposable copy, never the source.
+    pub disposable: bool,
+    /// Only switch once the per-type (nodes + links) verification passes.
+    pub verify_by_type: bool,
+}
+
+impl Default for StorageMigrationConfig {
+    /// The defaults when nothing is configured: no rollback, no disposable
+    /// copy, and the per-type verification gate ON.
+    fn default() -> Self {
+        Self {
+            rollback: false,
+            disposable: false,
+            verify_by_type: true,
+        }
+    }
 }
 
 /// Event transport selection.
@@ -1044,6 +1088,10 @@ pub struct Config {
     /// None, in which case that backend refuses to start. Stored unexpanded.
     pub storage_obrain_path: Option<String>,
 
+    /// Startup storage-migration configuration (rollback / disposable copy /
+    /// per-type verification). See [`crate::storage::migrate`].
+    pub storage_migration: StorageMigrationConfig,
+
     /// Chat transport selection: which transport carries chat events between
     /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
     /// > default ("nats").
@@ -1215,6 +1263,29 @@ impl Config {
             storage_obrain_path: std::env::var("STORAGE_OBRAIN_PATH")
                 .ok()
                 .or(yaml.storage.obrain_path),
+            // Startup migration flags (env var > YAML > defaults). Rollback and
+            // disposable default to false; the per-type verification gate to true.
+            storage_migration: StorageMigrationConfig {
+                rollback: env_flag_over(
+                    std::env::var("STORAGE_MIGRATION_ROLLBACK").ok().as_deref(),
+                    yaml.storage.migration.rollback,
+                )
+                .unwrap_or(false),
+                disposable: env_flag_over(
+                    std::env::var("STORAGE_MIGRATION_DISPOSABLE")
+                        .ok()
+                        .as_deref(),
+                    yaml.storage.migration.disposable,
+                )
+                .unwrap_or(false),
+                verify_by_type: env_flag_over(
+                    std::env::var("STORAGE_MIGRATION_VERIFY_BY_TYPE")
+                        .ok()
+                        .as_deref(),
+                    yaml.storage.migration.verify_by_type,
+                )
+                .unwrap_or(true),
+            },
             events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
                 yaml.events
                     .transport
@@ -3797,6 +3868,49 @@ chat:
         std::env::remove_var("CHAT_PROCESS_PATH");
         std::env::remove_var("CLAUDE_CLI_PATH");
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+    }
+
+    #[test]
+    fn storage_migration_flags_resolve_env_over_yaml_over_defaults() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
+        std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
+        std::env::remove_var("STORAGE_MIGRATION_VERIFY_BY_TYPE");
+
+        // Defaults when nothing is configured: rollback off, disposable off,
+        // per-type verification on.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        std::fs::write(&file_path, "storage:\n  backend: obrain\n").unwrap();
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(!config.storage_migration.rollback);
+        assert!(!config.storage_migration.disposable);
+        assert!(config.storage_migration.verify_by_type);
+
+        // YAML wins over the defaults.
+        std::fs::write(
+            &file_path,
+            "storage:\n  backend: obrain\n  migration:\n    rollback: true\n    \
+             disposable: true\n    verify_by_type: false\n",
+        )
+        .unwrap();
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(config.storage_migration.rollback);
+        assert!(config.storage_migration.disposable);
+        assert!(!config.storage_migration.verify_by_type);
+
+        // Environment wins over YAML.
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "false");
+        std::env::set_var("STORAGE_MIGRATION_VERIFY_BY_TYPE", "true");
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(!config.storage_migration.rollback);
+        assert!(!config.storage_migration.disposable);
+        assert!(config.storage_migration.verify_by_type);
+
+        std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
+        std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
+        std::env::remove_var("STORAGE_MIGRATION_VERIFY_BY_TYPE");
     }
 
     /// A duplicate instance must die on the port BEFORE any initialization.

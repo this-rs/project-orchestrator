@@ -7,6 +7,8 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod migrate;
+
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -77,7 +79,39 @@ impl StorageBackend {
     /// This is the single selection point: a new backend is added here, never
     /// in `AppState`.
     pub async fn from_config(config: &Config) -> Result<Self> {
-        match select_backend(&config.storage_backend)? {
+        let requested = select_backend(&config.storage_backend)?;
+
+        // The rollback is a configuration variable (`storage.migration.rollback`
+        // / STORAGE_MIGRATION_ROLLBACK): when it is set, PO stays on the source
+        // backend even if a target was requested. The source is never modified —
+        // this path only re-selects it, it never touches its data.
+        let kind = if config.storage_migration.rollback && requested != BackendKind::Default {
+            tracing::warn!(
+                requested = ?requested,
+                "storage: migration rollback demanded by configuration — staying on the source \
+                 backend ('default')"
+            );
+            BackendKind::Default
+        } else {
+            requested
+        };
+
+        // A target backend was requested (not the source). The actual data copy
+        // is the migrator's job and happens BEFORE this factory runs, outside
+        // this repository; what PO owns is the gate (see `migrate`): the
+        // read-only state and the per-type verification that decide whether the
+        // switch is allowed. The migrator leaves the process read-only while it
+        // runs, and PO only leaves it when the verification passes.
+        if kind != BackendKind::Default {
+            tracing::info!(
+                backend = ?kind,
+                verify_by_type = config.storage_migration.verify_by_type,
+                disposable = config.storage_migration.disposable,
+                "storage: non-source backend selected — migration gate owns the switch"
+            );
+        }
+
+        match kind {
             BackendKind::Default => Self::default_backend(config).await,
             BackendKind::Memory => Self::memory_backend(config).await,
             BackendKind::Obrain => Self::obrain_backend(config).await,
