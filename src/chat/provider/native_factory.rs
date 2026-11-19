@@ -127,6 +127,17 @@ pub async fn list_models(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Vec<String>, ProviderError> {
+    // Codex lists its own models through its app-server; the other kinds go through
+    // the native harness (`GET /models`).
+    if record.kind == "codex" {
+        let provider = build_native_provider(record, vault)?;
+        return Ok(provider
+            .catalog()
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect());
+    }
     let provider = build_native(record, vault, &[])?;
     Ok(provider
         .catalog()

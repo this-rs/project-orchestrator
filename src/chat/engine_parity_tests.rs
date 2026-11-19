@@ -1113,6 +1113,50 @@ async fn await_turn_result(
     }
 }
 
+/// Waits for the `Result` of the turn a provider switch starts, read from the PERSISTED
+/// events — and NEVER times out mutely, like [`await_turn_result`].
+///
+/// `switch_session_provider` relays the conversation and starts the new engine's turn in a
+/// task of its own, then returns: a fake engine answers at once, so its `Result` may be
+/// broadcast BEFORE the test subscribes after the switch, and a `broadcast` channel does not
+/// replay. Waiting on a subscription made after the switch is therefore a race (a 180 s
+/// silence, "no event ... after 3 event(s)"). `emit` persists an event before it broadcasts
+/// it, so the persisted journal holds the `Result` whenever it fired: this polls it, from
+/// `after_seq` (the last event seen before the switch).
+async fn await_persisted_turn_result(
+    graph: &MockGraphStore,
+    session_id: &str,
+    after_seq: i64,
+    phase: &str,
+    deadline: Duration,
+    record: &Path,
+) {
+    let id = Uuid::parse_str(session_id).unwrap();
+    let started = tokio::time::Instant::now();
+    loop {
+        let events = graph.get_chat_events(id, after_seq, 10_000).await.unwrap();
+        if let Some(error) = events.iter().find(|e| e.event_type == "error") {
+            panic!(
+                "{phase}: the engine reported an error instead of a Result: {}\n{}",
+                error.data,
+                record_tail(record)
+            );
+        }
+        if events.iter().any(|e| e.event_type == "result") {
+            return;
+        }
+        if started.elapsed() >= deadline {
+            panic!(
+                "{phase}: no persisted Result for {}s, after {} event(s) since seq {after_seq}\n{}",
+                deadline.as_secs(),
+                events.len(),
+                record_tail(record)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The last lines the fake wrote: the requests it received, so a stuck turn
 /// shows whether the engine ever reached it.
 fn record_tail(path: &Path) -> String {
@@ -3207,9 +3251,6 @@ fn precompact_instructions(line: &str) -> String {
 
 /// The scenario twice: Claude Code on the historical engine, then on the agent engine
 /// (each run on its own stage, CLI and endpoint); the native column is the first run's.
-// QUARANTAINE : échec intermittent préexistant (déjà rouge sur 7f9ccfd1, vert sur le même SHA
-// ailleurs) — le relais Codex reste muet après `initialized`. À réactiver après diagnostic.
-#[ignore = "quarantaine : hang intermittent du relais Codex, voir la PR de quarantaine"]
 #[test]
 fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     // A thread of its own with a large stack: the scenario's future outgrew the test
@@ -5548,18 +5589,28 @@ async fn run_acp_column() -> Measures {
     )
     .await;
 
-    // Switch to ACP.
+    // Switch to ACP. The new turn starts in a task of its own and the fake answers at once:
+    // its `Result` can be broadcast before any subscription made after the switch, so the
+    // wait reads the persisted events after the last one seen here (see
+    // `await_persisted_turn_result`).
+    let before_switch = graph
+        .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 10_000)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
     manager
         .switch_session_provider(&sid, "parity-acp", None, "relay check", None)
         .await
         .unwrap_or_else(|e| panic!("run_acp_column: switch to ACP failed: {e:#}"));
 
-    // Re-subscribe after the switch: the ACP session may use a fresh broadcast sender.
-    let mut rx = manager.subscribe(&sid).await.unwrap();
-
-    // Wait for ACP answer.
-    await_turn_result(
-        &mut rx,
+    // Wait for the ACP answer.
+    await_persisted_turn_result(
+        &graph,
+        &sid,
+        before_switch,
         "run_acp_column/acp",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
@@ -5744,18 +5795,28 @@ async fn run_codex_column() -> Measures {
     )
     .await;
 
-    // Switch to Codex.
+    // Switch to Codex. The new turn starts in a task of its own and the fake answers at once:
+    // its `Result` can be broadcast before any subscription made after the switch, so the
+    // wait reads the persisted events after the last one seen here (see
+    // `await_persisted_turn_result`).
+    let before_switch = graph
+        .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 10_000)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
     manager
         .switch_session_provider(&sid, "parity-codex", None, "relay check", None)
         .await
         .unwrap_or_else(|e| panic!("run_codex_column: switch to Codex failed: {e:#}"));
 
-    // Re-subscribe after the switch: the Codex session may use a fresh broadcast sender.
-    let mut rx = manager.subscribe(&sid).await.unwrap();
-
-    // Wait for Codex answer.
-    await_turn_result(
-        &mut rx,
+    // Wait for the Codex answer.
+    await_persisted_turn_result(
+        &graph,
+        &sid,
+        before_switch,
         "run_codex_column/codex",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
