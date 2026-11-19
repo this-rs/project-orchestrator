@@ -1,5 +1,5 @@
 %% name: po-chat-transport
-%% covers: backend:src/api/{ws_chat_handler,refs_ws_tests}.rs backend:src/chat/wire_contract.rs backend:src/events/transport.rs
+%% covers: backend:src/api/{ws_chat_handler,refs_ws_tests,keepalive_ws_tests}.rs backend:src/chat/wire_contract.rs backend:src/events/transport.rs
 %% verified: 878281ca
 %% ---
 %% PROUVE : le transport WebSocket du chat — /ws/chat/{session_id} — tel que le code
@@ -55,7 +55,7 @@ flowchart TD
 
     subgraph loop["Boucle — select! dans handle_ws_chat_loop"]
         direction TB
-        SELECT["✅ select! : broadcast local · événements NATS · ping · trames clientes<br/><i>vérifié : test_dormant_select_skips_none_branch</i>"]
+        SELECT["✅ select! : broadcast local · événements NATS · ping · trames clientes<br/>le battement de ping (30 s ; 250 ms sous cfg(test)) envoie un Ping ET, si la session se dit en cours,<br/>une trame streaming_status{true} — sans quoi un tour natif silencieux est indistinguable d'une socket morte<br/>(un Ping ne remonte jamais jusqu'à JavaScript) et le chien de garde du front reconnecte toutes les 60 s<br/><i>vérifié : test_dormant_select_skips_none_branch,<br/>keepalive_ws_tests::a_turn_that_says_nothing_still_tells_the_client_it_is_alive,<br/>keepalive_ws_tests::an_idle_session_says_nothing</i>"]
         LAG["✅ broadcast en retard (Lagged) → trame events_lagged<br/>(le client se reconnecte et rejoue l'écart)<br/><i>vérifié : test_broadcast_close_returns_closed_error</i>"]
         DORMANT["✅ broadcast fermé (CLI nettoyé) → trame session_dormant,<br/>re-souscription après reprise<br/><i>vérifié : test_session_dormant_json_format, test_resubscribe_after_broadcast_close,<br/>test_dormant_resume_lifecycle</i>"]
         FRAMES["✅ trames serveur hors ChatEvent : auth_ok, partial_text, replay_complete,<br/>events_lagged, session_dormant, error<br/><i>vérifié : test_session_dormant_json_format</i>"]
