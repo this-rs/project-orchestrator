@@ -143,27 +143,19 @@ const STEP_UPDATE_KEYS: &[&str] = &["status", "description", "verification"];
 /// Refuse, before any request, an update that would answer `updated: true`
 /// without doing what it was asked:
 ///
-/// - `unsupported_fields`: an argument the update cannot write. It used to be
-///   dropped, and the answer said the update had happened.
+/// - `unsupported_fields`: an argument the update cannot write, published by the
+///   tool or not (`due_date`, `model_alias`, …). It used to be dropped, and the
+///   answer said the update had happened; an unpublished one was refused only
+///   when it was the ONLY one, by `empty_update`, and ignored next to a written one.
 /// - `empty_update`: no writable field at all, so nothing would change.
 ///
 /// A `null` value and a `_`-prefixed key (client metadata) are not fields.
 fn refuse_unwritable_fields(
     args: &Value,
-    tool: &str,
     writable: &[&str],
     what: &str,
     id_key: &str,
 ) -> Result<()> {
-    // Only the parameters the tool publishes are refused. A key the API writes
-    // but the tool does not publish (`due_date`, `model_alias`, …) keeps being
-    // ignored, as on main: refusing it would be a contract change of its own.
-    let published: Vec<String> = super::tools::all_tools()
-        .into_iter()
-        .find(|t| t.name == tool)
-        .and_then(|t| t.input_schema.properties)
-        .and_then(|p| p.as_object().map(|o| o.keys().cloned().collect()))
-        .unwrap_or_default();
     let given: Vec<&str> = args
         .as_object()
         .into_iter()
@@ -177,7 +169,7 @@ fn refuse_unwritable_fields(
     let mut unsupported: Vec<&str> = given
         .iter()
         .copied()
-        .filter(|key| !writable.contains(key) && published.iter().any(|p| p == key))
+        .filter(|key| !writable.contains(key))
         .collect();
     unsupported.sort_unstable();
     if !unsupported.is_empty() {
@@ -187,9 +179,8 @@ fn refuse_unwritable_fields(
             writable.join(", ")
         ));
     }
-    // Counted on the keys the update WRITES: a key the tool does not publish
-    // (`order`, `due_date`) is ignored, so it does not make the update non-empty.
-    // Without this the call went through with an empty body and answered success.
+    // Counted on the keys the update WRITES. Without this the call went
+    // through with an empty body and answered success.
     if !given.iter().any(|key| writable.contains(key)) {
         return Err(anyhow!(
             "empty_update: {what} was given no field to write — nothing was changed. It writes: {}",
@@ -1765,7 +1756,7 @@ impl ToolHandler {
 
             "update_task" => {
                 let task_id = extract_id(args, "task_id")?;
-                refuse_unwritable_fields(args, "task", TASK_UPDATE_KEYS, "task update", "task_id")?;
+                refuse_unwritable_fields(args, TASK_UPDATE_KEYS, "task update", "task_id")?;
                 let (mut body, mut fields) = written_update_body(args, TASK_UPDATE_KEYS);
                 let rejected = take_malformed_string_lists(
                     &mut body,
@@ -1990,8 +1981,28 @@ impl ToolHandler {
                 }))
             }
             "enrich_task" => {
-                let plan_id = extract_id(args, "plan_id")?;
                 let task_id = extract_id(args, "task_id")?;
+                // The task already belongs to a plan: `plan_id` is optional, and
+                // when it is given it must be that plan (never silently ignored).
+                let actual = http
+                    .get(&format!("/api/tasks/{}/plan", task_id))
+                    .await?
+                    .get("plan_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("task {task_id} belongs to no plan"))?;
+                let plan_id = match args.get("plan_id").filter(|v| !v.is_null()) {
+                    None => actual,
+                    Some(_) => {
+                        let given = extract_id(args, "plan_id")?;
+                        if !given.eq_ignore_ascii_case(&actual) {
+                            return Err(anyhow!(
+                                "plan_mismatch: task {task_id} belongs to plan {actual}, not {given} — nothing was enriched. Omit plan_id to use the task's plan"
+                            ));
+                        }
+                        actual
+                    }
+                };
                 let result = http
                     .post(
                         &format!("/api/plans/{}/tasks/{}/enrich", plan_id, task_id),
@@ -2047,7 +2058,7 @@ impl ToolHandler {
 
             "update_step" => {
                 let step_id = extract_id(args, "step_id")?;
-                refuse_unwritable_fields(args, "step", STEP_UPDATE_KEYS, "step update", "step_id")?;
+                refuse_unwritable_fields(args, STEP_UPDATE_KEYS, "step update", "step_id")?;
                 let (body, fields) = written_update_body(args, STEP_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
@@ -8152,11 +8163,41 @@ mod tests {
         assert!(err.to_string().contains("supersede_self"), "{err}");
     }
 
-    /// A key the API writes but the tool does not publish (`due_date`) keeps
-    /// being ignored, as on main: the update goes through, the key is not
-    /// refused and not written.
+    /// A key the API writes but the tool does not publish (`due_date`) next to a
+    /// published one used to be ignored in silence while the answer said
+    /// `updated`. It is refused by name, and nothing is written (#1189 §1).
     #[tokio::test]
-    async fn an_unpublished_key_the_api_writes_is_still_ignored_not_refused() {
+    async fn an_unpublished_key_mixed_with_published_ones_is_refused_by_name() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let before = graph.get_task(task_id).await.unwrap().unwrap();
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "title": "new title",
+                    "due_date": "2026-12-01",
+                    "estimated_minutes": 30,
+                })),
+            )
+            .await
+            .expect_err("an unwritable key mixed with a written one is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "unsupported_fields: task update cannot write due_date, estimated_minutes"
+            ),
+            "{msg}"
+        );
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.title, before.title, "nothing was changed");
+    }
+
+    /// Only published-and-written fields: still goes through.
+    #[tokio::test]
+    async fn an_update_with_only_written_fields_still_goes_through() {
         use crate::neo4j::traits::*;
         let (handler, graph, task_id) = real_handler_with_task().await;
         let result = handler
@@ -8166,22 +8207,36 @@ mod tests {
                     "action": "update",
                     "task_id": task_id.to_string(),
                     "title": "new title",
-                    "due_date": "2026-12-01",
                 })),
             )
             .await
-            .expect("an unpublished key is not a refusal");
+            .expect("written fields only");
         assert_eq!(result["updated_fields"], json!(["title"]), "{result}");
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(stored.title.as_deref(), Some("new title"));
-        assert_eq!(stored.due_date, None, "ignored, as before");
     }
 
-    /// A key the tool does not publish (`order` on a step) does not make an update
-    /// non-empty: nothing is written, so the update is refused by name, before any
-    /// request. It used to go through with an empty body and answer `updated: true`.
+    /// The same on a step: `order` next to a written field is refused by name.
     #[tokio::test]
-    async fn step_update_with_only_an_unpublished_key_is_refused_as_empty() {
+    async fn step_update_with_an_unpublished_key_mixed_is_refused_by_name() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({"action": "update", "step_id": UUID1, "status": "completed", "order": 3})),
+            )
+            .await
+            .expect_err("order is not written");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("order"),
+            "{msg}"
+        );
+    }
+
+    /// An unwritable key alone is refused, by name (it was `empty_update`).
+    #[tokio::test]
+    async fn step_update_with_only_an_unpublished_key_is_refused_by_name() {
         let (handler, _) = make_http_handler().await;
         let err = handler
             .handle(
@@ -8190,13 +8245,16 @@ mod tests {
             )
             .await
             .expect_err("nothing is written");
-        assert!(err.to_string().contains("empty_update"), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("order"),
+            "{msg}"
+        );
     }
 
-    /// The same on a task, against the real API: `due_date` is written by the
-    /// API but not published by the tool, so this update writes nothing.
+    /// The same on a task, against the real API.
     #[tokio::test]
-    async fn task_update_with_only_an_unpublished_key_is_refused_as_empty() {
+    async fn task_update_with_only_an_unpublished_key_is_refused_by_name() {
         use crate::neo4j::traits::*;
         let (handler, graph, task_id) = real_handler_with_task().await;
         let err = handler
@@ -8205,14 +8263,75 @@ mod tests {
                 Some(json!({
                     "action": "update",
                     "task_id": task_id.to_string(),
-                    "due_date": "2026-12-01",
+                    "model_alias": "opus",
                 })),
             )
             .await
             .expect_err("nothing is written");
-        assert!(err.to_string().contains("empty_update"), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("model_alias"),
+            "{msg}"
+        );
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(stored.due_date, None);
+    }
+
+    /// A server that knows the plan of the task UUID1 and echoes the rest.
+    async fn make_handler_with_task_plan(plan: &'static str) -> ToolHandler {
+        let app = Router::new()
+            .route(
+                "/api/tasks/{task_id}/plan",
+                axum::routing::get(move || async move {
+                    axum::Json(json!({"task_id": UUID1, "plan_id": plan}))
+                }),
+            )
+            .fallback(any(echo_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ToolHandler::new(McpHttpClient::new(base_url, Some("test-token".to_string())))
+    }
+
+    /// `task enrich` asked for a `plan_id` the task already carries. Without it
+    /// the plan is the task's own (#1189 §6).
+    #[tokio::test]
+    async fn task_enrich_without_plan_id_uses_the_plan_of_the_task() {
+        let handler = make_handler_with_task_plan(UUID2).await;
+        let result = handler
+            .handle("task", Some(json!({"action": "enrich", "task_id": UUID1})))
+            .await
+            .expect("plan_id is optional");
+        assert_eq!(
+            result["path"],
+            json!(format!("/api/plans/{UUID2}/tasks/{UUID1}/enrich")),
+            "{result}"
+        );
+    }
+
+    /// A `plan_id` that is the task's plan is accepted; another one is refused
+    /// by name, never ignored.
+    #[tokio::test]
+    async fn task_enrich_with_another_plan_id_is_refused_as_a_mismatch() {
+        let handler = make_handler_with_task_plan(UUID2).await;
+        handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .expect("the task's own plan is fine");
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": UUID1, "plan_id": UUID1})),
+            )
+            .await
+            .expect_err("another plan is a mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("plan_mismatch"), "{msg}");
+        assert!(msg.contains(UUID2), "{msg}");
     }
 
     /// A list refused by name and nothing else: nothing was written, so the

@@ -459,7 +459,7 @@ fn task_tool() -> ToolDefinition {
                     "description": "Operation to perform"
                 },
                 "task_id": {"type": "string", "description": "Task UUID"},
-                "plan_id": {"type": "string", "description": "Plan UUID (list/create/get_next/get_context/get_prompt)"},
+                "plan_id": {"type": "string", "description": "Plan UUID (list/create/get_next/get_context/get_prompt; enrich: optional, defaults to the task's plan, refused if it is another plan)"},
                 "title": {"type": "string", "description": "Task title (create/update)"},
                 "description": {"type": "string", "description": "Task description (create/update)"},
                 "priority": {"type": "integer", "description": "Priority (create/update)"},

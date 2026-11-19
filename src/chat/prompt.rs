@@ -742,7 +742,7 @@ Manage tasks.
 | get_context | `plan_id` (req), `task_id` (req) | Get full task context |
 | get_prompt | `plan_id` (req), `task_id` (req) | Generate implementation prompt |
 | build_prompt | `plan_id` (req), `task_id` (req), `custom_sections` (array of strings) | Build implementation prompt with custom sections appended |
-| enrich | `task_id` (req) | Enrich task with auto-generated context (affected files, code references) |
+| enrich | `task_id` (req), `plan_id` (optional: the task's plan by default; another plan is refused with `plan_mismatch`) | Enrich task with auto-generated context (affected files, code references) |
 | get_sessions | `task_id` (req) | Sessions linked to this task |
 
 ## day_plan
