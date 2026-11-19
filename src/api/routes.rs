@@ -3235,6 +3235,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_migration_gate_refuses_writes_with_a_named_code_and_allows_reads() {
+        let _lock = crate::storage::migrate::GATE_TEST_LOCK.lock().await;
         // One test touches the process-wide gate, so it cannot race with
         // itself or any other test.
         crate::storage::migrate::set_read_only(true);
@@ -3267,5 +3268,68 @@ mod tests {
         let req = Request::post("/write").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A migrator that, mid-copy, tries to WRITE through the guarded router and
+    /// records the answer: the production factory raised the gate, not the test.
+    struct WritesDuringCopy(std::sync::Mutex<Option<(u16, String)>>);
+    #[async_trait::async_trait]
+    impl crate::storage::migrate::Migrator for WritesDuringCopy {
+        async fn source_counts(&self) -> anyhow::Result<crate::storage::migrate::PerTypeCounts> {
+            Ok(crate::storage::migrate::PerTypeCounts {
+                nodes: [("Project".to_string(), 1usize)].into(),
+                relationships: Default::default(),
+            })
+        }
+        async fn copy(&self, dest: &std::path::Path) -> anyhow::Result<()> {
+            let resp = migration_guard_router()
+                .oneshot(Request::post("/write").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            *self.0.lock().unwrap() = Some((
+                status,
+                json["code"].as_str().unwrap_or_default().to_string(),
+            ));
+            std::fs::write(dest.join("ok"), "1")?;
+            Ok(())
+        }
+        async fn target_counts(
+            &self,
+            _dest: &std::path::Path,
+        ) -> anyhow::Result<crate::storage::migrate::PerTypeCounts> {
+            self.source_counts().await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_startup_factory_itself_refuses_a_write_during_the_migration() {
+        let _lock = crate::storage::migrate::GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, "setup_completed: true\n").unwrap();
+        let mut config = crate::Config::from_yaml_and_env(Some(&file)).unwrap();
+        config.storage_backend = "memory".into();
+        config.storage_obrain_path = Some(dir.path().display().to_string());
+        config.storage_migration = crate::StorageMigrationConfig {
+            rollback: false,
+            disposable: false,
+            from: Some("default".into()),
+        };
+        let m = WritesDuringCopy(Default::default());
+        crate::storage::StorageBackend::from_config_with(&config, &m)
+            .await
+            .unwrap();
+        let seen = m.0.lock().unwrap().clone().expect("copy ran");
+        assert_eq!(
+            seen,
+            (503, crate::storage::migrate::READ_ONLY_CODE.to_string())
+        );
+        // And the gate is lifted once the target is built.
+        assert!(!crate::storage::migrate::is_read_only());
     }
 }

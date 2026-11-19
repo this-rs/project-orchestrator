@@ -79,42 +79,96 @@ impl StorageBackend {
     /// This is the single selection point: a new backend is added here, never
     /// in `AppState`.
     pub async fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with(config, &migrate::NoMigrator).await
+    }
+
+    /// [`Self::from_config`] with the data-copy seam injected (the migrator
+    /// lives outside this repository; tests inject a scripted one).
+    pub async fn from_config_with(
+        config: &Config,
+        migrator: &dyn migrate::Migrator,
+    ) -> Result<Self> {
+        // The gate is held until the chosen backend is BUILT: `start_server`
+        // creates every route and background writer after `AppState::new`
+        // returns, so nothing can write while a migration runs.
+        let (kind, config, _read_only) = Self::resolve_kind(config, migrator).await?;
+        match kind {
+            BackendKind::Default => Self::default_backend(&config).await,
+            BackendKind::Memory => Self::memory_backend(&config).await,
+            BackendKind::Obrain => Self::obrain_backend(&config).await,
+        }
+    }
+
+    /// Decide which backend to build, running the startup migration first when
+    /// one is configured (`storage.migration.from`) and a non-source target is
+    /// requested. Returns the kind, the configuration to build it with (the
+    /// obrain path points at the scratch copy for a disposable run) and the
+    /// read-only scope the caller must hold until the backend is built.
+    ///
+    /// Fail-closed: the target is chosen ONLY after the source was read under
+    /// the read-only gate, copied, read back and verified per type (nodes and
+    /// links). A rollback, an unreadable source/target, a failed copy or any
+    /// mismatch selects the source and logs why; the source is never written.
+    async fn resolve_kind(
+        config: &Config,
+        migrator: &dyn migrate::Migrator,
+    ) -> Result<(BackendKind, Config, Option<migrate::ReadOnlyScope>)> {
         let requested = select_backend(&config.storage_backend)?;
+        let mig = &config.storage_migration;
 
-        // The rollback is a configuration variable (`storage.migration.rollback`
-        // / STORAGE_MIGRATION_ROLLBACK): when it is set, PO stays on the source
-        // backend even if a target was requested. The source is never modified —
-        // this path only re-selects it, it never touches its data.
-        let kind = if config.storage_migration.rollback && requested != BackendKind::Default {
-            tracing::warn!(
-                requested = ?requested,
-                "storage: migration rollback demanded by configuration — staying on the source \
-                 backend ('default')"
-            );
-            BackendKind::Default
-        } else {
-            requested
+        let Some(from) = mig.from.as_deref() else {
+            // No migration configured. The rollback still re-selects the
+            // source (it never touches its data).
+            if mig.rollback && requested != BackendKind::Default {
+                tracing::warn!(
+                    requested = ?requested,
+                    "storage: migration rollback demanded by configuration — staying on the \
+                     source backend ('default')"
+                );
+                return Ok((BackendKind::Default, config.clone(), None));
+            }
+            return Ok((requested, config.clone(), None));
         };
-
-        // A target backend was requested (not the source). The actual data copy
-        // is the migrator's job and happens BEFORE this factory runs, outside
-        // this repository; what PO owns is the gate (see `migrate`): the
-        // read-only state and the per-type verification that decide whether the
-        // switch is allowed. The migrator leaves the process read-only while it
-        // runs, and PO only leaves it when the verification passes.
-        if kind != BackendKind::Default {
-            tracing::info!(
-                backend = ?kind,
-                verify_by_type = config.storage_migration.verify_by_type,
-                disposable = config.storage_migration.disposable,
-                "storage: non-source backend selected — migration gate owns the switch"
-            );
+        if select_backend(from)? != BackendKind::Default {
+            bail!("storage.migration.from = '{from}': only the '{DEFAULT_BACKEND}' source can be migrated from");
+        }
+        if requested == BackendKind::Default {
+            return Ok((requested, config.clone(), None));
         }
 
-        match kind {
-            BackendKind::Default => Self::default_backend(config).await,
-            BackendKind::Memory => Self::memory_backend(config).await,
-            BackendKind::Obrain => Self::obrain_backend(config).await,
+        // Read-only BEFORE the source is read, held by the caller.
+        let scope = migrate::ReadOnlyScope::enter();
+        let configured_dest = config
+            .storage_obrain_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| std::path::PathBuf::from(crate::expand_tilde(p)));
+        let outcome = migrate::run_startup_migration(
+            from,
+            &config.storage_backend,
+            mig.rollback,
+            mig.disposable,
+            configured_dest,
+            migrator,
+        )
+        .await;
+        match outcome.decision {
+            migrate::MigrationDecision::Flip { .. } => {
+                let mut built = config.clone();
+                if mig.disposable {
+                    if let Some(dest) = &outcome.dest {
+                        built.storage_obrain_path = Some(dest.display().to_string());
+                    }
+                }
+                tracing::info!(target = %config.storage_backend, disposable = mig.disposable,
+                    "storage: per-type verification passed — switching to the target");
+                Ok((requested, built, Some(scope)))
+            }
+            migrate::MigrationDecision::StayOnSource { reason, .. } => {
+                tracing::warn!(%reason, "storage: staying on the source backend");
+                Ok((BackendKind::Default, config.clone(), Some(scope)))
+            }
         }
     }
 
@@ -358,5 +412,152 @@ mod tests {
                 && msg.contains(OBRAIN_BACKEND),
             "error must name the accepted values: {msg}"
         );
+    }
+
+    // ── Startup migration through the real factory ───────────────────────
+
+    use super::migrate::{is_read_only, Migrator, PerTypeCounts, GATE_TEST_LOCK};
+
+    /// Source counts fixed; the "copy" writes them (minus `lose` Project nodes)
+    /// into `dest` and `target_counts` reads them back from there.
+    struct Scripted {
+        lose: usize,
+        copied: std::sync::atomic::AtomicBool,
+    }
+    fn data() -> PerTypeCounts {
+        PerTypeCounts {
+            nodes: [("Project".to_string(), 3usize), ("Note".to_string(), 7)].into(),
+            relationships: [("LINKED_TO".to_string(), 4usize)].into(),
+        }
+    }
+    #[async_trait::async_trait]
+    impl Migrator for Scripted {
+        async fn source_counts(&self) -> Result<PerTypeCounts> {
+            assert!(is_read_only());
+            Ok(data())
+        }
+        async fn copy(&self, dest: &std::path::Path) -> Result<()> {
+            self.copied.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut c = data();
+            *c.nodes.get_mut("Project").unwrap() -= self.lose;
+            std::fs::write(
+                dest.join("n.json"),
+                serde_json::to_string(&(c.nodes, c.relationships))?,
+            )?;
+            Ok(())
+        }
+        async fn target_counts(&self, dest: &std::path::Path) -> Result<PerTypeCounts> {
+            let (nodes, relationships) =
+                serde_json::from_str(&std::fs::read_to_string(dest.join("n.json"))?)?;
+            Ok(PerTypeCounts {
+                nodes,
+                relationships,
+            })
+        }
+    }
+    fn scripted(lose: usize) -> Scripted {
+        Scripted {
+            lose,
+            copied: Default::default(),
+        }
+    }
+
+    fn migrating_config(target: &str, dest: &std::path::Path) -> Config {
+        let file = dest.join("config.yaml");
+        std::fs::write(&file, "setup_completed: true\n").unwrap();
+        let mut c = Config::from_yaml_and_env(Some(&file)).unwrap();
+        c.storage_backend = target.to_string();
+        c.storage_obrain_path = Some(dest.join("target").display().to_string());
+        c.storage_migration = crate::StorageMigrationConfig {
+            rollback: false,
+            disposable: false,
+            from: Some("default".to_string()),
+        };
+        c
+    }
+
+    #[tokio::test]
+    async fn the_factory_flips_to_the_target_only_after_a_verified_copy() {
+        let _l = GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        let config = migrating_config(MEMORY_BACKEND, dir.path());
+        let m = scripted(0);
+        let (kind, _, scope) = StorageBackend::resolve_kind(&config, &m).await.unwrap();
+        assert_eq!(kind, BackendKind::Memory);
+        assert!(m.copied.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            scope.is_some() && is_read_only(),
+            "still read-only until the backend is built"
+        );
+        drop(scope);
+        assert!(!is_read_only());
+        // The whole factory, too: it builds the target and releases the gate.
+        StorageBackend::from_config_with(&config, &scripted(0))
+            .await
+            .unwrap();
+        assert!(!is_read_only());
+    }
+
+    #[tokio::test]
+    async fn a_parity_gap_keeps_the_source_and_the_gate_is_released() {
+        let _l = GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        let config = migrating_config(MEMORY_BACKEND, dir.path());
+        let (kind, _, _scope) = StorageBackend::resolve_kind(&config, &scripted(1))
+            .await
+            .unwrap();
+        assert_eq!(kind, BackendKind::Default, "a gap must never flip");
+    }
+
+    #[tokio::test]
+    async fn without_a_migrator_the_factory_stays_on_the_source() {
+        let _l = GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = migrating_config(MEMORY_BACKEND, dir.path());
+        let (kind, _, _s) = StorageBackend::resolve_kind(&config, &migrate::NoMigrator)
+            .await
+            .unwrap();
+        assert_eq!(kind, BackendKind::Default);
+    }
+
+    #[tokio::test]
+    async fn rollback_by_configuration_selects_the_source_without_copying() {
+        let _l = GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = migrating_config(MEMORY_BACKEND, dir.path());
+        config.storage_migration.rollback = true;
+        let m = scripted(0);
+        let (kind, _, _s) = StorageBackend::resolve_kind(&config, &m).await.unwrap();
+        assert_eq!(kind, BackendKind::Default);
+        assert!(
+            !m.copied.load(std::sync::atomic::Ordering::SeqCst),
+            "rollback copies nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn disposable_mounts_a_migrated_copy_on_the_test_stack_never_the_source() {
+        let _l = GATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = migrating_config(MEMORY_BACKEND, dir.path());
+        config.storage_migration.disposable = true;
+        let configured = config.storage_obrain_path.clone();
+        let m = scripted(0);
+        let (kind, built, _s) = StorageBackend::resolve_kind(&config, &m).await.unwrap();
+        assert_eq!(kind, BackendKind::Memory);
+        let scratch = built.storage_obrain_path.clone().unwrap();
+        assert_ne!(
+            Some(scratch.clone()),
+            configured,
+            "the disposable target is a scratch copy"
+        );
+        assert!(
+            std::path::Path::new(&scratch).join("n.json").exists(),
+            "the copy is there"
+        );
+        assert!(!dir.path().join("target").join("n.json").exists());
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 }

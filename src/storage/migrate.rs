@@ -39,6 +39,10 @@ pub const READ_ONLY_STATUS: u16 = 503;
 
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// Tests that touch the process-wide gate serialize on this lock.
+#[cfg(test)]
+pub(crate) static GATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Enter (`true`) or leave (`false`) the read-only migration state.
 pub fn set_read_only(value: bool) {
     READ_ONLY.store(value, Ordering::SeqCst);
@@ -182,40 +186,180 @@ pub enum MigrationDecision {
     },
 }
 
+/// What the verification step produced. "Not run" and "ran clean" are
+/// DIFFERENT states: only a completed, empty mismatch list lets the switch
+/// through, so a skipped, failed or erroring verification can never flip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// The verification did not complete (copy failed, counts unreadable, no
+    /// migrator wired…); the string says why.
+    NotRun(String),
+    /// The per-type comparison ran; the list is its mismatches (empty = parity).
+    Done(Vec<TypeMismatch>),
+}
+
 /// Decide the switch from the configuration and the verification result.
 ///
 /// - `rollback` (a configuration variable) always stays on the source.
-/// - `verify_by_type` + a non-empty [`verify_by_type`] result stays on the
-///   source, naming every mismatch.
-/// - Otherwise the switch is allowed.
+/// - A verification that did not run, or that found any mismatch, stays on the
+///   source, naming why. There is no way to skip it.
+/// - Only `Verification::Done` with no mismatch flips.
 pub fn decide(
     source: &str,
     target: &str,
     rollback: bool,
-    verify_by_type: bool,
-    mismatches: &[TypeMismatch],
+    verification: &Verification,
 ) -> MigrationDecision {
-    if rollback {
-        return MigrationDecision::StayOnSource {
-            source: source.to_string(),
-            target: target.to_string(),
-            reason: "rollback demanded by configuration — staying on the source".to_string(),
-        };
-    }
-    if verify_by_type && !mismatches.is_empty() {
-        return MigrationDecision::StayOnSource {
-            source: source.to_string(),
-            target: target.to_string(),
-            reason: format!(
-                "per-type verification failed ({} mismatch): {}",
-                mismatches.len(),
-                summarize(mismatches)
-            ),
-        };
-    }
-    MigrationDecision::Flip {
+    let stay = |reason: String| MigrationDecision::StayOnSource {
         source: source.to_string(),
         target: target.to_string(),
+        reason,
+    };
+    if rollback {
+        return stay("rollback demanded by configuration — staying on the source".to_string());
+    }
+    match verification {
+        Verification::NotRun(why) => stay(format!(
+            "per-type verification did not run ({why}) — the switch needs a passed check, \
+             staying on the source"
+        )),
+        Verification::Done(mismatches) if !mismatches.is_empty() => stay(format!(
+            "per-type verification failed ({} mismatch): {}",
+            mismatches.len(),
+            summarize(mismatches)
+        )),
+        Verification::Done(_) => MigrationDecision::Flip {
+            source: source.to_string(),
+            target: target.to_string(),
+        },
+    }
+}
+
+// ── The startup orchestration ───────────────────────────────────────────────
+
+/// The data-copy seam. The real migrator (reading Neo4j, writing obrain) lives
+/// outside this repository; PO drives it through this trait and owns the gate
+/// and the decision. An implementation READS the source and WRITES only to
+/// `dest`: the source is never modified.
+#[async_trait::async_trait]
+pub trait Migrator: Send + Sync {
+    /// Per-type counts of the source.
+    async fn source_counts(&self) -> anyhow::Result<PerTypeCounts>;
+    /// Copy the source into `dest` (a directory owned by the target).
+    async fn copy(&self, dest: &std::path::Path) -> anyhow::Result<()>;
+    /// Per-type counts of what `dest` now holds, read back from the target.
+    async fn target_counts(&self, dest: &std::path::Path) -> anyhow::Result<PerTypeCounts>;
+}
+
+/// The migrator wired in a build that carries none: every step fails by name,
+/// so a migration request fails CLOSED (stay on the source) instead of
+/// flipping blind.
+pub struct NoMigrator;
+
+#[async_trait::async_trait]
+impl Migrator for NoMigrator {
+    async fn source_counts(&self) -> anyhow::Result<PerTypeCounts> {
+        anyhow::bail!(
+            "no migrator is wired in this build (the data copy lives outside this repository)"
+        )
+    }
+    async fn copy(&self, _dest: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::bail!("no migrator is wired in this build")
+    }
+    async fn target_counts(&self, _dest: &std::path::Path) -> anyhow::Result<PerTypeCounts> {
+        anyhow::bail!("no migrator is wired in this build")
+    }
+}
+
+/// Holds the process read-only for its lifetime: `enter` raises the gate, drop
+/// lowers it (also on an early return or a panic). The factory keeps it until
+/// the chosen backend is built, i.e. before any route or background writer of
+/// `start_server` exists.
+pub struct ReadOnlyScope(());
+
+impl ReadOnlyScope {
+    pub fn enter() -> Self {
+        set_read_only(true);
+        Self(())
+    }
+}
+
+impl Drop for ReadOnlyScope {
+    fn drop(&mut self) {
+        set_read_only(false);
+    }
+}
+
+/// The result of the startup migration: the decision, and where the target
+/// lives (the configured path, or a throwaway copy when `disposable`).
+#[derive(Debug)]
+pub struct StartupMigration {
+    pub decision: MigrationDecision,
+    /// The directory holding the migrated copy; `None` when nothing was copied
+    /// (rollback, empty source, or a failure before the copy).
+    pub dest: Option<std::path::PathBuf>,
+}
+
+/// Run the whole startup migration: caller MUST already hold a
+/// [`ReadOnlyScope`]. Reads the source counts; if the source holds data, copies
+/// it to the destination (a fresh scratch directory when `disposable`, else
+/// `configured_dest`), reads the target back and verifies per type. Every error
+/// path is a `StayOnSource` with its reason; only a clean parity flips.
+pub async fn run_startup_migration(
+    source: &str,
+    target: &str,
+    rollback: bool,
+    disposable: bool,
+    configured_dest: Option<std::path::PathBuf>,
+    migrator: &dyn Migrator,
+) -> StartupMigration {
+    let stay = |reason: String, dest: Option<std::path::PathBuf>| StartupMigration {
+        decision: decide(source, target, rollback, &Verification::NotRun(reason)),
+        dest,
+    };
+    if rollback {
+        return stay("rollback".to_string(), None);
+    }
+    let src_counts = match migrator.source_counts().await {
+        Ok(c) => c,
+        Err(e) => return stay(format!("source unreadable: {e}"), None),
+    };
+    // A scratch destination for the disposable environment: a COPY, never the
+    // source, and never the configured (real) target location.
+    let dest = if disposable {
+        match tempfile::Builder::new().prefix("po-disposable-").tempdir() {
+            #[allow(deprecated)]
+            Ok(dir) => dir.into_path(),
+            Err(e) => return stay(format!("cannot create the disposable directory: {e}"), None),
+        }
+    } else {
+        match configured_dest {
+            Some(d) => d,
+            None => return stay("no destination configured for the target".to_string(), None),
+        }
+    };
+    if src_counts.is_empty() {
+        // Nothing to carry over: the target starts empty, parity is trivial.
+        return StartupMigration {
+            decision: decide(source, target, rollback, &Verification::Done(Vec::new())),
+            dest: Some(dest),
+        };
+    }
+    if let Err(e) = migrator.copy(&dest).await {
+        return stay(format!("copy failed: {e}"), Some(dest));
+    }
+    let tgt_counts = match migrator.target_counts(&dest).await {
+        Ok(c) => c,
+        Err(e) => return stay(format!("target unreadable: {e}"), Some(dest)),
+    };
+    StartupMigration {
+        decision: decide(
+            source,
+            target,
+            rollback,
+            &Verification::Done(verify_by_type(&src_counts, &tgt_counts)),
+        ),
+        dest: Some(dest),
     }
 }
 
@@ -282,16 +426,35 @@ mod tests {
         assert!(!counts(&[("Project", 1)], &[]).is_empty());
     }
 
+    fn flip() -> MigrationDecision {
+        MigrationDecision::Flip {
+            source: "default".into(),
+            target: "obrain".into(),
+        }
+    }
+
     #[test]
-    fn decide_flips_when_verification_passes_and_no_rollback() {
-        let d = decide("default", "obrain", false, true, &[]);
+    fn decide_flips_only_on_a_completed_clean_verification() {
         assert_eq!(
-            d,
-            MigrationDecision::Flip {
-                source: "default".into(),
-                target: "obrain".into(),
-            }
+            decide("default", "obrain", false, &Verification::Done(vec![])),
+            flip()
         );
+    }
+
+    #[test]
+    fn decide_never_flips_without_a_verification() {
+        // The case the old `verify_by_type=false` flag used to wave through.
+        match decide(
+            "default",
+            "obrain",
+            false,
+            &Verification::NotRun("x".into()),
+        ) {
+            MigrationDecision::StayOnSource { reason, .. } => {
+                assert!(reason.contains("did not run"), "{reason}")
+            }
+            other => panic!("expected StayOnSource, got {other:?}"),
+        }
     }
 
     #[test]
@@ -302,37 +465,199 @@ mod tests {
             source: 3,
             target: 2,
         }];
-        match decide("default", "obrain", false, true, &m) {
+        match decide("default", "obrain", false, &Verification::Done(m)) {
             MigrationDecision::StayOnSource { source, reason, .. } => {
                 assert_eq!(source, "default");
-                assert!(
-                    reason.contains("Project"),
-                    "reason must name the type: {reason}"
-                );
-                assert!(
-                    reason.contains("3"),
-                    "reason must name the source count: {reason}"
-                );
+                assert!(reason.contains("Project"), "{reason}");
+                assert!(reason.contains('3'), "{reason}");
             }
             other => panic!("expected StayOnSource, got {other:?}"),
         }
     }
 
     #[test]
-    fn decide_skips_verification_when_disabled_but_never_skips_rollback() {
-        let m = vec![TypeMismatch {
-            kind: "node",
-            type_name: "Project".into(),
-            source: 3,
-            target: 2,
-        }];
+    fn decide_rollback_wins_over_a_clean_verification() {
         assert!(matches!(
-            decide("default", "obrain", false, false, &m),
-            MigrationDecision::Flip { .. }
-        ));
-        assert!(matches!(
-            decide("default", "obrain", true, true, &[]),
+            decide("default", "obrain", true, &Verification::Done(vec![])),
             MigrationDecision::StayOnSource { .. }
         ));
+    }
+
+    /// A scripted migrator over in-memory "stores": `src` is the source's
+    /// counts; `copy` writes a marker file in `dest` and records what it saw;
+    /// `lose` drops one node from the copy (an injected parity gap).
+    struct Fake {
+        src: PerTypeCounts,
+        lose: bool,
+        fail_copy: bool,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+    impl Fake {
+        fn new(src: PerTypeCounts) -> Self {
+            Self {
+                src,
+                lose: false,
+                fail_copy: false,
+                copies: Default::default(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Migrator for Fake {
+        async fn source_counts(&self) -> anyhow::Result<PerTypeCounts> {
+            assert!(is_read_only(), "the source must be read under the gate");
+            Ok(self.src.clone())
+        }
+        async fn copy(&self, dest: &std::path::Path) -> anyhow::Result<()> {
+            assert!(is_read_only(), "the copy must run under the gate");
+            self.copies.fetch_add(1, Ordering::SeqCst);
+            if self.fail_copy {
+                anyhow::bail!("disk full");
+            }
+            let mut c = self.src.clone();
+            if self.lose {
+                *c.nodes.get_mut("Project").unwrap() -= 1;
+            }
+            std::fs::write(
+                dest.join("copy.json"),
+                format!("{:?}", (&c.nodes, &c.relationships)),
+            )?;
+            std::fs::write(dest.join("nodes"), serde_json::to_string(&c.nodes)?)?;
+            std::fs::write(dest.join("rels"), serde_json::to_string(&c.relationships)?)?;
+            Ok(())
+        }
+        async fn target_counts(&self, dest: &std::path::Path) -> anyhow::Result<PerTypeCounts> {
+            Ok(PerTypeCounts {
+                nodes: serde_json::from_str(&std::fs::read_to_string(dest.join("nodes"))?)?,
+                relationships: serde_json::from_str(&std::fs::read_to_string(dest.join("rels"))?)?,
+            })
+        }
+    }
+
+    fn data() -> PerTypeCounts {
+        counts(&[("Project", 3), ("Note", 7)], &[("LINKED_TO", 4)])
+    }
+
+    #[tokio::test]
+    async fn startup_migration_flips_on_parity_and_never_touches_the_source() {
+        let _lock = GATE_TEST_LOCK.lock().await;
+        let dest = tempfile::tempdir().unwrap();
+        let _ro = ReadOnlyScope::enter();
+        let fake = Fake::new(data());
+        let r = run_startup_migration(
+            "default",
+            "obrain",
+            false,
+            false,
+            Some(dest.path().into()),
+            &fake,
+        )
+        .await;
+        assert_eq!(r.decision, flip());
+        assert_eq!(r.dest.as_deref(), Some(dest.path()));
+        assert_eq!(fake.src, data(), "the source counts are unchanged");
+    }
+
+    #[tokio::test]
+    async fn startup_migration_stays_on_source_on_a_parity_gap_and_says_why() {
+        let _lock = GATE_TEST_LOCK.lock().await;
+        let dest = tempfile::tempdir().unwrap();
+        let _ro = ReadOnlyScope::enter();
+        let mut fake = Fake::new(data());
+        fake.lose = true;
+        let r = run_startup_migration(
+            "default",
+            "obrain",
+            false,
+            false,
+            Some(dest.path().into()),
+            &fake,
+        )
+        .await;
+        match r.decision {
+            MigrationDecision::StayOnSource { reason, .. } => {
+                assert!(
+                    reason.contains("Project") && reason.contains("source 3 vs target 2"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected StayOnSource, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_migration_fails_closed_on_copy_error_and_without_migrator() {
+        let _lock = GATE_TEST_LOCK.lock().await;
+        let dest = tempfile::tempdir().unwrap();
+        let _ro = ReadOnlyScope::enter();
+        let mut fake = Fake::new(data());
+        fake.fail_copy = true;
+        let r = run_startup_migration(
+            "default",
+            "obrain",
+            false,
+            false,
+            Some(dest.path().into()),
+            &fake,
+        )
+        .await;
+        assert!(
+            matches!(&r.decision, MigrationDecision::StayOnSource { reason, .. } if reason.contains("disk full"))
+        );
+        let r = run_startup_migration(
+            "default",
+            "obrain",
+            false,
+            false,
+            Some(dest.path().into()),
+            &NoMigrator,
+        )
+        .await;
+        assert!(
+            matches!(&r.decision, MigrationDecision::StayOnSource { reason, .. } if reason.contains("no migrator"))
+        );
+    }
+
+    #[tokio::test]
+    async fn disposable_copies_into_a_scratch_dir_not_the_configured_target() {
+        let _lock = GATE_TEST_LOCK.lock().await;
+        let configured = tempfile::tempdir().unwrap();
+        let _ro = ReadOnlyScope::enter();
+        let fake = Fake::new(data());
+        let r = run_startup_migration(
+            "default",
+            "obrain",
+            false,
+            true,
+            Some(configured.path().into()),
+            &fake,
+        )
+        .await;
+        assert_eq!(r.decision, flip());
+        let d = r.dest.unwrap();
+        assert_ne!(
+            d,
+            configured.path(),
+            "a disposable run never uses the configured target"
+        );
+        assert!(
+            d.join("nodes").exists(),
+            "the copy landed in the scratch dir"
+        );
+        assert!(
+            !configured.path().join("nodes").exists(),
+            "the configured target is untouched"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_scope_is_released_on_drop() {
+        let _lock = GATE_TEST_LOCK.lock().await;
+        {
+            let _ro = ReadOnlyScope::enter();
+            assert!(is_read_only());
+        }
+        assert!(!is_read_only());
     }
 }

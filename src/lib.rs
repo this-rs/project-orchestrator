@@ -277,30 +277,33 @@ pub struct MigrationYamlConfig {
     /// source itself. Priority: env var (STORAGE_MIGRATION_DISPOSABLE) > YAML
     /// > false.
     pub disposable: Option<bool>,
-    /// Gate the switch on a per-type (nodes + links) source == target check.
-    /// Priority: env var (STORAGE_MIGRATION_VERIFY_BY_TYPE) > YAML > true.
-    pub verify_by_type: Option<bool>,
+    /// The source backend whose data must be carried over to the requested
+    /// target (only `"default"` today). Unset = no migration: the requested
+    /// backend is built as is. The per-type (nodes + links) source == target
+    /// verification is NOT configurable: it always gates the switch.
+    /// Priority: env var (STORAGE_MIGRATION_FROM) > YAML > unset.
+    pub from: Option<String>,
 }
 
 /// Resolved startup-migration configuration (see [`MigrationYamlConfig`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageMigrationConfig {
     /// Stay on the source backend: the rollback demanded by configuration.
     pub rollback: bool,
     /// Migrate a disposable copy, never the source.
     pub disposable: bool,
-    /// Only switch once the per-type (nodes + links) verification passes.
-    pub verify_by_type: bool,
+    /// The source backend to migrate from; `None` = no migration.
+    pub from: Option<String>,
 }
 
 impl Default for StorageMigrationConfig {
     /// The defaults when nothing is configured: no rollback, no disposable
-    /// copy, and the per-type verification gate ON.
+    /// copy, no migration.
     fn default() -> Self {
         Self {
             rollback: false,
             disposable: false,
-            verify_by_type: true,
+            from: None,
         }
     }
 }
@@ -1278,13 +1281,11 @@ impl Config {
                     yaml.storage.migration.disposable,
                 )
                 .unwrap_or(false),
-                verify_by_type: env_flag_over(
-                    std::env::var("STORAGE_MIGRATION_VERIFY_BY_TYPE")
-                        .ok()
-                        .as_deref(),
-                    yaml.storage.migration.verify_by_type,
-                )
-                .unwrap_or(true),
+                from: std::env::var("STORAGE_MIGRATION_FROM")
+                    .ok()
+                    .or(yaml.storage.migration.from.clone())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
             },
             events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
                 yaml.events
@@ -3875,42 +3876,44 @@ chat:
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
         std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
-        std::env::remove_var("STORAGE_MIGRATION_VERIFY_BY_TYPE");
+        std::env::remove_var("STORAGE_MIGRATION_FROM");
 
-        // Defaults when nothing is configured: rollback off, disposable off,
-        // per-type verification on.
+        // Defaults when nothing is configured: no rollback, no disposable, no source.
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("config.yaml");
         std::fs::write(&file_path, "storage:\n  backend: obrain\n").unwrap();
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
         assert!(!config.storage_migration.rollback);
         assert!(!config.storage_migration.disposable);
-        assert!(config.storage_migration.verify_by_type);
+        assert_eq!(config.storage_migration.from, None);
 
         // YAML wins over the defaults.
         std::fs::write(
             &file_path,
             "storage:\n  backend: obrain\n  migration:\n    rollback: true\n    \
-             disposable: true\n    verify_by_type: false\n",
+             disposable: true\n    from: default\n",
         )
         .unwrap();
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
         assert!(config.storage_migration.rollback);
         assert!(config.storage_migration.disposable);
-        assert!(!config.storage_migration.verify_by_type);
+        assert_eq!(config.storage_migration.from.as_deref(), Some("default"));
 
         // Environment wins over YAML.
         std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
         std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "false");
-        std::env::set_var("STORAGE_MIGRATION_VERIFY_BY_TYPE", "true");
+        std::env::set_var("STORAGE_MIGRATION_FROM", "");
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
         assert!(!config.storage_migration.rollback);
         assert!(!config.storage_migration.disposable);
-        assert!(config.storage_migration.verify_by_type);
+        assert_eq!(
+            config.storage_migration.from, None,
+            "an empty env value is unset"
+        );
 
         std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
         std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
-        std::env::remove_var("STORAGE_MIGRATION_VERIFY_BY_TYPE");
+        std::env::remove_var("STORAGE_MIGRATION_FROM");
     }
 
     /// A duplicate instance must die on the port BEFORE any initialization.
