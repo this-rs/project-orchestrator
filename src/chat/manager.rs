@@ -11293,14 +11293,19 @@ impl ChatManager {
                 .get(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
 
+            // `is_streaming` is read under the queue lock, the lock the end of a turn holds
+            // to decide nothing is left (#1188 §1a, P2): either the turn still runs and sees
+            // this entry, or it is over and the message is sent below. Never queued behind a
+            // turn that already finished, where nothing would drain it.
+            let mut queue = session.pending_messages.lock().await;
             if session.is_streaming.load(Ordering::SeqCst) {
                 info!(
                     "Stream in progress for session {}, queuing message and interrupting",
                     session_id
                 );
                 // Queue the message (real user message)
-                let mut queue = session.pending_messages.lock().await;
                 queue.push_back(PendingMessage::user(message.to_string()));
+                drop(queue);
 
                 // Interrupt the stream so the message is processed sooner
                 session.interrupt_flag.store(true, Ordering::SeqCst);
@@ -14718,19 +14723,19 @@ impl ChatManager {
         };
         match tasks {
             Some((background, cli_background, child_pid, pending)) => {
-                // A queued message will open a turn: the session is not over (#1188 §1a).
-                if !pending.lock().await.is_empty() {
-                    return true;
-                }
                 let cli_count = cli_background.load(Ordering::Relaxed);
                 // A dead CLI (zombie or reaped) cannot have live background tasks; its last
                 // reported count is stale. Clear it so the session frees its child slot
                 // instead of holding it until the idle-cleanup timeout (ZOMBIE-CLI).
                 if cli_count > 0 && process_alive(child_pid) == Some(false) {
                     cli_background.store(0, Ordering::Relaxed);
-                    return !background.lock().await.is_empty();
+                    // The queue is read after the counter is cleared (#1188 §1a).
+                    return !pending.lock().await.is_empty() || !background.lock().await.is_empty();
                 }
-                !background.lock().await.is_empty() || cli_count > 0
+                // A queued message will open a turn: the session is not over (#1188 §1a).
+                !pending.lock().await.is_empty()
+                    || !background.lock().await.is_empty()
+                    || cli_count > 0
             }
             None => false,
         }

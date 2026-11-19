@@ -1396,9 +1396,6 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
-    // #1188 §1b: refused before anything is built or opened (a refusal costs nothing).
-    refuse_task_already_in_flight(graph.as_ref(), chat_manager, task_id).await?;
-
     // Step 0: the spawn envelope (decision A17). When the caller is a chat
     // session, the parent is read from its signed token and the child stays
     // inside it: same project, a directory the parent can see, a permission
@@ -1421,6 +1418,10 @@ pub async fn delegate_task(
         opening.as_ref(),
     )
     .await?;
+    // #1188 §1b: refused after authentication and the envelope (a caller refused with 401/403 is
+    // never told about another session), and before anything is built or opened. The `opening`
+    // ticket is released when this returns.
+    refuse_task_already_in_flight(graph.as_ref(), chat_manager, task_id).await?;
     let default_mode = chat_manager.default_permission_mode().await;
     let mut chat_request = delegation_chat_request(
         req.cwd,
@@ -1499,7 +1500,15 @@ pub(crate) struct PreparedDelegation {
 /// interrupted) never blocks a retry, and an execution left `running` by a dead process
 /// (its session is gone) does not block it forever. Delegations of OTHER tasks are not
 /// looked at. Two agents on one task shared one worktree and overwrote each other.
-async fn refuse_task_already_in_flight(
+///
+/// Known limit (P1): a child that is alive but silent (a stream or background task that never
+/// ends) keeps the task blocked until the listener's delay (`DelegationLimits`, 3 h) closes the
+/// delegation. The 409 says how to lift the block sooner.
+///
+/// Known limit (P3): the execution row is written in a spawned task and the prompt is sent in
+/// another. In that gap the child is neither streaming nor queued, so a second call that
+/// arrives at the same moment is not refused. The guard covers a parent that re-delegates later.
+pub(crate) async fn refuse_task_already_in_flight(
     graph: &dyn crate::neo4j::GraphStore,
     chat_manager: &ChatManager,
     task_id: Uuid,
@@ -1515,8 +1524,10 @@ async fn refuse_task_already_in_flight(
         let session = session.to_string();
         if chat_manager.is_session_working(&session).await {
             return Err(AppError::Conflict(format!(
-                "Task {task_id} is already being delegated: session {session} has not finished. \
-                 Wait for its end (or stop it) before delegating this task again."
+                "Task {task_id} is already being delegated: child session {session} has not \
+                 finished. To lift the block, interrupt it (POST /api/chat/sessions/{session}/interrupt) \
+                 or close it (DELETE /api/chat/sessions/{session}); the delegation then ends and the \
+                 task can be delegated again."
             )));
         }
     }
@@ -9666,6 +9677,35 @@ pub(crate) mod tests {
         delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
             .await
             .expect("a finished delegation must not block a retry");
+    }
+
+    /// #1188 §1b: an execution left `running` whose session is gone (a dead process) does not
+    /// block the task: only a child that still works does.
+    #[tokio::test]
+    async fn an_execution_whose_session_is_gone_does_not_block_its_task() {
+        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+
+        let (_manager, _fake, _rx, state, headers, plan, [task_a, _], cwd) =
+            a_rig_to_delegate_twice().await;
+        state
+            .orchestrator
+            .neo4j_arc()
+            .create_agent_execution(&AgentExecutionNode {
+                id: Uuid::new_v4(),
+                run_id: Uuid::nil(),
+                task_id: task_a,
+                session_id: Some(Uuid::new_v4()),
+                started_at: chrono::Utc::now(),
+                status: AgentExecutionStatus::Running,
+                persona_profile: "delegation".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("a running execution whose session is gone must not block the task");
     }
 
     /// #1188 §1: a `Result` closes a TURN, not the delegation. A child that ends its turn
