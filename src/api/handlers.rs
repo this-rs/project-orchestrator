@@ -2018,7 +2018,7 @@ async fn listen_delegation_result(
         std::time::Duration::from_secs(limits.timeout_secs)
     };
 
-    let closure = DelegationClosure {
+    let mut closure = DelegationClosure {
         task_id,
         task_title,
         event_bus,
@@ -2027,6 +2027,7 @@ async fn listen_delegation_result(
         owner,
         limits,
         halt,
+        close_child: false,
     };
 
     // A `Result` closes a TURN, not a session (#1188). A delegated child that ends its turn
@@ -2045,6 +2046,10 @@ async fn listen_delegation_result(
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             tracing::warn!(task_id = %task_id, timeout_secs = limits.timeout_secs, "Delegation past its delay: the child is stopped");
+            // Whether a turn runs NOW, asked before the interrupt (which ends it). A finished
+            // turn (`ended_turn`) is the last one only if no later turn began since: the child
+            // woken by its background work runs a new turn whose `Result` is the one to read.
+            let turn_running = delegation_turn_running(&closure.halt).await;
             // Stop the CHILD, not only the listening: its running turn is interrupted, and
             // what it spent up to there is read from the `Result` that interrupted turn gives
             // (bounded wait). The session is closed by the closure, its descendants with it.
@@ -2054,9 +2059,13 @@ async fn listen_delegation_result(
             // A turn already ended and the child only waited on its background work: no turn
             // is running, so the interrupt gives no `Result` to wait for. The delegation closes
             // on that finished turn — its answer and its spend — and the background work the
-            // interrupt stopped does not make it a failure.
-            if let Some((end, cost_detail)) = ended_turn.take() {
-                return closure.finish(end, cost_detail, execution).await;
+            // interrupt stopped does not make it a failure. The child is closed all the same
+            // (PYSR-3b), with what it spawned, although the status stays `completed`.
+            if !turn_running {
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    closure.close_child = true;
+                    return closure.finish(end, cost_detail, execution).await;
+                }
             }
             let ended = result_after_interrupt(&mut rx).await;
             let duration_secs = start.elapsed().as_secs_f64();
@@ -2112,8 +2121,10 @@ async fn listen_delegation_result(
                 // it is a silent no-op), so no turn will ever end and the delegation used to
                 // wait for its delay while the parent believed the work was going on (#1188
                 // §3). Its death is reported as a FAILED delegation — unless a turn had already
-                // ended: the work it did stands, and the delegation closes on it, as on `Closed`.
-                if let Some((end, cost_detail)) = ended_turn.take() {
+                // ended AND no later turn was running when it died (that turn's death is not a
+                // success): the work it did stands, and the delegation closes on it.
+                let turn_running = delegation_turn_running(&closure.halt).await;
+                if let Some((end, cost_detail)) = ended_turn.take().filter(|_| !turn_running) {
                     tracing::warn!(
                         task_id = %task_id,
                         reason = %reason,
@@ -2179,6 +2190,15 @@ async fn delegation_child_has_work(halt: &Option<Arc<dyn DelegationHalt>>) -> bo
         Some(halt) => halt.is_working().await,
         // No handle on the child (a delegation nobody opened from a session): the `Result` is
         // the end, as it was before.
+        None => false,
+    }
+}
+
+/// Whether a turn of the child runs right now ([`ChatManager::is_session_streaming`]): a
+/// background task alone is not a turn. Without a handle on the child, none.
+async fn delegation_turn_running(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_turn_running().await,
         None => false,
     }
 }
@@ -2264,6 +2284,9 @@ struct DelegationClosure<'a> {
     owner: DelegationOwner,
     limits: crate::runner::DelegationLimits,
     halt: Option<Arc<dyn DelegationHalt>>,
+    /// Close the child (cascade) even when no stop is recorded: the delay found it with a
+    /// finished turn and only background work left — `completed`, yet not left open.
+    close_child: bool,
 }
 
 impl DelegationClosure<'_> {
@@ -2376,8 +2399,9 @@ impl DelegationClosure<'_> {
             }
         }
 
-        // Stopped by its own limits: the child does not stay open, nor anything it spawned.
-        if end.stop.is_some() {
+        // Stopped by its own limits (or by the delay after a finished turn): the child does not
+        // stay open, nor anything it spawned.
+        if end.stop.is_some() || self.close_child {
             if let Some(halt) = &self.halt {
                 halt.close().await;
             }
@@ -2418,6 +2442,9 @@ pub(crate) trait DelegationHalt: Send + Sync {
     /// still reports. A `Result` that arrives while it does closes a TURN, not the
     /// delegation (#1188).
     async fn is_working(&self) -> bool;
+    /// Whether a turn runs right now (not a background task alone): a `Result` already seen
+    /// is then not the last one.
+    async fn is_turn_running(&self) -> bool;
     /// The session is closed with every session it spawned (cascade): a sub-agent of the
     /// child does not outlive the stop.
     async fn close(&self);
@@ -2433,6 +2460,10 @@ struct HaltSession {
 impl DelegationHalt for HaltSession {
     async fn is_working(&self) -> bool {
         self.manager.is_session_working(&self.session_id).await
+    }
+
+    async fn is_turn_running(&self) -> bool {
+        self.manager.is_session_streaming(&self.session_id).await
     }
 
     async fn interrupt(&self) {
@@ -9776,6 +9807,8 @@ pub(crate) mod tests {
         closed: std::sync::atomic::AtomicBool,
         /// Whether the child still has work — a background task, a turn still open.
         working: std::sync::atomic::AtomicBool,
+        /// Whether a turn runs (a new turn began after a finished one).
+        turn_running: std::sync::atomic::AtomicBool,
         /// How many times the listener asked: a test waits for the question, then answers it.
         work_checks: std::sync::atomic::AtomicUsize,
         on_interrupt:
@@ -9800,6 +9833,12 @@ pub(crate) mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self
         }
+        /// A new turn is running (the child was woken by its background work).
+        fn in_a_turn(self) -> Self {
+            self.turn_running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
         /// The work the child was waiting on is over: the next turn is its last.
         fn stopped_working(&self) {
             self.working
@@ -9815,6 +9854,9 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl super::DelegationHalt for HaltRecorder {
+        async fn is_turn_running(&self) -> bool {
+            self.turn_running.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn is_working(&self) -> bool {
             self.work_checks
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -10135,6 +10177,7 @@ pub(crate) mod tests {
         drop(tx);
 
         assert!(halt.interrupted(), "the background work is stopped");
+        assert!(halt.closed(), "the child is closed, with what it spawned");
         assert_eq!(stop, None, "the finished turn is the delegation's end");
         assert!(
             waited < std::time::Duration::from_secs(90) + super::INTERRUPT_RESULT_GRACE,
@@ -10189,6 +10232,85 @@ pub(crate) mod tests {
         let event = delegation_event(&mut events).expect("the delegation's end is emitted");
         assert_eq!(event["event"], "delegation_completed");
         assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 — T1 ended, the background work finished, the child woke and T2 RUNS when the
+    /// delay expires: T2 is interrupted and its `Result` read (its cumulative spend), the
+    /// delegation closes `Interrupted`, the child closed. Red before: the listener closed
+    /// `completed` on T1's spend and dropped T2's.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_during_a_new_turn_reads_that_turns_result() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.9)).in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        halt.working
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        assert!(halt.interrupted() && halt.closed());
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed");
+        assert_eq!(
+            event["cost_usd"], 0.9,
+            "T2's cumulative spend is read, not T1's: {event}"
+        );
+    }
+
+    /// #1188 — the child's session dies while a NEW turn runs, after a finished one: that
+    /// turn's death is a failure, not a success on T1. Red before: `completed` at T1's spend.
+    #[tokio::test]
+    async fn a_session_error_during_a_new_turn_fails_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working().in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
     }
 
     /// PYSR-3b — the halt of a delegation closes the child AND what the child spawned (a
