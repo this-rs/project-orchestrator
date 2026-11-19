@@ -2051,6 +2051,13 @@ async fn listen_delegation_result(
             if let Some(halt) = &closure.halt {
                 halt.interrupt().await;
             }
+            // A turn already ended and the child only waited on its background work: no turn
+            // is running, so the interrupt gives no `Result` to wait for. The delegation closes
+            // on that finished turn — its answer and its spend — and the background work the
+            // interrupt stopped does not make it a failure.
+            if let Some((end, cost_detail)) = ended_turn.take() {
+                return closure.finish(end, cost_detail, execution).await;
+            }
             let ended = result_after_interrupt(&mut rx).await;
             let duration_secs = start.elapsed().as_secs_f64();
             let (end, cost_detail) = match ended {
@@ -2104,7 +2111,16 @@ async fn listen_delegation_result(
                 // The child's session is gone for good (`SessionError`: every later message on
                 // it is a silent no-op), so no turn will ever end and the delegation used to
                 // wait for its delay while the parent believed the work was going on (#1188
-                // §3). Its death is reported as a FAILED delegation.
+                // §3). Its death is reported as a FAILED delegation — unless a turn had already
+                // ended: the work it did stands, and the delegation closes on it, as on `Closed`.
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        reason = %reason,
+                        "Delegation: the child's session ended ({message}) after a finished turn; closing on that turn"
+                    );
+                    return closure.finish(end, cost_detail, execution).await;
+                }
                 tracing::warn!(
                     task_id = %task_id,
                     reason = %reason,
@@ -10081,6 +10097,98 @@ pub(crate) mod tests {
             event["cost_usd"], 0.9,
             "the delegation closes on the last turn's cumulative spend: {event}"
         );
+    }
+
+    /// #1188 — the delay expires while the child, its turn ended, only waits on background
+    /// work: no turn is running, so the interrupt gives no `Result`. The delegation closes on
+    /// the finished turn (completed, its spend), at once. Red before: the listener waited the
+    /// whole `INTERRUPT_RESULT_GRACE` for a `Result` that never comes, then closed `failed`
+    /// at an unknown cost.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        let start = tokio::time::Instant::now();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        let waited = start.elapsed();
+        drop(tx);
+
+        assert!(halt.interrupted(), "the background work is stopped");
+        assert_eq!(stop, None, "the finished turn is the delegation's end");
+        assert!(
+            waited < std::time::Duration::from_secs(90) + super::INTERRUPT_RESULT_GRACE,
+            "no grace is waited for a `Result` no turn will give: {waited:?}"
+        );
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 §3 — the child's session dies AFTER a finished turn (it only waited on
+    /// background work): the work it did stands, the delegation closes on that turn,
+    /// completed. Red before: any `SessionError` closed the delegation `failed`.
+    #[tokio::test]
+    async fn a_session_error_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, None);
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
     }
 
     /// PYSR-3b — the halt of a delegation closes the child AND what the child spawned (a
