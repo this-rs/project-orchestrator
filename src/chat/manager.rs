@@ -40225,6 +40225,177 @@ pub(crate) mod test_support {
         insert_session_with_client(manager, session_id, client, false, &[]).await;
     }
 
+    /// A CLI that can DIE the way the real one does: its output stream ends (the reader
+    /// task of the subprocess is gone) while the transport itself is still held by the
+    /// session. `MockTransport` cannot do that: its sender lives as long as the client.
+    pub(crate) struct DyingCli {
+        out: Arc<std::sync::Mutex<Option<broadcast::Sender<nexus_claude::Message>>>>,
+    }
+
+    impl DyingCli {
+        /// The CLI says `message`.
+        pub(crate) fn say(&self, message: nexus_claude::Message) {
+            if let Some(tx) = self.out.lock().unwrap().as_ref() {
+                let _ = tx.send(message);
+            }
+        }
+
+        /// The CLI process is gone: every stream on its output ends.
+        pub(crate) fn die(&self) {
+            self.out.lock().unwrap().take();
+        }
+    }
+
+    struct DyingTransport {
+        out: Arc<std::sync::Mutex<Option<broadcast::Sender<nexus_claude::Message>>>>,
+        connected: bool,
+    }
+
+    impl DyingTransport {
+        fn stream(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>> + Send>,
+        > {
+            use futures::StreamExt;
+            match self.out.lock().unwrap().as_ref() {
+                Some(tx) => Box::pin(
+                    tokio_stream::wrappers::BroadcastStream::new(tx.subscribe())
+                        .filter_map(|m| async move { m.ok().map(Ok) }),
+                ),
+                None => Box::pin(futures::stream::empty()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for DyingTransport {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _message: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>> + Send>,
+        > {
+            self.stream()
+        }
+        fn subscribe_messages(
+            &self,
+        ) -> Option<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>> + Send>,
+            >,
+        > {
+            Some(self.stream())
+        }
+        async fn send_control_request(
+            &mut self,
+            _request: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _request: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _response: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+        async fn end_input(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A live session on a [`DyingCli`], wired like a created session: the permanent
+    /// out-of-band listener runs on its output (the one that publishes the
+    /// `SessionError` when the CLI dies), next to the turns `send_message` starts.
+    pub(crate) async fn insert_dying_cli_session(
+        manager: &ChatManager,
+        session_id: &str,
+    ) -> DyingCli {
+        let (tx, _rx) = broadcast::channel(100);
+        let out = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let transport = DyingTransport {
+            out: out.clone(),
+            connected: false,
+        };
+        let mut client = InteractiveClient::from_transport(Box::new(transport));
+        client.connect().await.expect("the transport connects");
+        insert_session_with_client(manager, session_id, client, false, &[]).await;
+        let (client, events_tx, is_streaming, next_seq, cancel) = {
+            let sessions = manager.active_sessions.read().await;
+            let s = sessions.get(session_id).expect("the session was inserted");
+            (
+                s.client.clone(),
+                s.events_tx.clone(),
+                s.is_streaming.clone(),
+                s.next_seq.clone(),
+                s.nats_cancel.clone(),
+            )
+        };
+        super::super::oob_listener::spawn_oob_listener(
+            session_id.to_string(),
+            client,
+            events_tx,
+            is_streaming,
+            next_seq,
+            cancel,
+            super::super::oob_listener::OobListenerDeps {
+                graph: manager.graph.clone(),
+                active_sessions: manager.active_sessions.clone(),
+                context_injector: manager.context_injector.clone(),
+                event_emitter: manager.event_emitter.clone(),
+                retry_config: manager.config.retry.clone(),
+                enrichment_pipeline: manager.enrichment_pipeline.clone(),
+                search: manager.search.clone(),
+                documents: manager.document_store.clone(),
+                nats: manager.nats.clone(),
+            },
+        );
+        // The listener subscribes to the output in its own task.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        DyingCli { out }
+    }
+
+    /// The CLI's own count of its running background tasks, as the OOB listener stores it.
+    pub(crate) async fn set_cli_background_tasks(
+        manager: &ChatManager,
+        session_id: &str,
+        count: usize,
+    ) {
+        if let Some(s) = manager.active_sessions.read().await.get(session_id) {
+            s.cli_background_tasks.store(count, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) async fn insert_session_with_client(
         manager: &ChatManager,
         session_id: &str,
