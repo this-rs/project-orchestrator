@@ -9914,6 +9914,117 @@ pub(crate) mod tests {
         None
     }
 
+    /// #1239 — with the REAL `ChatManager` (not `HaltRecorder`): a child that finished a
+    /// turn (while a background task of it still runs) and began a NEW turn, whose CLI then
+    /// dies. The death reaches the listener as the `SessionError` the out-of-band listener
+    /// publishes (`emit_subprocess_death`); while the new turn's own stream is closing on the
+    /// same dead output. The delegation is `failed`: the dead turn's work is not a success.
+    /// What it asks of the manager: `is_session_streaming` is still `true` when the
+    /// `SessionError` is read, the turn's end (`post_stream`) not having reset it yet.
+    #[tokio::test]
+    async fn a_child_whose_cli_dies_in_a_new_turn_fails_its_delegation_with_the_real_manager() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        use crate::neo4j::GraphStore;
+        use nexus_claude::Message;
+
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            graph,
+            search,
+            crate::chat::manager::test_support::chat_config(),
+        ));
+        let sid = Uuid::new_v4().to_string();
+        let cli =
+            crate::chat::manager::test_support::insert_dying_cli_session(&manager, &sid).await;
+        // The child waits on a background task of its own, so a `Result` is a turn's end.
+        crate::chat::manager::test_support::set_cli_background_tasks(&manager, &sid, 1).await;
+        let rx = manager.subscribe(&sid).await.unwrap();
+        // What the manager says at the instant the `SessionError` is published.
+        let mut probe = manager.subscribe(&sid).await.unwrap();
+        let probe_manager = manager.clone();
+        let probe_sid = sid.clone();
+        let streaming_at_death = tokio::spawn(async move {
+            loop {
+                if let Ok(crate::chat::types::ChatEvent::SessionError { .. }) = probe.recv().await {
+                    return probe_manager.is_session_streaming(&probe_sid).await;
+                }
+            }
+        });
+
+        let result = || Message::Result {
+            subtype: "success".into(),
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            session_id: "cli-1".into(),
+            total_cost_usd: Some(0.1),
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        let halt = Arc::new(HaltSession {
+            manager: manager.clone(),
+            session_id: sid.clone(),
+        });
+        let listener = tokio::spawn(super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt),
+        ));
+
+        // T1 runs and ends: the listener keeps the finished turn, the child still has work.
+        manager.send_message(&sid, "t1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cli.say(result());
+        wait_until(|| async { !manager.is_session_streaming(&sid).await }).await;
+        // T2 begins, and the CLI dies in it.
+        manager.send_message(&sid, "t2").await.unwrap();
+        wait_until(|| async { manager.is_session_streaming(&sid).await }).await;
+        cli.die();
+
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(15), listener)
+            .await
+            .expect("the delegation ends")
+            .unwrap();
+        let streaming = streaming_at_death.await.unwrap();
+
+        let stored = closed_execution(&mock, id).await;
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(
+            stored.status,
+            AgentExecutionStatus::Failed,
+            "stop={stop:?} streaming_at_death={streaming} event={event}"
+        );
+        assert_eq!(event["event"], "delegation_failed");
+    }
+
+    /// Polls `condition` for up to 10 s.
+    async fn wait_until<F, Fut>(condition: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the condition never held");
+    }
+
     /// PYSR-3b — a delegation stopped by its DELAY goes through the same closure as one that
     /// ends on its own: the event is emitted, what the interrupted turn spent is the run's,
     /// the execution carries that cost, the task is marked with the reason (the StopReason's
