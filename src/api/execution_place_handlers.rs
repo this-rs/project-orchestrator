@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::handlers::{
-    launch_delegation, AppError, DelegateTaskOutcome, OrchestratorState, PreparedDelegation,
+    launch_delegation, refuse_task_already_in_flight, AppError, DelegateTaskOutcome,
+    OrchestratorState, PreparedDelegation,
 };
 use crate::auth::jwt::Claims;
 use crate::chat::envelope::{self, ParentEnvelope, SpawnCaller};
@@ -482,6 +483,9 @@ async fn confirm_and_launch(
 ) -> Result<DelegateTaskOutcome, AppError> {
     let meta = PlacementMeta::of_pending(&pending);
     let graph = state.orchestrator.neo4j_arc();
+    // #1188 §1b (B1): the task may have been delegated while this placement waited for its
+    // person. Checked again here, before the audit and before any worktree is made.
+    refuse_task_already_in_flight(graph.as_ref(), chat_manager, pending.task_id).await?;
     // The audit comes first: no trace of who confirmed what, no worktree.
     meta.record(
         graph.as_ref(),
@@ -876,6 +880,62 @@ mod tests {
             confirm(&f, Claims::person(OWNER, "p@example.org", "P"), id, &x).await,
             Err(AppError::NotFound(_))
         ));
+    }
+
+    /// #1188 §1b (B1): a placement waits for its person, the same task is delegated meanwhile
+    /// and is working: the confirmation is refused before the audit and before any worktree.
+    #[tokio::test]
+    async fn a_placement_confirmed_while_its_task_is_being_delegated_is_refused() {
+        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+        // Its own person: the waiting placements of a person are capped, and the
+        // registry is shared by the tests of this module.
+        const OTHER: &str = "33333333-3333-3333-3333-333333333333";
+        let f = fixture(Some(OTHER), None).await;
+        let pending = ask(&f).await.unwrap();
+        let x = pending.execution_place.path.clone();
+        let id = pending.execution_place.placement_id;
+
+        // The same task is delegated in the meantime: a running execution whose child works.
+        let manager = f.state.chat_manager.clone().expect("a chat manager");
+        let child = Uuid::new_v4();
+        crate::chat::manager::test_support::insert_live_session_without_cli(
+            &manager,
+            &child.to_string(),
+        )
+        .await;
+        manager.active_sessions.read().await[&child.to_string()]
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        f.mock
+            .create_agent_execution(&AgentExecutionNode {
+                id: Uuid::new_v4(),
+                run_id: Uuid::nil(),
+                task_id: f.task_id,
+                session_id: Some(child),
+                started_at: Utc::now(),
+                status: AgentExecutionStatus::Running,
+                persona_profile: "delegation".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        match confirm(&f, Claims::person(OTHER, "p@example.org", "P"), id, &x).await {
+            Err(AppError::Conflict(message)) => assert!(
+                message.contains(&child.to_string()),
+                "the refusal names the session already on the task: {message}"
+            ),
+            other => panic!("a placement confirmed on a task already delegated was not refused (#1188 §1b, B1): {other:?}"),
+        }
+        assert!(
+            !std::path::Path::new(&x).exists(),
+            "no worktree is made for a refused confirmation"
+        );
+        let kinds = kinds(&f).await;
+        assert!(
+            !kinds.contains(&ExecutionPlaceEventKind::Confirmed),
+            "a refused confirmation leaves no « confirmed » trace: {kinds:?}"
+        );
     }
 
     async fn in_bypass(f: &Fixture) {

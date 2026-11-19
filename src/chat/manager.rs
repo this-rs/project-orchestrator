@@ -11293,14 +11293,19 @@ impl ChatManager {
                 .get(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
 
+            // `is_streaming` is read under the queue lock, the lock the end of a turn holds
+            // to decide nothing is left (#1188 §1a, P2): either the turn still runs and sees
+            // this entry, or it is over and the message is sent below. Never queued behind a
+            // turn that already finished, where nothing would drain it.
+            let mut queue = session.pending_messages.lock().await;
             if session.is_streaming.load(Ordering::SeqCst) {
                 info!(
                     "Stream in progress for session {}, queuing message and interrupting",
                     session_id
                 );
                 // Queue the message (real user message)
-                let mut queue = session.pending_messages.lock().await;
                 queue.push_back(PendingMessage::user(message.to_string()));
+                drop(queue);
 
                 // Interrupt the stream so the message is processed sooner
                 session.interrupt_flag.store(true, Ordering::SeqCst);
@@ -14699,7 +14704,11 @@ impl ChatManager {
             return true;
         }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
-            return !handle.active_background_tasks().await.is_empty();
+            // A message waiting in the queue is work too (#1188 §1a): the session is between
+            // two turns, not idle. Agent engine: not covered by a test (its queue is private
+            // to `agent_runtime` and only fills while a turn streams).
+            return handle.queued_len().await > 0
+                || !handle.active_background_tasks().await.is_empty();
         }
         let tasks = {
             let sessions = self.active_sessions.read().await;
@@ -14708,20 +14717,25 @@ impl ChatManager {
                     s.active_background_tasks.clone(),
                     s.cli_background_tasks.clone(),
                     s.child_pid,
+                    s.pending_messages.clone(),
                 )
             })
         };
         match tasks {
-            Some((background, cli_background, child_pid)) => {
+            Some((background, cli_background, child_pid, pending)) => {
                 let cli_count = cli_background.load(Ordering::Relaxed);
                 // A dead CLI (zombie or reaped) cannot have live background tasks; its last
                 // reported count is stale. Clear it so the session frees its child slot
                 // instead of holding it until the idle-cleanup timeout (ZOMBIE-CLI).
                 if cli_count > 0 && process_alive(child_pid) == Some(false) {
                     cli_background.store(0, Ordering::Relaxed);
-                    return !background.lock().await.is_empty();
+                    // The queue is read after the counter is cleared (#1188 §1a).
+                    return !pending.lock().await.is_empty() || !background.lock().await.is_empty();
                 }
-                !background.lock().await.is_empty() || cli_count > 0
+                // A queued message will open a turn: the session is not over (#1188 §1a).
+                !pending.lock().await.is_empty()
+                    || !background.lock().await.is_empty()
+                    || cli_count > 0
             }
             None => false,
         }
@@ -39993,6 +40007,31 @@ mod tests {
         );
         // A session nobody knows is not working.
         assert!(!manager.is_session_working("s-nowhere").await);
+    }
+
+    /// #1188 §1a: a message waiting in the queue, with no turn running and no background
+    /// task, is work to come. The queue normally fills only while a turn streams, so the
+    /// state is built directly on the real queue: this pins the contract of
+    /// `is_session_working`, not a reproduction of the race that leaves it so.
+    #[tokio::test]
+    async fn a_cli_session_with_a_queued_message_is_working() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (queued, _) = create_dummy_session(false, "", vec![]);
+        queued
+            .pending_messages
+            .lock()
+            .await
+            .push_back(PendingMessage::user("carry on".to_string()));
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-queued".into(), queued);
+        assert!(
+            manager.is_session_working("s-queued").await,
+            "a queued message with no turn open was seen as idle (#1188 §1a)"
+        );
     }
 
     /// A dead CLI (zombie process) whose `cli_background_tasks` was left > 0 must NOT
