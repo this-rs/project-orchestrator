@@ -8078,6 +8078,131 @@ mod tests {
         assert_eq!(new_after.status, DecisionStatus::Accepted);
     }
 
+    /// The real router on a free port: its base URL.
+    async fn spawn_real_router(
+        graph: std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) -> String {
+        let app = crate::test_helpers::router_with_auth(graph).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base_url
+    }
+
+    /// A task of a plan behind the REAL router (not the fake server above):
+    /// the handler, the base URL, the plan id and the task id.
+    async fn real_router_with_plan_task() -> (ToolHandler, String, uuid::Uuid, uuid::Uuid) {
+        use crate::neo4j::traits::*;
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan_id = uuid::Uuid::new_v4();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        let base_url = spawn_real_router(graph).await;
+        let token = crate::test_helpers::test_bearer_token()
+            .trim_start_matches("Bearer ")
+            .to_string();
+        let handler = ToolHandler::new(McpHttpClient::new(base_url.clone(), Some(token)));
+        (handler, base_url, plan_id, task.id)
+    }
+
+    /// `GET /api/tasks/{id}/plan`, called with a JWT.
+    async fn real_task_plan_answer(base_url: &str, task_id: uuid::Uuid) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{base_url}/api/tasks/{task_id}/plan"))
+            .header("Authorization", crate::test_helpers::test_bearer_token())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The route answers the plan of a task, from the graph.
+    #[tokio::test]
+    async fn real_route_answers_the_plan_of_a_task() {
+        let (_, base_url, plan_id, task_id) = real_router_with_plan_task().await;
+        let resp = real_task_plan_answer(&base_url, task_id).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["plan_id"], json!(plan_id.to_string()), "{body}");
+    }
+
+    /// Without `plan_id` the enrich takes the task's plan from the real route:
+    /// the enrich call goes to `/api/plans/{plan}/tasks/{task}/enrich` with the
+    /// plan of the task. Either it succeeds, or its error names that very call
+    /// (not the plan lookup, not the argument).
+    #[tokio::test]
+    async fn real_task_enrich_without_plan_id_deduces_the_plan() {
+        let (handler, _, plan_id, task_id) = real_router_with_plan_task().await;
+        let enrich_path = format!("/api/plans/{plan_id}/tasks/{task_id}/enrich");
+        let outcome = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": task_id.to_string()})),
+            )
+            .await;
+        if let Err(err) = outcome {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&enrich_path),
+                "the enrich did not go to the task's plan: {msg}"
+            );
+        }
+    }
+
+    /// Another plan than the task's own is refused by name, before any request.
+    #[tokio::test]
+    async fn real_task_enrich_with_another_plan_is_refused_as_a_mismatch() {
+        let (handler, _, plan_id, task_id) = real_router_with_plan_task().await;
+        let other = uuid::Uuid::new_v4();
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "enrich",
+                    "task_id": task_id.to_string(),
+                    "plan_id": other.to_string(),
+                })),
+            )
+            .await
+            .expect_err("another plan is a mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("plan_mismatch"), "{msg}");
+        assert!(
+            msg.contains(&plan_id.to_string()) && msg.contains(&other.to_string()),
+            "{msg}"
+        );
+    }
+
+    /// A task the graph does not know has no plan: 404 on the route, and a
+    /// readable MCP error that says so.
+    #[tokio::test]
+    async fn real_task_enrich_of_an_unknown_task_is_a_readable_error() {
+        let (handler, base_url, _, _) = real_router_with_plan_task().await;
+        let unknown = uuid::Uuid::new_v4();
+        let resp = real_task_plan_answer(&base_url, unknown).await;
+        assert_eq!(resp.status(), 404);
+        let msg = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": unknown.to_string()})),
+            )
+            .await
+            .expect_err("a task with no plan cannot be enriched")
+            .to_string();
+        assert!(msg.contains("belongs to no plan"), "{msg}");
+    }
+
+    /// The route is behind the authentication of the protected API.
+    #[tokio::test]
+    async fn real_task_plan_route_refuses_a_call_without_authentication() {
+        let (_, base_url, _, task_id) = real_router_with_plan_task().await;
+        let resp = reqwest::get(format!("{base_url}/api/tasks/{task_id}/plan"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
     /// The keys `task update` and `step update` now refuse are the published
     /// parameters of the tool that the update does not write: they used to be
     /// ignored. The list is the one in the PR description; a new published

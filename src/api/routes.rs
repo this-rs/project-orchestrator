@@ -55,16 +55,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-/// Create the API router with public + protected route groups.
-///
-/// Frontend serving behavior depends on the build:
-/// - **`embedded-frontend` feature ON**: The SPA is baked into the binary via
-///   rust-embed; `serve_frontend` and `frontend_path` are ignored.
-/// - **`embedded-frontend` feature OFF** (default): When `serve_frontend` is true,
-///   a `ServeDir` fallback serves files from `frontend_path` with SPA routing.
-///
-/// In both cases, Axum's explicit routes (/api/*, /auth/*, /ws/*, /health,
-/// /hooks/*, /internal/*) always take priority — only unmatched paths hit the fallback.
 /// `GET /api/tasks/{task_id}/plan`: the plan a task belongs to, or 404.
 ///
 /// `task(action: "enrich")` used to demand a `plan_id` the task already carries
@@ -87,6 +77,16 @@ async fn get_task_plan(
     ))
 }
 
+/// Create the API router with public + protected route groups.
+///
+/// Frontend serving behavior depends on the build:
+/// - **`embedded-frontend` feature ON**: The SPA is baked into the binary via
+///   rust-embed; `serve_frontend` and `frontend_path` are ignored.
+/// - **`embedded-frontend` feature OFF** (default): When `serve_frontend` is true,
+///   a `ServeDir` fallback serves files from `frontend_path` with SPA routing.
+///
+/// In both cases, Axum's explicit routes (/api/*, /auth/*, /ws/*, /health,
+/// /hooks/*, /internal/*) always take priority — only unmatched paths hit the fallback.
 pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
