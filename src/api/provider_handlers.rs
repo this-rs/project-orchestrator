@@ -1058,7 +1058,8 @@ async fn instance_models(state: &OrchestratorState, id: &str) -> Result<Value, A
         .collect();
     // A process instance (codex, acp) chooses its own models: only the stored
     // default is known here.
-    if st::is_process_kind(&record.kind) {
+    // (Codex is the exception: its app-server lists its own models, asked below.)
+    if st::is_process_kind(&record.kind) && record.kind != "codex" {
         return Ok(json!(stored));
     }
     // An OpenAI-compatible endpoint lists its models (`GET /models`). Ask it:
