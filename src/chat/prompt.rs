@@ -732,8 +732,8 @@ Manage tasks.
 | list | `plan_id`, `search`, `limit`, `offset` | List tasks |
 | create | `plan_id` (req), `title` (req), `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Create task |
 | get | `task_id` (req) | Get task by UUID |
-| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Update task |
-| delete | `task_id` (req) | Delete a task |
+| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Update task. A published parameter this update does not write is refused (`unsupported_fields`). A key the tool does not publish is ignored. An update that writes nothing is refused (`empty_update`). A malformed list (`acceptance_criteria`, `affected_files`) is not written and is named in `rejected_fields` of the answer |
+| delete | `task_id` (req) | Delete a task, WITH its steps and its decisions; the answer lists `deleted_decision_ids` |
 | get_next | `plan_id` (req) | Get next actionable task |
 | add_dependencies | `task_id` (req), `dependency_ids` (req, array) | Add task dependencies |
 | remove_dependency | `task_id` (req), `dependency_id` (req) | Remove one dependency |
@@ -764,7 +764,7 @@ Manage steps within tasks.
 |--------|---------------|-------------|
 | list | `task_id` (req) | List steps for task |
 | create | `task_id` (req), `description` (req), `verification` | Create a step |
-| update | `step_id` (req), `status` (pending/in_progress/completed/skipped), `description`, `verification` | Update a step |
+| update | `step_id` (req), `status` (pending/in_progress/completed/skipped), `description`, `verification` | Update a step. An unknown `step_id` is an error (404). A published parameter it does not write (`task_id`) is refused (`unsupported_fields`). An update that writes nothing is refused (`empty_update`); a key the tool does not publish is ignored |
 | get | `step_id` (req) | Get step by UUID |
 | delete | `step_id` (req) | Delete a step |
 | get_progress | `task_id` (req) | Get step completion progress |
@@ -784,7 +784,7 @@ Manage architectural decisions.
 | remove_affects | `decision_id` (req), `entity_type` (req), `entity_id` (req) | Remove affects link |
 | list_affects | `decision_id` (req) | List entities affected by decision |
 | get_affecting | `entity_type` (req), `entity_id` (req) | Get decisions affecting entity |
-| supersede | `decision_id` (req), `superseded_by_id` (req) | Mark decision as superseded |
+| supersede | `decision_id` (req: the OLD one), `superseded_by_id` (req: the NEW one) | Mark `decision_id` as superseded by `superseded_by_id` |
 | get_timeline | `task_id` (req), `from`, `to` | Get decision timeline |
 
 ## constraint

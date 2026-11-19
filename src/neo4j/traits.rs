@@ -508,6 +508,29 @@ pub trait CodeStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Paths of the files CONTAINED by one project whose path ends with `suffix`
+    /// (at most `limit`, in path order). The project filter is part of the query:
+    /// applied after a `LIMIT`, files of other projects with the same suffix could
+    /// fill the page and hide the project's own (issue #1189). Membership is the
+    /// `CONTAINS` relation, as in the other project reads: with nested roots one
+    /// file node is contained by several projects, while its `project_id`
+    /// property holds only the last one that wrote it.
+    /// Defaults to no match for stores without file storage.
+    async fn find_project_files_by_path_suffix(
+        &self,
+        _project_id: Uuid,
+        _suffix: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Does the project contain the file at this exact `path` (the `CONTAINS`
+    /// relation)? Defaults to `false` for stores without file storage.
+    async fn project_contains_file(&self, _project_id: Uuid, _path: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// List files for a project
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
 

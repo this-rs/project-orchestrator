@@ -589,6 +589,107 @@ pub struct ImpactAnalysis {
     pub confidence: Option<crate::graph::confidence::ConfidenceScore>,
 }
 
+/// Upper bound of the files listed when a relative target is ambiguous. One more
+/// is fetched, only to know whether the list is cut: the answer then says
+/// "(and others)".
+const IMPACT_TARGET_MAX_LISTED: usize = 6;
+
+/// The file of the code graph an impact analysis is about. Used by BOTH
+/// `GET /api/code/impact` and `GET /api/code/impact/multi`, with the same rule.
+///
+/// The graph stores absolute paths. A target that names no file of the graph
+/// used to go straight to the traversal, which found nothing and answered 200
+/// with empty lists and `risk_level: low` — "no impact" for a file that was
+/// never looked at (issue #1189). The target is resolved, in this order:
+///
+/// 1. `<project root>/<target>` when a project is given and the target is relative;
+/// 2. the target as written;
+/// 3. for a relative target, the one file whose path ends with `/<target>`
+///    (of the project, when one is given; several are a 400 that lists them).
+///
+/// A file found at step 1 or 2 must be a `File` node of the graph. With a
+/// project, it must also be CONTAINED by that project (the `CONTAINS` relation):
+/// the lookup by path is global, and with nested roots (`/r` and `/r/b`) the
+/// outer project's `<root>/b/src/lib.rs` is the inner project's file. Taking it
+/// would analyse another project's file with this project's scope and answer
+/// "no impact". Otherwise the answer is a 404.
+async fn resolve_impact_file(
+    neo4j: &dyn crate::neo4j::GraphStore,
+    raw: &str,
+    project: Option<(uuid::Uuid, &str)>,
+) -> Result<String, AppError> {
+    let relative = !raw.starts_with('/');
+    let project_id = project.map(|(id, _)| id);
+    let mut candidates: Vec<String> = Vec::new();
+    if let (true, Some((_, root))) = (relative, project) {
+        let expanded = crate::expand_tilde(root);
+        candidates.push(format!("{}/{}", expanded.trim_end_matches('/'), raw));
+    }
+    candidates.push(raw.to_string());
+
+    let mut outside_project = false;
+    for candidate in &candidates {
+        if neo4j.get_file(candidate).await?.is_none() {
+            continue;
+        }
+        match project_id {
+            Some(pid) if !neo4j.project_contains_file(pid, candidate).await? => {
+                outside_project = true;
+            }
+            _ => return Ok(candidate.clone()),
+        }
+    }
+
+    if relative {
+        let suffix = format!("/{}", raw.trim_start_matches("./"));
+        // With a project, the filter is in the query: a LIMIT applied first would
+        // let files of other projects with the same suffix hide the project's own
+        // (a false 404, or a false "ambiguous"). Without one, the page is the
+        // same length either way; the store orders it by path, so it is stable.
+        let mut matches: Vec<String> = match project_id {
+            Some(pid) => {
+                neo4j
+                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_MAX_LISTED + 1)
+                    .await?
+            }
+            None => neo4j
+                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_MAX_LISTED + 1)
+                .await?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect(),
+        };
+        matches.sort();
+        matches.dedup();
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.remove(0)),
+            _ => {
+                let cut = matches.len() > IMPACT_TARGET_MAX_LISTED;
+                matches.truncate(IMPACT_TARGET_MAX_LISTED);
+                return Err(AppError::BadRequest(format!(
+                    "ambiguous target '{raw}': it names several files of the graph ({}{}). \
+                     Pass an absolute path, or project_slug with a path relative to the project root.",
+                    matches.join(", "),
+                    if cut { " (and others)" } else { "" }
+                )));
+            }
+        }
+    }
+
+    if outside_project {
+        return Err(AppError::NotFound(format!(
+            "file not found in graph for this project: '{raw}' is a file of the graph, but not of \
+             this project (it lies under another project's root, or belongs to another project)."
+        )));
+    }
+    Err(AppError::NotFound(format!(
+        "file not found in graph: '{raw}' (looked up as {}). Pass an absolute path, or \
+         project_slug with a path relative to the project root; sync the project if the file is new.",
+        candidates.join(", ")
+    )))
+}
+
 /// Analyze impact of changing a file or function
 pub async fn analyze_impact(
     State(state): State<OrchestratorState>,
@@ -631,14 +732,14 @@ pub async fn analyze_impact(
         None
     };
 
-    // Resolve relative file paths to absolute using project root_path
-    let target = if target_type == "file" && !query.target.starts_with('/') {
-        if let Some(ref root) = project_root {
-            let expanded = crate::expand_tilde(root);
-            format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
-        } else {
-            query.target.clone()
-        }
+    // A file target is resolved to a file of the graph, or refused by name.
+    let target = if target_type == "file" {
+        resolve_impact_file(
+            state.orchestrator.neo4j(),
+            &query.target,
+            project_id.zip(project_root.as_deref()),
+        )
+        .await?
     } else {
         query.target.clone()
     };
@@ -966,13 +1067,10 @@ pub async fn analyze_impact_v2(
     let project_id = project.id;
     let project_id_str = project_id.to_string();
 
-    // Resolve target path (relative → absolute)
-    let target = if !query.target.starts_with('/') {
-        let expanded = crate::expand_tilde(&project.root_path);
-        format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
-    } else {
-        query.target.clone()
-    };
+    // Resolve the target to a file of this project (the rule of `analyze_impact`):
+    // relative → absolute, a file the project does not contain is a 404.
+    let target =
+        resolve_impact_file(neo4j, &query.target, Some((project_id, &project.root_path))).await?;
 
     // Resolve analysis profile (built-in first, then Neo4j)
     let profile = if let Some(ref profile_ref) = query.profile {
@@ -6272,27 +6370,453 @@ mod tests {
     // GET /api/code/impact — analyze_impact additional coverage
     // ====================================================================
 
+    /// A graph that holds `<root>/src/lib.rs` imported by `<root>/src/handler.rs`
+    /// for each given root — the absolute paths a synced project has.
+    async fn impact_app_with_roots(roots: &[&str]) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        for root in roots {
+            for name in ["src/lib.rs", "src/handler.rs"] {
+                graph
+                    .upsert_file(&FileNode {
+                        path: format!("{root}/{name}"),
+                        language: "rust".to_string(),
+                        hash: "h".to_string(),
+                        last_parsed: chrono::Utc::now(),
+                        project_id: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            graph
+                .create_import_relationship(
+                    &format!("{root}/src/handler.rs"),
+                    &format!("{root}/src/lib.rs"),
+                    "lib",
+                )
+                .await
+                .unwrap();
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    async fn json_of(resp: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Issue #1189: a target that names no file of the graph answered 200 with
+    /// empty lists and `risk_level: low` — which reads "no impact".
     #[tokio::test]
     async fn test_analyze_impact_file_not_in_graph() {
-        // analyze_impact for a file with no relationships → empty lists, low risk
         let app = test_app().await;
         let resp = app
             .oneshot(auth_get("/api/code/impact?target=src/unknown.rs"))
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("file not found in graph"), "{error}");
+        assert!(error.contains("src/unknown.rs"), "{error}");
+    }
+
+    /// A relative target without `project_slug` is resolved to the one file of
+    /// the graph it names, and the answer says which absolute path was analysed.
+    #[tokio::test]
+    async fn a_relative_impact_target_is_resolved_to_the_file_it_names() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["target"], "src/unknown.rs");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/app/src/lib.rs");
+        assert_eq!(
+            json["directly_affected"],
+            serde_json::json!(["/repo/app/src/handler.rs"])
+        );
+        assert_eq!(json["caller_count"], 1);
+    }
+
+    /// Without `project_slug`, a relative target is looked up in EVERY project: a
+    /// single file of another project is accepted, and the answer names its
+    /// absolute path. This is the declared effect of the contract PR (section 5).
+    #[tokio::test]
+    async fn a_relative_target_without_a_slug_resolves_to_another_projects_unique_file() {
+        let app = impact_app_with_a_project_among_others(&[], 1).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/a0/src/lib.rs");
+    }
+
+    /// Two projects own a `src/lib.rs`, and no slug says which one is meant: the
+    /// answer is a 400 that lists both paths, not a pick.
+    #[tokio::test]
+    async fn two_projects_with_the_same_suffix_without_a_slug_is_ambiguous_and_lists_both() {
+        let app = impact_app_with_a_project_among_others(&[], 2).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/a0/src/lib.rs") && error.contains("/repo/a1/src/lib.rs"),
+            "{error}"
+        );
+    }
+
+    /// A project and files named `src/lib.rs` in `others` other projects. The
+    /// project's own files sort AFTER the others'.
+    async fn impact_app_with_a_project_among_others(
+        own_files: &[&str],
+        others: usize,
+    ) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::test_helpers::mock_app_state_with;
+
+        let project = |slug: &str| ProjectNode {
+            id: uuid::Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            root_path: format!("/nowhere/{slug}"),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        };
+        let file = |path: String, project_id: uuid::Uuid| FileNode {
+            path,
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project_id),
+        };
+        let graph = MockGraphStore::new();
+        let wanted = project("wanted");
+        graph.create_project(&wanted).await.unwrap();
+        for i in 0..others {
+            let other = project(&format!("other{i}"));
+            graph.create_project(&other).await.unwrap();
+            graph
+                .upsert_file(&file(format!("/repo/a{i}/src/lib.rs"), other.id))
+                .await
+                .unwrap();
+        }
+        for path in own_files {
+            graph
+                .upsert_file(&file((*path).to_string(), wanted.id))
+                .await
+                .unwrap();
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    /// The project filter comes before the page limit: seven other projects own
+    /// a `src/lib.rs` that sorts first, and the wanted project's is still found
+    /// (it used to be a false 404).
+    #[tokio::test]
+    async fn a_relative_impact_target_is_found_among_other_projects_files_of_the_same_suffix() {
+        let app = impact_app_with_a_project_among_others(&["/repo/zz/src/lib.rs"], 7).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=wanted",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/zz/src/lib.rs");
+    }
+
+    /// An ambiguity inside the project lists the project's files only, not those
+    /// of the other projects that fill the first page (it used to be a false 404).
+    #[tokio::test]
+    async fn an_ambiguity_inside_a_project_lists_only_its_own_files() {
+        let app = impact_app_with_a_project_among_others(
+            &["/repo/zy/src/lib.rs", "/repo/zz/src/lib.rs"],
+            7,
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=wanted",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/zy/src/lib.rs") && error.contains("/repo/zz/src/lib.rs"),
+            "{error}"
+        );
+        assert!(!error.contains("/repo/a0/"), "{error}");
+    }
+
+    /// Two projects with nested roots: `outer` at `/r`, `inner` at `/r/b`. The file
+    /// `/r/b/src/lib.rs` is the inner project's; with `shared` the outer project
+    /// contains it too (one node, two `CONTAINS`, as the sync of nested roots
+    /// leaves it).
+    async fn impact_app_with_nested_projects(shared: bool) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::test_helpers::mock_app_state_with;
+
+        let project = |slug: &str, root: &str| ProjectNode {
+            id: uuid::Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            root_path: root.to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        };
+        let graph = MockGraphStore::new();
+        let (outer, inner) = (project("outer", "/r"), project("inner", "/r/b"));
+        graph.create_project(&outer).await.unwrap();
+        graph.create_project(&inner).await.unwrap();
+        graph
+            .upsert_file(&FileNode {
+                path: "/r/b/src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(inner.id),
+            })
+            .await
+            .unwrap();
+        if shared {
+            graph
+                .file_contains
+                .write()
+                .await
+                .entry(outer.id)
+                .or_default()
+                .push("/r/b/src/lib.rs".to_string());
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    /// `get_file` is global: with nested roots the outer project's
+    /// `<root>/b/src/lib.rs` is a file of the INNER project. It is not the outer
+    /// project's, so the outer project answers 404 instead of analysing another
+    /// project's file with its own scope (a false "no impact").
+    #[tokio::test]
+    async fn a_nested_projects_file_is_not_found_for_the_outer_project() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("file not found in graph"),
+            "{json}"
+        );
+    }
+
+    /// The inner project still resolves its own file, and the absolute path
+    /// written as is under the outer project's scope is refused the same way.
+    #[tokio::test]
+    async fn a_nested_projects_file_is_found_by_its_own_project_only() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=inner",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs");
+
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=/r/b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A node that both nested projects contain is found by either.
+    #[tokio::test]
+    async fn a_file_contained_by_both_nested_projects_is_found_by_either() {
+        let app = impact_app_with_nested_projects(true).await;
+        for slug in ["outer", "inner"] {
+            let target = if slug == "outer" {
+                "b/src/lib.rs"
+            } else {
+                "src/lib.rs"
+            };
+            let resp = app
+                .clone()
+                .oneshot(auth_get(&format!(
+                    "/api/code/impact?target={target}&project_slug={slug}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{slug}");
+            assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs", "{slug}");
+        }
+    }
+
+    /// More candidates than the list holds: the answer says the list is cut.
+    #[tokio::test]
+    async fn an_ambiguity_list_cut_at_six_says_there_are_others() {
+        let app = impact_app_with_a_project_among_others(&[], 7).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("(and others)"), "{error}");
+        assert!(error.contains("/repo/a5/src/lib.rs"), "{error}");
+        assert!(!error.contains("/repo/a6/src/lib.rs"), "{error}");
+    }
+
+    /// Exactly six candidates are all listed: nothing is hidden, nothing is said.
+    #[tokio::test]
+    async fn an_ambiguity_list_of_exactly_six_is_complete() {
+        let app = impact_app_with_a_project_among_others(&[], 6).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(!error.contains("(and others)"), "{error}");
+        assert!(error.contains("/repo/a5/src/lib.rs"), "{error}");
+    }
+
+    /// A suffix is matched on a path boundary: `lib.rs` is not `mylib.rs`.
+    #[tokio::test]
+    async fn a_relative_impact_target_matches_whole_path_segments() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=rc/lib.rs"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A relative target that names a file in two places is refused with the
+    /// candidates, not answered for one of them.
+    #[tokio::test]
+    async fn an_ambiguous_relative_impact_target_is_refused_with_its_candidates() {
+        let app = impact_app_with_roots(&["/repo/app", "/repo/other"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/app/src/lib.rs") && error.contains("/repo/other/src/lib.rs"),
+            "{error}"
+        );
+    }
+
+    /// The multi-signal endpoint follows the same rule as `analyze_impact`: a file
+    /// of the other nested project is a 404 for this project, not an analysis with
+    /// this project's scope (which answered "no impact" through this endpoint).
+    #[tokio::test]
+    async fn a_nested_projects_file_is_not_found_on_the_multi_endpoint() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact/multi?target=b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        let message = json["error"].as_str().unwrap();
+        assert!(message.contains("not of this project"), "{message}");
+    }
+
+    /// The same endpoint answers a file of its own project, with the absolute path.
+    #[tokio::test]
+    async fn the_multi_endpoint_finds_a_file_by_its_own_project() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact/multi?target=src/lib.rs&project_slug=inner",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs");
+    }
+
+    /// A file of the graph that nothing depends on is still a 200 with empty
+    /// lists: "no impact" is a legitimate answer when the file is known.
+    #[tokio::test]
+    async fn a_known_file_without_dependents_still_answers_no_impact() {
+        let app = impact_app_with_roots(&["/repo/app"]).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=/repo/app/src/handler.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/app/src/handler.rs");
         assert!(json["directly_affected"].as_array().unwrap().is_empty());
-        assert!(json["transitively_affected"].as_array().unwrap().is_empty());
-        assert!(json["test_files_affected"].as_array().unwrap().is_empty());
-        assert_eq!(json["caller_count"], 0);
-        assert_eq!(json["risk_level"], "low");
     }
 
     #[tokio::test]
