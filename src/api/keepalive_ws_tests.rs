@@ -96,6 +96,26 @@ async fn frame_where(
     }
 }
 
+/// Waits for one beat of the socket. A `Ping` frame proves the keepalive arm
+/// actually ran, so an ABSENCE of `streaming_status` measured afterwards is a
+/// fact about the guard — not about a timer that never fired. Without this, the
+/// idle test would pass on a handler that emits nothing at all.
+async fn wait_for_ping(ws: &mut Client, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(left, ws.next()).await {
+            Err(_) => return false,
+            Ok(None) | Ok(Some(Err(_))) => return false,
+            Ok(Some(Ok(WsMessage::Ping(_)))) => return true,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
 fn streaming_status(v: &Value) -> bool {
     v["type"] == "streaming_status"
 }
@@ -131,7 +151,14 @@ async fn an_idle_session_says_nothing() {
     let rig = rig(false).await;
     let mut ws = connect(&rig).await;
 
-    // Four beats of the same interval the keepalive rides on.
+    // Prove the beat runs before concluding from its silence: one Ping is the
+    // same arm of the same `select!` that would carry the frame.
+    assert!(
+        wait_for_ping(&mut ws, WAIT).await,
+        "no keepalive beat ever reached this client: the absence below would prove nothing"
+    );
+
+    // Then four more beats of the same interval, with nothing to announce.
     let seen = frame_where(&mut ws, Duration::from_millis(1200), streaming_status).await;
     assert!(
         seen.is_none(),
