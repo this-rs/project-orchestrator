@@ -550,7 +550,7 @@ mod tests {
     fn migrating_config(target: &str, dir: &std::path::Path) -> Config {
         let file = dir.join("config.yaml");
         std::fs::write(&file, "setup_completed: true\n").unwrap();
-        let mut c = Config::from_yaml_and_env(Some(&file)).unwrap();
+        let mut c = crate::config_for_test(&file);
         c.storage_backend = target.to_string();
         c.storage_obrain_path = Some(dir.join("target").display().to_string());
         c.storage_migration = crate::StorageMigrationConfig {

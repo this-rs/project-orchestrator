@@ -13666,7 +13666,7 @@ fn test_persist_permission_roundtrip_with_config_load() {
     std::env::remove_var("CHAT_ALLOWED_TOOLS");
     std::env::remove_var("CHAT_DISALLOWED_TOOLS");
 
-    let config = crate::Config::from_yaml_and_env(Some(&yaml_path)).unwrap();
+    let config = crate::config_for_test(&yaml_path);
     let loaded_perm = config
         .chat_permissions
         .expect("chat_permissions should be Some");

@@ -3335,7 +3335,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.yaml");
         std::fs::write(&file, "setup_completed: true\n").unwrap();
-        let mut config = crate::Config::from_yaml_and_env(Some(&file)).unwrap();
+        let mut config = crate::config_for_test(&file);
         config.storage_backend = crate::storage::OBRAIN_BACKEND.into();
         config.storage_obrain_path = Some(dir.path().join("target").display().to_string());
         config.storage_migration = crate::StorageMigrationConfig {

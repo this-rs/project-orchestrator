@@ -3070,6 +3070,18 @@ mod anonymous_warning_tests {
     }
 }
 
+/// A configuration read the way the boot reads it, under the lock of the
+/// tests that set configuration env vars (`config_tests::ENV_LOCK`): without
+/// it, a parallel test setting `STORAGE_MIGRATION_ROLLBACK=ture` fails this
+/// read at random.
+#[cfg(test)]
+pub(crate) fn config_for_test(file: &std::path::Path) -> Config {
+    let _env = config_tests::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Config::from_yaml_and_env(Some(file)).unwrap()
+}
+
 #[cfg(test)]
 mod config_tests {
     use super::*;
@@ -3085,7 +3097,7 @@ mod config_tests {
     /// `test_explicit_config_path_bypasses_auto_detect` reads it back fails the
     /// latter with `left: 7777, right: 1111`. Poison-tolerant on purpose: a
     /// panicking test must not turn every later one into a spurious failure.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_yaml_config_loading() {
@@ -3996,8 +4008,7 @@ chat:
         let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = holder.local_addr().unwrap().port();
 
-        let mut config =
-            Config::from_yaml_and_env(Some(Path::new("/nonexistent/po-bind-first.yaml"))).unwrap();
+        let mut config = crate::config_for_test(Path::new("/nonexistent/po-bind-first.yaml"));
         // Set explicitly rather than through YAML/env: other tests in this
         // module mutate the environment concurrently.
         config.setup_completed = true;
@@ -4023,6 +4034,7 @@ chat:
     /// silently replaced by defaults (which would look like a first run).
     #[test]
     fn from_yaml_and_env_errors_on_malformed_yaml() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("config.yaml");
         std::fs::write(&file_path, "setup_completed: [oops\n").unwrap();
