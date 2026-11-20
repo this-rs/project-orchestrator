@@ -2,7 +2,7 @@
 //! backend does. Persistence across a close and a reopen, an update cut at every
 //! engine write and reopened (the update marker), a duplicated `WORKS_ON` edge, the
 //! quarantine of an unreadable node (its key reserved), the refusal of an absent
-//! target, and the 119 refusals named. The behaviour shared with Neo4j and the mock
+//! target, and the refusals named. The behaviour shared with Neo4j and the mock
 //! is in `tests/store_conformance.rs` (`analytics_checks!`).
 #![cfg(feature = "obrain-backend")]
 
@@ -712,7 +712,10 @@ async fn the_other_sub_lots_refuse_by_name() {
             assert!(refusees_analytics().contains(&$name));
         }};
     }
-    refuse!(store.get_synapses(id), "AnalyticsStore::get_synapses");
+    refuse!(
+        store.consolidate_memory(),
+        "AnalyticsStore::consolidate_memory"
+    );
     refuse!(
         store.get_project_import_edges(id),
         "AnalyticsStore::get_project_import_edges"
@@ -722,16 +725,8 @@ async fn the_other_sub_lots_refuse_by_name() {
         "AnalyticsStore::compute_churn_scores"
     );
     refuse!(
-        store.get_deep_maintenance_times(),
-        "AnalyticsStore::get_deep_maintenance_times"
-    );
-    refuse!(
-        store.mark_deep_maintenance(id),
-        "AnalyticsStore::mark_deep_maintenance"
-    );
-    refuse!(
-        store.weaken_node_synapses(id, 0.1, 0.0),
-        "AnalyticsStore::weaken_node_synapses"
+        store.decay_synapses(&Default::default()),
+        "AnalyticsStore::decay_synapses"
     );
     refuse!(
         store.decay_project_synapses(id, &Default::default()),
@@ -750,7 +745,7 @@ async fn the_other_sub_lots_refuse_by_name() {
         store.causal_walk("Note", "x", 2),
         "AnalyticsStore::causal_walk"
     );
-    assert_eq!(refusees_analytics().len(), 119);
+    assert_eq!(refusees_analytics().len(), 96);
     assert!(refusees_analytics()
         .iter()
         .all(|m| m.starts_with("AnalyticsStore::")));
@@ -761,8 +756,9 @@ async fn the_other_sub_lots_refuse_by_name() {
         .filter(|m| m.starts_with("AnalyticsStore::"))
         .count();
     assert_eq!(
-        n, 26,
-        "25 methods serve and `run_data_migrations` answers its no-migration"
+        n, 49,
+        "25 (A1) + 23 (A2, `tests/obrain_neural.rs`) serve and `run_data_migrations` answers its \
+         no-migration"
     );
     // The one that cannot refuse says what it is.
     assert!(store.run_data_migrations().await.is_empty());

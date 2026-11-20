@@ -1,7 +1,8 @@
-//! `AnalyticsStore` on obrain, sub-lot A1 ("profiles, rules, routing, settings"):
-//! 25 of the 145 methods serve, `run_data_migrations` answers its documented "no
-//! migration", and the 119 others are refused by name in this very `impl`
-//! ([`REFUSEES`]). Nothing here answers an empty or default value in place of a
+//! `AnalyticsStore` on obrain, sub-lot A1 ("profiles, rules, routing, settings") and,
+//! delegated to `synapse.rs`, sub-lot A2 ("the neural layer of the notes": synapses,
+//! energy, scars, the deep-maintenance clock): 48 of the 145 methods serve,
+//! `run_data_migrations` answers its documented "no migration", and the 96 others are
+//! refused by name in this very `impl` ([`REFUSEES`]). Nothing here answers an empty or default value in place of a
 //! refusal. The classification of the 145 methods into sub-lots is in
 //! `CONSOLIDATION.md` ("Portage d'`AnalyticsStore` : sous-lots").
 //!
@@ -1140,16 +1141,7 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::set_function_embedding",
     "AnalyticsStore::vector_search_files",
     "AnalyticsStore::vector_search_functions",
-    "AnalyticsStore::create_synapses",
-    "AnalyticsStore::get_synapses",
-    "AnalyticsStore::delete_synapses",
-    "AnalyticsStore::get_project_note_entity_links",
-    "AnalyticsStore::get_project_note_synapses",
     "AnalyticsStore::get_project_decisions_for_graph",
-    "AnalyticsStore::update_energy_scores",
-    "AnalyticsStore::boost_energy",
-    "AnalyticsStore::track_reactivation",
-    "AnalyticsStore::reinforce_synapses",
     "AnalyticsStore::decay_synapses",
     "AnalyticsStore::shadow_synapse_edges",
     "AnalyticsStore::reward_shadow_synapses",
@@ -1159,19 +1151,11 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::get_synapse_shadow_trace",
     "AnalyticsStore::claim_shadow_trace_reward",
     "AnalyticsStore::shadow_trace_closures",
-    "AnalyticsStore::apply_scars",
-    "AnalyticsStore::heal_scars",
     "AnalyticsStore::consolidate_memory",
     "AnalyticsStore::auto_observed_report",
     "AnalyticsStore::archive_unconfirmed_auto_observed",
     "AnalyticsStore::compute_homeostasis",
     "AnalyticsStore::compute_structural_drift",
-    "AnalyticsStore::init_note_energy",
-    "AnalyticsStore::list_notes_needing_synapses",
-    "AnalyticsStore::create_cross_entity_synapses",
-    "AnalyticsStore::get_cross_entity_synapses",
-    "AnalyticsStore::list_decisions_needing_synapses",
-    "AnalyticsStore::get_all_synapse_weights",
     "AnalyticsStore::get_pm_graph_data",
     "AnalyticsStore::get_chat_graph_data",
     "AnalyticsStore::get_project_import_edges",
@@ -1207,15 +1191,10 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::rescope_protocol",
     "AnalyticsStore::ensure_project_canonical_paths",
     "AnalyticsStore::decay_project_synapses",
-    "AnalyticsStore::weaken_node_synapses",
-    "AnalyticsStore::get_deep_maintenance_times",
-    "AnalyticsStore::mark_deep_maintenance",
-    "AnalyticsStore::get_synapse_graph",
     "AnalyticsStore::auto_scope_to_feature_graphs",
     "AnalyticsStore::compute_adaptive_thresholds",
     "AnalyticsStore::auto_grow_file_knows",
     "AnalyticsStore::propagate_knows_via_co_change",
-    "AnalyticsStore::rate_limited_energy_boost",
     "AnalyticsStore::get_learning_health",
     "AnalyticsStore::find_bridge_subgraph",
     "AnalyticsStore::get_knowledge_density",
@@ -1243,7 +1222,6 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::link_agent_lived",
     "AnalyticsStore::link_agent_knows",
     "AnalyticsStore::link_agent_uses",
-    "AnalyticsStore::coactivate_session",
     "AnalyticsStore::release_agent_knows",
     "AnalyticsStore::entity_exists",
     "AnalyticsStore::entities_linked",
@@ -1635,7 +1613,8 @@ impl AnalyticsStore for ObrainGraphStore {
         boost: f64,
         max_per_cycle: f64,
     ) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::rate_limited_energy_boost").into())
+        self.persona_energie_limitee(persona_id, boost, max_per_cycle)
+            .await
     }
     async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
         Err(crate::obrain::NonPorte("AnalyticsStore::ensure_agent").into())
@@ -1745,46 +1724,46 @@ impl AnalyticsStore for ObrainGraphStore {
     async fn get_deep_maintenance_times(
         &self,
     ) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_deep_maintenance_times").into())
+        self.maintenance_profonde_lire().await
     }
-    async fn mark_deep_maintenance(&self, _project_id: Uuid) -> Result<()> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::mark_deep_maintenance").into())
+    async fn mark_deep_maintenance(&self, project_id: Uuid) -> Result<()> {
+        self.maintenance_profonde_marquer(project_id).await
     }
 
     // ---- sub-lot A2 ----
     async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::create_synapses").into())
+        self.synapses_creer(note_id, neighbors).await
     }
     async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_synapses").into())
+        self.synapses_lire(note_id).await
     }
     async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::delete_synapses").into())
+        self.synapses_supprimer(note_id).await
     }
     async fn get_project_note_entity_links(
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(String, String, String)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_project_note_entity_links").into())
+        self.liens_de_notes_du_projet(project_id).await
     }
     async fn get_project_note_synapses(
         &self,
         project_id: Uuid,
         min_weight: f64,
     ) -> Result<Vec<(String, String, f64)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_project_note_synapses").into())
+        self.synapses_du_projet(project_id, min_weight).await
     }
     async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::update_energy_scores").into())
+        self.energie_mettre_a_jour(half_life_days).await
     }
     async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::boost_energy").into())
+        self.energie_renforcer(note_id, amount).await
     }
     async fn track_reactivation(&self, note_ids: &[Uuid]) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::track_reactivation").into())
+        self.reactivations_suivre(note_ids).await
     }
     async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::reinforce_synapses").into())
+        self.synapses_renforcer(note_ids, boost).await
     }
     async fn decay_synapses(
         &self,
@@ -1793,16 +1772,16 @@ impl AnalyticsStore for ObrainGraphStore {
         Err(crate::obrain::NonPorte("AnalyticsStore::decay_synapses").into())
     }
     async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::apply_scars").into())
+        self.cicatrices_appliquer(node_ids, increment).await
     }
     async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::heal_scars").into())
+        self.cicatrices_guerir(node_id).await
     }
     async fn consolidate_memory(&self) -> Result<(usize, usize)> {
         Err(crate::obrain::NonPorte("AnalyticsStore::consolidate_memory").into())
     }
     async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::init_note_energy").into())
+        self.energie_initialiser(project_id).await
     }
     async fn list_notes_needing_synapses(
         &self,
@@ -1810,27 +1789,27 @@ impl AnalyticsStore for ObrainGraphStore {
         offset: usize,
         project_id: Option<Uuid>,
     ) -> Result<(Vec<crate::notes::Note>, usize)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::list_notes_needing_synapses").into())
+        self.notes_sans_synapse(limit, offset, project_id).await
     }
     async fn create_cross_entity_synapses(
         &self,
         source_id: Uuid,
         neighbors: &[(Uuid, f64)],
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::create_cross_entity_synapses").into())
+        self.synapses_creer_entre(source_id, neighbors, true).await
     }
     async fn get_cross_entity_synapses(&self, node_id: Uuid) -> Result<Vec<(Uuid, f64, String)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_cross_entity_synapses").into())
+        self.synapses_croisees(node_id).await
     }
     async fn list_decisions_needing_synapses(
         &self,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<DecisionNode>, usize)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::list_decisions_needing_synapses").into())
+        self.decisions_sans_synapse(limit, offset).await
     }
     async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_all_synapse_weights").into())
+        self.synapses_poids(project_id).await
     }
     async fn get_project_synapse_edges(
         &self,
@@ -1847,18 +1826,19 @@ impl AnalyticsStore for ObrainGraphStore {
     }
     async fn weaken_node_synapses(
         &self,
-        _node_id: Uuid,
-        _amount: f64,
-        _prune_threshold: f64,
+        node_id: Uuid,
+        amount: f64,
+        prune_threshold: f64,
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::weaken_node_synapses").into())
+        self.synapses_affaiblir(node_id, amount, prune_threshold)
+            .await
     }
     async fn get_synapse_graph(
         &self,
         project_id: Uuid,
         min_weight: f64,
     ) -> Result<Vec<(String, String, f64)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_synapse_graph").into())
+        self.synapses_graphe(project_id, min_weight).await
     }
     async fn coactivate_session(
         &self,
@@ -1867,7 +1847,15 @@ impl AnalyticsStore for ObrainGraphStore {
         session: Uuid,
         provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::coactivate_session").into())
+        self.synapses_coactiver(
+            project,
+            notes,
+            session,
+            provenance.rule.clone(),
+            provenance.measure.clone(),
+            provenance.at.clone(),
+        )
+        .await
     }
 
     // ---- sub-lot A3 ----
@@ -2251,7 +2239,7 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
-        assert_eq!(REFUSEES.len(), 119);
+        assert_eq!(REFUSEES.len(), 96);
     }
 
     /// The reserved keys of `trigger::cle_reservee` never collide on a value that

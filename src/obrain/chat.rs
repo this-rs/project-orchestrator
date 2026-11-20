@@ -654,6 +654,25 @@ pub(super) struct IndexChat {
 }
 
 impl IndexChat {
+    /// Sessions on disk that could not be read at open (quarantined).
+    pub(super) fn sessions_en_quarantaine(&self) -> usize {
+        self.reserves.len()
+    }
+
+    /// The latest `updated_at` of the sessions bound to each project slug.
+    pub(super) fn derniere_activite_par_projet(&self) -> HashMap<String, DateTime<Utc>> {
+        let mut m: HashMap<String, DateTime<Utc>> = HashMap::new();
+        for e in self.sessions.values() {
+            if let Some(slug) = e.session.project_slug.as_deref() {
+                let at = e.session.updated_at;
+                m.entry(slug.to_string())
+                    .and_modify(|d| *d = (*d).max(at))
+                    .or_insert(at);
+            }
+        }
+        m
+    }
+
     /// The `(scope, value)` of every setting of this key, in scope order.
     pub(super) fn reglages_de_cle(&self, cle: &str) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = self

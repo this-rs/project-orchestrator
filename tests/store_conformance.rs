@@ -6245,6 +6245,218 @@ pub mod conformance {
         assert!(store.health_check().await.unwrap());
         task_cleanup(store, &p, &plan).await;
     }
+
+    // ------------------------------------------------------------------
+    // Analytics, sub-lot A2: the synapses of the notes, their energy, their
+    // scars. What the three stores agree on (what is specific to obrain, and
+    // what the mock cannot be the reference for, is in `tests/obrain_neural.rs`).
+    // ------------------------------------------------------------------
+
+    fn close_to(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    async fn a_note_of(store: &dyn GraphStore, p: Uuid, energy: f64) -> Note {
+        let mut n = a_note(Some(p), "neural");
+        n.energy = energy;
+        store.create_note(&n).await.unwrap();
+        n
+    }
+
+    /// The `SYNAPSE` layer between notes: both directions on creation, the update of an
+    /// existing weight (no second edge), the read order (heaviest first), the Hebbian
+    /// reinforcement (only notes of one project, `0.5` for a new pair, capped at 1.0), the
+    /// weights and pairs of a project, the weakening of one node, and the deletion.
+    pub async fn check_neural_synapses(store: &dyn GraphStore) {
+        let p = a_project("neural-syn");
+        store.create_project(&p).await.unwrap();
+        let (a, b, c) = (
+            a_note_of(store, p.id, 1.0).await.id,
+            a_note_of(store, p.id, 1.0).await.id,
+            a_note_of(store, p.id, 1.0).await.id,
+        );
+        assert_eq!(store.create_synapses(a, &[]).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .create_synapses(a, &[(b, 0.8), (c, 0.6)])
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store.get_synapses(a).await.unwrap(),
+            vec![(b, 0.8), (c, 0.6)]
+        );
+        assert_eq!(store.get_synapses(b).await.unwrap(), vec![(a, 0.8)]);
+        // The same pair again rewrites the weight in both directions.
+        assert_eq!(store.create_synapses(a, &[(b, 0.3)]).await.unwrap(), 2);
+        assert_eq!(
+            store.get_synapses(a).await.unwrap(),
+            vec![(c, 0.6), (b, 0.3)]
+        );
+        assert_eq!(store.get_synapses(b).await.unwrap(), vec![(a, 0.3)]);
+        assert!(store.get_synapses(Uuid::new_v4()).await.unwrap().is_empty());
+        assert_eq!(store.delete_synapses(Uuid::new_v4()).await.unwrap(), 0);
+
+        let mut w = store.get_all_synapse_weights(Some(p.id)).await.unwrap();
+        w.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(w, vec![0.3, 0.3, 0.6, 0.6]);
+        // One row per pair, whichever id is first.
+        let paires = |v: Vec<(String, String, f64)>| {
+            let mut v: Vec<(String, String, String)> = v
+                .into_iter()
+                .map(|(x, y, w)| {
+                    let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+                    (lo, hi, format!("{w:.3}"))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let mut attendu = vec![
+            {
+                let (x, y) = (a.to_string(), b.to_string());
+                if x < y {
+                    (x, y, "0.300".to_string())
+                } else {
+                    (y, x, "0.300".to_string())
+                }
+            },
+            {
+                let (x, y) = (a.to_string(), c.to_string());
+                if x < y {
+                    (x, y, "0.600".to_string())
+                } else {
+                    (y, x, "0.600".to_string())
+                }
+            },
+        ];
+        attendu.sort();
+        assert_eq!(
+            paires(store.get_project_note_synapses(p.id, 0.0).await.unwrap()),
+            attendu
+        );
+        assert_eq!(
+            store
+                .get_project_note_synapses(p.id, 0.5)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the minimum filters"
+        );
+
+        // Reinforcement: 0.3 + 0.1, 0.6 + 0.1, and the new pair (b, c) starts at 0.5.
+        assert!(store.reinforce_synapses(&[a], 0.1).await.is_err());
+        assert_eq!(store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap(), 6);
+        let sb = store.get_synapses(b).await.unwrap();
+        assert!(sb.iter().any(|s| s.0 == a && close_to(s.1, 0.4)), "{sb:?}");
+        assert!(sb.iter().any(|s| s.0 == c && close_to(s.1, 0.5)), "{sb:?}");
+        let sa = store.get_synapses(a).await.unwrap();
+        assert!(sa.iter().any(|s| s.0 == c && close_to(s.1, 0.7)), "{sa:?}");
+        // A note of no project is not reinforced with anything.
+        let libre = a_note(None, "no project");
+        store.create_note(&libre).await.unwrap();
+        assert_eq!(
+            store.reinforce_synapses(&[a, libre.id], 0.1).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .reinforce_synapses(&[a, b, Uuid::new_v4()], 0.1)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Weakening `b`: 0.5 - 0.1 and 0.5 - 0.1 are under 0.45 and go; a-b became 0.5 too.
+        let avant = store.get_synapses(b).await.unwrap().len();
+        assert_eq!(avant, 2);
+        let n = store.weaken_node_synapses(b, 0.1, 0.45).await.unwrap();
+        assert_eq!(n, 4, "two neighbours, both directions");
+        assert!(store.get_synapses(b).await.unwrap().is_empty());
+        // `a` keeps its edge to `c`.
+        assert_eq!(store.get_synapses(a).await.unwrap().len(), 1);
+        assert_eq!(store.delete_synapses(a).await.unwrap(), 2);
+        assert!(store.get_synapses(c).await.unwrap().is_empty());
+        for id in [a, b, c, libre.id] {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// The energy and the scars of a note: a boost adds to the stored energy (capped at 1.0),
+    /// the reactivation counter counts the notes it found, a scar is added and capped and
+    /// healed, and healing an unknown node answers `false`.
+    pub async fn check_neural_energy_and_scars(store: &dyn GraphStore) {
+        let p = a_project("neural-energy");
+        store.create_project(&p).await.unwrap();
+        let n = a_note_of(store, p.id, 0.4).await;
+        let m = a_note_of(store, p.id, 1.0).await;
+        store.boost_energy(n.id, 0.3).await.unwrap();
+        let e = store.get_note(n.id).await.unwrap().unwrap().energy;
+        assert!(close_to(e, 0.7), "{e}");
+        store.boost_energy(n.id, 0.9).await.unwrap();
+        assert!(close_to(
+            store.get_note(n.id).await.unwrap().unwrap().energy,
+            1.0
+        ));
+        store.boost_energy(Uuid::new_v4(), 0.5).await.unwrap();
+
+        assert_eq!(store.track_reactivation(&[]).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .track_reactivation(&[n.id, m.id, Uuid::new_v4()])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.track_reactivation(&[n.id]).await.unwrap(), 1);
+        let lue = store.get_note(n.id).await.unwrap().unwrap();
+        assert_eq!(lue.reactivation_count, 2);
+        assert!(lue.last_reactivated.is_some());
+        assert_eq!(
+            store
+                .get_note(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reactivation_count,
+            1
+        );
+
+        assert_eq!(store.apply_scars(&[], 0.3).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .apply_scars(&[n.id, Uuid::new_v4()], 0.3)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(close_to(
+            store.get_note(n.id).await.unwrap().unwrap().scar_intensity,
+            0.3
+        ));
+        store.apply_scars(&[n.id], 0.5).await.unwrap();
+        store.apply_scars(&[n.id], 0.5).await.unwrap();
+        assert!(
+            close_to(
+                store.get_note(n.id).await.unwrap().unwrap().scar_intensity,
+                1.0
+            ),
+            "capped"
+        );
+        assert!(store.heal_scars(n.id).await.unwrap());
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().scar_intensity,
+            0.0
+        );
+        assert!(!store.heal_scars(Uuid::new_v4()).await.unwrap());
+        for id in [n.id, m.id] {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ======================================================================
@@ -8124,6 +8336,22 @@ macro_rules! analytics_checks {
         );
     };
 }
+
+/// The neural layer of the notes (`AnalyticsStore`, sub-lot A2): synapses, energy, scars.
+macro_rules! neural_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_neural_synapses, check_neural_energy_and_scars]
+        );
+    };
+}
+
+neural_checks!(mock_neural, MockFactory);
+neural_checks!(neo4j_neural, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+neural_checks!(obrain_neural, ObrainFactory);
 
 analytics_checks!(mock_analytics, MockFactory);
 analytics_checks!(neo4j_analytics, Neo4jFactory);
