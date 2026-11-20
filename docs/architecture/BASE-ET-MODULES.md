@@ -36,7 +36,7 @@ Découpage par domaine PO, aligné sur les domaines déjà identifiés. Tailles 
 | **sharing** | consentement de partage | `sharing.*` | note, graph | `src/sharing` 2 063 |
 | **identity/vault** | credential_ref, provider | `provider.*`, `vault.*` | — | `src/auth` 6 765 + `src/vault` 2 767 + `src/identity` 945 |
 
-**Ce qui ne rentre dans AUCUN module** (c'est du socle, voir §3) : `src/chat` 205 577, `src/runner` 33 548, `src/orchestrator` 20 440, `src/mcp` 19 115 + `src/mcp_federation` 6 638, `src/neo4j` 87 088, `src/parser` 12 196, `src/pipeline` 8 434, `src/meilisearch` 2 299, `src/embeddings` 1 010, `src/events` (le bus), `src/transport`, `src/reception`, `src/ingress`, `src/lifecycle`, `src/boot.rs`, `src/storage.rs`.
+**Ce qui ne rentre dans AUCUN module** (c'est du socle, voir §3) : `src/chat` 205 577, `src/runner` 33 548, `src/orchestrator` 20 440, `src/mcp` 19 115 + `src/mcp_federation` 6 638, `src/neo4j` 87 088, `src/parser` 12 196, `src/pipeline` 8 434, `src/meilisearch` 2 299, `src/embeddings` 1 010, `src/events` (le bus), `src/transport`, `src/reception`, `src/ingress`, `src/lifecycle`, `src/boot.rs`, `src/storage/mod.rs`.
 
 Le « 427 actions MCP » du brief est un instantané : `grep` sur `src/mcp/` relève **≈490 noms d'action distincts** (le compteur exact dépend du filtre). Le point n'est pas le chiffre, c'est que ces ~490 actions sont **un seul point de répartition** (`src/mcp` 19 115 lignes), pas 32 crates. Pour les modulariser, il faut réattribuer chaque `(outil, action)` au module qui possède l'entité — la table ci-dessus en est le squelette — et laisser au socle les ~10 outils transverses (chat, code, admin, lifecycle_hook).
 

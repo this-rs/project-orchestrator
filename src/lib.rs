@@ -639,6 +639,9 @@ pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<boo
 pub(crate) fn strict_env_flag_over(name: &str, yaml: Option<bool>) -> Result<Option<bool>> {
     match std::env::var(name) {
         Err(_) => Ok(yaml),
+        // Present but EMPTY (`X=${X:-}` of a compose file) is absent, not an
+        // error: it says nothing. A non-empty unreadable value stays an error.
+        Ok(raw) if raw.trim().is_empty() => Ok(yaml),
         Ok(raw) => match parse_env_flag(&raw) {
             Some(v) => Ok(Some(v)),
             None => anyhow::bail!(
@@ -3981,6 +3984,16 @@ chat:
             err.contains("STORAGE_MIGRATION_ROLLBACK") && err.contains("ture"),
             "{err}"
         );
+        // Present but EMPTY (`${X:-}` in a compose file) is absent: the YAML
+        // (rollback: true) decides, nothing fails.
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "  ");
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(
+            config.storage_migration.rollback,
+            "empty = absent: the YAML wins"
+        );
+        assert!(config.storage_migration.disposable);
         std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
         std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "oui");
         let err = Config::from_yaml_and_env(Some(&file_path))

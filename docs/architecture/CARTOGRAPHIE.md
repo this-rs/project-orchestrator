@@ -15,7 +15,7 @@ But : décider **qui possède quoi** avant d'écrire la première ligne de refac
 
 Transports : `src/api/routes.rs` (3188 l., **483 `.route(`**), `src/mcp/handlers.rs` (**13 483 l.**).
 Domaine : `src/chat` **205 451 l.**, `src/runner` 32 155, `src/skills` 26 841, `src/graph` 21 098, `src/orchestrator` 20 440, `src/notes` 14 732, `src/protocol` 12 367, `src/neurons` 6 592, `src/plan` 3 065.
-Stockage : `src/neo4j` (57 fichiers), `src/meilisearch`, `src/storage.rs`.
+Stockage : `src/neo4j` (57 fichiers), `src/meilisearch`, `src/storage/mod.rs`.
 Événements : `src/events` (9 792 l., 17 fichiers). Auth : `src/auth` (6 765 l., 11 fichiers).
 
 **Le chat est le vrai poids** : `src/chat/manager.rs` fait 40 957 lignes, dont **la moitié est du code de test inline** (lignes ~20 410 → 40 957). Production = 20 410 lignes, 1 086 `async fn`, un seul `impl ChatManager`. Sous-ensembles réels : cycle de vie de session, ouverture/spawn d'agent, permissions/annulation, mémoire tenue au resume, livraison d'événements. Sous-dossiers : `provider/` 41 293, `stages/` 10 322, `provider/cognitive/` 10 328, `provider/limits/` 6 804.

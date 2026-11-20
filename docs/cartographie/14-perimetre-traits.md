@@ -24,7 +24,7 @@ L'abstraction **de types** est bonne : les signatures des traits ne nomment jama
 
 **Points structurants :**
 - `StoreCapabilities` (`traits.rs:42`) est un **manifeste déclaratif** : il nomme bien `vector_search`, `vector_filter`, `composite_unique`, `subqueries`, `datetime_arithmetic`, `relationship_property_index`, `shortest_path`, `variable_length_paths`, `explicit_transactions`. Mais **aucun code de production ne branche dessus** — seule lecture : `src/api/handlers.rs:227,290` qui l'expose à l'UI. Un obrain qui annonce `datetime_arithmetic: false` reçoit quand même le même Cypher. C'est la bombe n°1 de ce périmètre.
-- **Trajectory store hors fabrique** : `neural_routing_core::traits::TrajectoryStore` (`crates/neural-routing-core/src/traits.rs:11`) est un trait séparé, mais l'adaptateur est ouvert **en direct** dans la fabrique (`src/storage.rs` → `crate::neo4j::trajectory::open()`), pas via le sélecteur de backend. obrain ne peut pas le remplacer sans modifier `storage.rs`.
+- **Trajectory store hors fabrique** : `neural_routing_core::traits::TrajectoryStore` (`crates/neural-routing-core/src/traits.rs:11`) est un trait séparé, mais l'adaptateur est ouvert **en direct** dans la fabrique (`src/storage/mod.rs` → `crate::neo4j::trajectory::open()`), pas via le sélecteur de backend. obrain ne peut pas le remplacer sans modifier `storage/mod.rs`.
 - Delta brut 888 méthodes publiques d'adaptateur vs 737 de trait : en grande partie les helpers exclus *documentés* (`execute`, `execute_with_params`, `init_schema`, décodeurs). À vérifier par un diff mécanique 1:1, pas un trou prouvé.
 
 ## 2. Meilisearch — `SearchStore`, 27 méthodes
@@ -82,7 +82,7 @@ Le transport de chat est consommé **concrètement** : `Option<Arc<NatsEmitter>>
 ### PO doit changer (Y)
 1. **Introduire un trait de transport de chat** (ex. `ChatTransport`) portant `publish_chat_event`/`subscribe_*`/`request_*`, et remplacer `Arc<NatsEmitter>` par `Arc<dyn ChatTransport>` dans `chat/` (~40 sites). Sans cela, la bascule du chat est impossible.
 2. **Consommer `StoreCapabilities`** (ou le supprimer) : aujourd'hui il est affiché mais jamais utilisé pour dégrader. Chaque capacité doit avoir un chemin de repli nommé.
-3. **Router le trajectory store par la fabrique** (`storage.rs`) au lieu d'ouvrir `neo4j::trajectory::open()` en dur.
+3. **Router le trajectory store par la fabrique** (`storage/mod.rs`) au lieu d'ouvrir `neo4j::trajectory::open()` en dur.
 4. **Expliciter** les défauts Meili (typo/ranking) et la politique de retry transient dans le trait (au moins en doc).
 
 ### Ne peut pas être abstrait (et pourquoi)

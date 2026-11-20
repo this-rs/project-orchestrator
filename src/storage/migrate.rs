@@ -45,6 +45,15 @@ pub const READ_ONLY_STATUS: u16 = 503;
 /// presence makes every later start serve the target without copying again.
 pub const DONE_MARKER: &str = ".po-migration-done";
 
+/// Written next to [`DONE_MARKER`] when a rollback starts the process on the
+/// source of an already migrated target: the trace that lets a later start say
+/// loudly that the writes made on the source during the rollback are not in the
+/// target it is about to serve again.
+pub const ROLLBACK_MARKER: &str = ".po-migration-rolled-back";
+
+/// Version of the [`DONE_MARKER`] content.
+const MARKER_VERSION: u64 = 1;
+
 /// Suffix of the lock file that serializes a migration across processes. It
 /// lives NEXT TO the target directory (`<parent>/.<name>.po-migration.lock`),
 /// never inside it, so it never makes the target look non-empty.
@@ -340,6 +349,10 @@ pub enum StartupOutcome {
     ServeTarget {
         dest: PathBuf,
         already_migrated: bool,
+        /// Set when this start serves a target after a rollback started the
+        /// process on the source: the writes made on the source meanwhile are
+        /// NOT in the target. Says since when.
+        after_rollback: Option<String>,
         /// The scratch directory of a disposable run: removed when dropped, so
         /// the caller hands it to the store that serves it.
         scratch: Option<tempfile::TempDir>,
@@ -412,9 +425,19 @@ fn holds_anything(dest: &Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Write the [`DONE_MARKER`] atomically (temp file + rename).
+/// Flush the directory entry of `dir` (a rename or a creation is durable only
+/// once its directory is).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Write the [`DONE_MARKER`] durably: a non-empty JSON body (version, source,
+/// target, time, the VERIFIED counts), written to a temporary file, fsynced,
+/// renamed, and the directory fsynced.
 fn write_marker(dest: &Path, req: &MigrationRequest, counts: &PerTypeCounts) -> anyhow::Result<()> {
+    use std::io::Write;
     let body = serde_json::json!({
+        "version": MARKER_VERSION,
         "source": req.source,
         "target": req.target,
         "verified_at": chrono::Utc::now().to_rfc3339(),
@@ -422,8 +445,79 @@ fn write_marker(dest: &Path, req: &MigrationRequest, counts: &PerTypeCounts) -> 
         "relationships": counts.relationships,
     });
     let tmp = dest.join(format!("{DONE_MARKER}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&body)?)?;
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(&body)?)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, dest.join(DONE_MARKER))?;
+    sync_dir(dest)?;
+    Ok(())
+}
+
+/// Read the [`DONE_MARKER`] of `dest`: `Ok(None)` when absent, `Ok(Some(_))`
+/// when present AND valid. An empty, unreadable or foreign marker is a named
+/// refusal, never "migrated": a crash between the rename and the flush, or a
+/// hand-made file, must not make PO serve a target that was never verified.
+fn read_marker(dest: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let path = dest.join(DONE_MARKER);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => anyhow::bail!(
+            "storage migration refused: the marker {} cannot be read ({e}); the target is not \
+             served on an unreadable marker. {}",
+            path.display(),
+            marker_remedy(dest)
+        ),
+    };
+    let invalid = |why: &str| {
+        anyhow::anyhow!(
+            "storage migration refused: the marker {} is invalid ({why}); the target is not \
+             served on a marker that does not prove a verified migration. {}",
+            path.display(),
+            marker_remedy(dest)
+        )
+    };
+    if bytes.is_empty() {
+        return Err(invalid("empty file"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| invalid(&format!("not JSON: {e}")))?;
+    if v["version"] != MARKER_VERSION {
+        return Err(invalid("unknown version"));
+    }
+    if !v["nodes"].is_object() || !v["relationships"].is_object() {
+        return Err(invalid("no verified counts"));
+    }
+    Ok(Some(v))
+}
+
+/// What to do about a target PO refuses to serve or to overwrite: said exactly,
+/// because under a supervisor that restarts the process the refusal repeats.
+fn marker_remedy(dest: &Path) -> String {
+    format!(
+        "To recover: either EMPTY the directory {} (delete its content: the source is \
+         untouched) and restart, which migrates again; or start on the source meanwhile with \
+         STORAGE_MIGRATION_ROLLBACK=true (storage.migration.rollback: true)",
+        dest.display()
+    )
+}
+
+/// Remove what a failed copy left in `dest` (a directory the migration found
+/// empty and created or filled under the lock), so the next start can retry
+/// instead of refusing. Best effort: `Err` carries what could not be removed.
+fn clean_failed_copy(dest: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(dest).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let r = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        r.map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -494,6 +588,7 @@ pub async fn run_startup_migration(
             Ok(_) => Ok(StartupOutcome::ServeTarget {
                 dest: scratch.path().to_path_buf(),
                 already_migrated: false,
+                after_rollback: None,
                 scratch: Some(scratch),
             }),
             // `scratch` is dropped here: the failed copy is removed.
@@ -505,15 +600,24 @@ pub async fn run_startup_migration(
     }
 
     if req.rollback {
-        let migrated = req
-            .configured_dest
-            .as_deref()
-            .is_some_and(|d| d.join(DONE_MARKER).is_file());
+        let migrated = match req.configured_dest.as_deref() {
+            Some(d) => read_marker(d).ok().flatten().is_some(),
+            None => false,
+        };
         let reason = if migrated {
+            // The trace a later start reads: after this rollback, writes land
+            // on the source and the target stops being current.
+            if let Some(d) = req.configured_dest.as_deref() {
+                let marker = d.join(ROLLBACK_MARKER);
+                if !marker.exists() {
+                    let _ = std::fs::write(&marker, chrono::Utc::now().to_rfc3339());
+                }
+            }
             format!(
                 "rollback demanded by configuration — staying on the source; the target was \
                  already migrated, so every write made on '{}' since the switch is NOT visible \
-                 on the source",
+                 on the source, and every write made on the source from now on will NOT be in \
+                 the target if the rollback is later removed",
                 req.target
             )
         } else {
@@ -529,21 +633,24 @@ pub async fn run_startup_migration(
             req.target
         );
     };
+    // A migrated target needs no lock and no write access to its parent: the
+    // marker is read first, so `serve` and `sync` started together on a migrated
+    // target both start. It is read AGAIN under the lock below, because another
+    // process may finish its migration while this one waits for the lock.
+    if read_marker(&dest)?.is_some() {
+        return Ok(served(dest));
+    }
     let _lock = MigrationLock::acquire(&dest)?;
-    if dest.join(DONE_MARKER).is_file() {
-        return Ok(StartupOutcome::ServeTarget {
-            dest,
-            already_migrated: true,
-            scratch: None,
-        });
+    if read_marker(&dest)?.is_some() {
+        return Ok(served(dest));
     }
     if holds_anything(&dest)? {
         anyhow::bail!(
             "storage migration refused: the target {} already holds data but carries no \
              {DONE_MARKER} (an interrupted or unverified copy, or another base). PO neither \
-             overwrites it nor falls back on the source silently: inspect and empty it to \
-             migrate again, or set storage.migration.rollback to stay on the source",
-            dest.display()
+             overwrites it nor falls back on the source silently. {}",
+            dest.display(),
+            marker_remedy(&dest)
         );
     }
     match copy_and_verify(req, &dest, migrator).await {
@@ -558,16 +665,43 @@ pub async fn run_startup_migration(
             Ok(StartupOutcome::ServeTarget {
                 dest,
                 already_migrated: false,
+                after_rollback: None,
                 scratch: None,
             })
         }
-        Err(reason) => Ok(StartupOutcome::StayOnSource {
-            reason: format!(
-                "{reason} — no {DONE_MARKER} was written; what the copy left in {} must be \
-                 emptied before the next attempt (it is refused while it holds data)",
-                dest.display()
-            ),
-        }),
+        Err(reason) => {
+            let cleaned = match clean_failed_copy(&dest) {
+                Ok(()) => format!(
+                    "what the failed copy wrote in {} was removed, so the next start retries",
+                    dest.display()
+                ),
+                Err(e) => format!(
+                    "what the failed copy wrote in {} could NOT be removed ({e}); the next \
+                     start refuses until it is. {}",
+                    dest.display(),
+                    marker_remedy(&dest)
+                ),
+            };
+            Ok(StartupOutcome::StayOnSource {
+                reason: format!("{reason} — no {DONE_MARKER} was written; {cleaned}"),
+            })
+        }
+    }
+}
+
+/// The outcome of a start that serves an already migrated target; reads the
+/// rollback trace (and consumes it, so the loud warning is given once).
+fn served(dest: PathBuf) -> StartupOutcome {
+    let trace = dest.join(ROLLBACK_MARKER);
+    let after_rollback = std::fs::read_to_string(&trace).ok().map(|since| {
+        let _ = std::fs::remove_file(&trace);
+        since.trim().to_string()
+    });
+    StartupOutcome::ServeTarget {
+        dest,
+        already_migrated: true,
+        after_rollback,
+        scratch: None,
     }
 }
 
@@ -703,6 +837,8 @@ mod tests {
         lose: bool,
         extra: bool,
         fail_copy: bool,
+        /// During `copy`, assert that the migration lock of `dest` is held.
+        probe_lock: bool,
         copied_into: std::sync::Mutex<Vec<PathBuf>>,
     }
     impl Fake {
@@ -713,6 +849,7 @@ mod tests {
                 lose: false,
                 extra: false,
                 fail_copy: false,
+                probe_lock: false,
                 copied_into: Default::default(),
             }
         }
@@ -732,6 +869,12 @@ mod tests {
         async fn copy(&self, dest: &Path) -> anyhow::Result<()> {
             assert!(self.gate.is_read_only(), "the copy must run under the gate");
             self.copied_into.lock().unwrap().push(dest.to_path_buf());
+            if self.probe_lock {
+                let err = MigrationLock::acquire(dest)
+                    .expect_err("the migration lock must be held DURING the copy")
+                    .to_string();
+                assert!(err.contains("another process is migrating"), "{err}");
+            }
             if self.fail_copy {
                 anyhow::bail!("disk full");
             }
@@ -786,7 +929,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(&o, StartupOutcome::ServeTarget { dest: d, already_migrated: false, scratch: None } if *d == dest),
+            matches!(&o, StartupOutcome::ServeTarget { dest: d, already_migrated: false, scratch: None, .. } if *d == dest),
             "{o:?}"
         );
         assert_eq!(fake.copies(), 1);
@@ -845,6 +988,14 @@ mod tests {
             .to_string();
         assert!(
             err.contains("already holds data") && err.contains(DONE_MARKER),
+            "{err}"
+        );
+        // It says exactly what to do (a supervisor restarts the process, so the
+        // refusal repeats until the operator acts).
+        assert!(
+            err.contains("EMPTY the directory")
+                && err.contains(&dest.display().to_string())
+                && err.contains("STORAGE_MIGRATION_ROLLBACK=true"),
             "{err}"
         );
         assert_eq!(fake.copies(), 0, "never overwritten");
@@ -1069,5 +1220,233 @@ mod tests {
             panic!("boom");
         });
         assert!(!gate.is_read_only(), "a panic lowers the gate too");
+    }
+
+    // ── Review round 3 ─────────────────────────────────────────────────────
+
+    /// The migration lock is held for the whole copy: a second process is
+    /// refused DURING `copy`, and the lock is free again afterwards.
+    #[tokio::test]
+    async fn the_lock_is_held_during_the_copy_and_released_after() {
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("base");
+        let ro = gate.enter();
+        let mut fake = Fake::new(&gate, data());
+        fake.probe_lock = true;
+        run_startup_migration(&request(&dest), &fake, &ro)
+            .await
+            .unwrap();
+        assert_eq!(fake.copies(), 1);
+        MigrationLock::acquire(&dest).expect("released after the migration");
+    }
+
+    async fn migrated(gate: &ReadOnlyGate, dest: &Path) {
+        let ro = gate.enter();
+        run_startup_migration(&request(dest), &Fake::new(gate, data()), &ro)
+            .await
+            .unwrap();
+    }
+
+    /// Restores the permissions of a directory when dropped (so the temp dir
+    /// can be removed even when an assertion fails).
+    struct Perms(PathBuf);
+    impl Drop for Perms {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Regression: the lock was taken before the marker was looked at, so a
+    /// read-only parent refused a target that needed no migration at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_marked_target_in_a_read_only_parent_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let dest = parent.join("base");
+        migrated(&gate, &dest).await;
+        let _restore = Perms(parent.clone());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _ = std::fs::remove_file(MigrationLock::path_for(&dest));
+
+        let ro = gate.enter();
+        let again = Fake::new(&gate, data());
+        let o = run_startup_migration(&request(&dest), &again, &ro)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                o,
+                StartupOutcome::ServeTarget {
+                    already_migrated: true,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(again.copies(), 0);
+    }
+
+    /// Regression: `serve` and `sync` started together on a migrated target got
+    /// a false "another process is migrating".
+    #[tokio::test]
+    async fn two_concurrent_starts_on_a_marked_target_both_succeed() {
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("base");
+        migrated(&gate, &dest).await;
+        // Even while a lock is held on it (another process mid-check).
+        let _held = MigrationLock::acquire(&dest).unwrap();
+        let (ro_a, ro_b) = (gate.enter(), gate.enter());
+        let (fa, fb) = (Fake::new(&gate, data()), Fake::new(&gate, data()));
+        let req = request(&dest);
+        let (a, b) = tokio::join!(
+            run_startup_migration(&req, &fa, &ro_a),
+            run_startup_migration(&req, &fb, &ro_b)
+        );
+        for o in [a.unwrap(), b.unwrap()] {
+            assert!(
+                matches!(
+                    o,
+                    StartupOutcome::ServeTarget {
+                        already_migrated: true,
+                        ..
+                    }
+                ),
+                "{o:?}"
+            );
+        }
+        assert_eq!(fa.copies() + fb.copies(), 0);
+    }
+
+    /// The marker is durable evidence, not a name: an empty or foreign file is
+    /// a named refusal, never "migrated", and a valid one carries the verified
+    /// counts.
+    #[tokio::test]
+    async fn an_empty_or_unreadable_marker_is_a_named_refusal_not_a_migrated_target() {
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("base");
+        migrated(&gate, &dest).await;
+        let marker = read_marker(&dest).unwrap().expect("valid marker");
+        assert_eq!(marker["version"], 1);
+        assert_eq!(marker["nodes"]["Note"], 7);
+        assert_eq!(marker["relationships"]["LINKED_TO"], 4);
+
+        for (why, body) in [
+            ("empty", ""),
+            ("not json", "garbage"),
+            (
+                "foreign version",
+                r#"{"version":99,"nodes":{},"relationships":{}}"#,
+            ),
+            ("no counts", r#"{"version":1}"#),
+        ] {
+            std::fs::write(dest.join(DONE_MARKER), body).unwrap();
+            let ro = gate.enter();
+            let fake = Fake::new(&gate, data());
+            let err = run_startup_migration(&request(&dest), &fake, &ro)
+                .await
+                .expect_err(why)
+                .to_string();
+            assert!(
+                err.contains("is invalid") && err.contains("EMPTY the directory"),
+                "{why}: {err}"
+            );
+            assert_eq!(fake.copies(), 0, "{why}: never overwritten");
+        }
+    }
+
+    /// A rollback leaves a trace; the next start that serves the marked target
+    /// says so (once), and an ordinary restart says nothing.
+    #[tokio::test]
+    async fn serving_the_target_after_a_rollback_is_reported_once() {
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("base");
+        migrated(&gate, &dest).await;
+
+        let ro = gate.enter();
+        let plain = run_startup_migration(&request(&dest), &Fake::new(&gate, data()), &ro)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                plain,
+                StartupOutcome::ServeTarget {
+                    after_rollback: None,
+                    ..
+                }
+            ),
+            "{plain:?}"
+        );
+
+        let mut rb = request(&dest);
+        rb.rollback = true;
+        let reason = stay_reason(
+            run_startup_migration(&rb, &Fake::new(&gate, data()), &ro)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            reason.contains("from now on will NOT be in the target"),
+            "{reason}"
+        );
+        assert!(
+            dest.join(ROLLBACK_MARKER).is_file(),
+            "the rollback leaves a trace"
+        );
+
+        let after = run_startup_migration(&request(&dest), &Fake::new(&gate, data()), &ro)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&after, StartupOutcome::ServeTarget { after_rollback: Some(t), .. } if !t.is_empty()),
+            "{after:?}"
+        );
+        let again = run_startup_migration(&request(&dest), &Fake::new(&gate, data()), &ro)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                again,
+                StartupOutcome::ServeTarget {
+                    after_rollback: None,
+                    ..
+                }
+            ),
+            "the warning is given once"
+        );
+    }
+
+    /// Regression (operational trap): a failed non-disposable copy left data in
+    /// the target, so every later start refused — a loop under a supervisor.
+    #[tokio::test]
+    async fn a_failed_copy_leaves_the_target_empty_so_the_next_start_retries() {
+        let gate = ReadOnlyGate::new();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("base");
+        let ro = gate.enter();
+        let mut gap = Fake::new(&gate, data());
+        gap.lose = true;
+        let reason = stay_reason(
+            run_startup_migration(&request(&dest), &gap, &ro)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            reason.contains("was removed, so the next start retries"),
+            "{reason}"
+        );
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+        let ok = Fake::new(&gate, data());
+        let o = run_startup_migration(&request(&dest), &ok, &ro)
+            .await
+            .unwrap();
+        assert!(matches!(o, StartupOutcome::ServeTarget { .. }), "{o:?}");
     }
 }

@@ -141,6 +141,27 @@ impl StorageBackend {
     ) -> Result<Chosen> {
         let requested = select_backend(&config.storage_backend)?;
         let mig = &config.storage_migration;
+        // A disposable environment is a migrated COPY. Without an executable
+        // migration (default -> obrain) there is no copy to mount: starting on
+        // the configured backend instead would open the REAL source with writes
+        // allowed, which is exactly what "disposable" promises never to do.
+        if mig.disposable {
+            let executable = requested == BackendKind::Obrain
+                && match mig.from.as_deref() {
+                    Some(from) => select_backend(from)? == BackendKind::Default,
+                    None => false,
+                };
+            if !executable {
+                bail!(
+                    "storage.migration.disposable is set, but there is no migration to mount a \
+                     copy from: it needs storage.backend = '{OBRAIN_BACKEND}' and \
+                     storage.migration.from = '{DEFAULT_BACKEND}' (got backend = '{}', from = {:?}). \
+                     Refusing to start: a disposable environment never runs on the real source",
+                    config.storage_backend,
+                    mig.from
+                );
+            }
+        }
         let plain = |kind| Chosen {
             kind,
             config: config.clone(),
@@ -195,8 +216,15 @@ impl StorageBackend {
             migrate::StartupOutcome::ServeTarget {
                 dest,
                 already_migrated,
+                after_rollback,
                 scratch,
             } => {
+                if let Some(since) = after_rollback {
+                    tracing::error!(since = %since, target = %dest.display(),
+                        "storage: serving the migrated target again after a rollback — every write \
+                         made on the source (Neo4j) since the rollback is NOT in this target and is \
+                         left behind; the target is not refreshed (migrate again by emptying it)");
+                }
                 let mut built = config.clone();
                 built.storage_obrain_path = Some(dest.display().to_string());
                 if already_migrated {
@@ -700,70 +728,44 @@ mod tests {
         );
     }
 
-    /// The backend the factory BUILDS is the obrain base that was verified,
-    /// at the same path — not some other store.
-    #[cfg(feature = "obrain-backend")]
+    /// Regression: `disposable` without an executable migration used to be
+    /// ignored — `backend: default` (or no `from`) started on the REAL Neo4j
+    /// with writes open, the very thing a disposable environment never does.
     #[tokio::test]
-    async fn the_built_backend_is_the_verified_obrain_base() {
-        use crate::obrain::{Creation, ObrainGraphStore};
-
-        /// Copies an (empty) source by creating a real PO obrain base in `dest`.
-        struct CreatesBase(ReadOnlyGate);
-        #[async_trait::async_trait]
-        impl Migrator for CreatesBase {
-            async fn source_counts(&self) -> Result<PerTypeCounts> {
-                assert!(self.0.is_read_only());
-                Ok(PerTypeCounts::default())
-            }
-            async fn copy(&self, dest: &std::path::Path) -> Result<()> {
-                let dest = dest.to_path_buf();
-                tokio::task::spawn_blocking(move || {
-                    ObrainGraphStore::open(dest, Creation::Permise).map(drop)
-                })
-                .await?
-            }
-            async fn target_counts(&self, _dest: &std::path::Path) -> Result<PerTypeCounts> {
-                Ok(PerTypeCounts::default())
-            }
-        }
-
+    async fn disposable_without_an_executable_migration_refuses_to_start() {
         let gate = ReadOnlyGate::new();
         let dir = tempfile::tempdir().unwrap();
-        let config = migrating_config(OBRAIN_BACKEND, dir.path());
-        let target = dir.path().join("target");
-        let backend = StorageBackend::from_config_in(&config, &CreatesBase(gate.clone()), &gate)
-            .await
-            .unwrap();
-        assert!(!gate.is_read_only(), "the gate is lowered once built");
-        assert!(target.join(DONE_MARKER).is_file());
-        // The built store holds obrain's exclusive lock on THAT directory.
-        let t = target.clone();
-        let reopen =
-            tokio::task::spawn_blocking(move || ObrainGraphStore::open(t, Creation::Interdite))
+        // backend = default, `from` set (the old `requested == Default` branch).
+        let mut config = migrating_config(DEFAULT_BACKEND, dir.path());
+        config.storage_migration.disposable = true;
+        // `from` absent, backend obrain (the old `plain(requested)` branch).
+        let mut no_from = migrating_config(OBRAIN_BACKEND, dir.path());
+        no_from.storage_migration.disposable = true;
+        no_from.storage_migration.from = None;
+        // `from` absent, backend default: nothing at all to copy.
+        let mut bare = migrating_config(DEFAULT_BACKEND, dir.path());
+        bare.storage_migration.disposable = true;
+        bare.storage_migration.from = None;
+        // with a rollback too.
+        let mut rolled = no_from.clone();
+        rolled.storage_migration.rollback = true;
+        for (name, c) in [
+            ("default + from", &config),
+            ("obrain, no from", &no_from),
+            ("default, no from", &bare),
+            ("rollback, no from", &rolled),
+        ] {
+            let err = StorageBackend::resolve_kind(c, &scripted(&gate, 0), &gate)
                 .await
-                .unwrap();
-        assert!(
-            reopen.is_err(),
-            "the verified base is the one the factory opened"
-        );
-        drop(reopen);
-        drop(backend);
-        // And a second start serves it, without copying.
-        struct NeverCopies;
-        #[async_trait::async_trait]
-        impl Migrator for NeverCopies {
-            async fn source_counts(&self) -> Result<PerTypeCounts> {
-                panic!("a migrated target is not read again")
-            }
-            async fn copy(&self, _dest: &std::path::Path) -> Result<()> {
-                panic!("a migrated target is never copied over")
-            }
-            async fn target_counts(&self, _dest: &std::path::Path) -> Result<PerTypeCounts> {
-                panic!("not read again")
-            }
+                .err()
+                .unwrap_or_else(|| panic!("{name}: must refuse"))
+                .to_string();
+            assert!(
+                err.contains("storage.migration.disposable")
+                    && err.contains("never runs on the real source"),
+                "{name}: {err}"
+            );
         }
-        StorageBackend::from_config_in(&config, &NeverCopies, &gate)
-            .await
-            .unwrap();
+        assert!(!gate.is_read_only());
     }
 }
