@@ -5658,8 +5658,10 @@ pub mod conformance {
         let builtin = a_profile("z-builtin", None, true);
         let mut scoped = a_profile("c-scoped", Some(&pid), false);
         scoped.description = Some("d".into());
-        let other = a_profile("other", Some(&Uuid::new_v4().to_string()), false);
-        for x in [&global_b, &global_a, &builtin, &scoped] {
+        let other_project = a_project("prof-other");
+        store.create_project(&other_project).await.unwrap();
+        let other = a_profile("other", Some(&other_project.id.to_string()), false);
+        for x in [&global_b, &global_a, &builtin, &scoped, &other] {
             store.create_analysis_profile(x).await.unwrap();
         }
         let got = store
@@ -5734,10 +5736,24 @@ pub mod conformance {
             .unwrap()
             .is_none());
         store.delete_analysis_profile("absent").await.unwrap();
-        for id in [&global_a.id, &global_b.id] {
+        // The other project's profile is visible to it, and to it only.
+        assert_eq!(
+            mine(
+                store
+                    .list_analysis_profiles(Some(&other_project.id.to_string()))
+                    .await
+                    .unwrap()
+            ),
+            ["z-builtin", "a-renamed", "b-global", "other"]
+        );
+        for id in [&global_a.id, &global_b.id, &other.id] {
             store.delete_analysis_profile(id).await.unwrap();
         }
         store.delete_project(p.id, &p.name).await.ok();
+        store
+            .delete_project(other_project.id, &other_project.name)
+            .await
+            .ok();
     }
 
     /// Topology rules: roundtrip, the per-project listing and its order

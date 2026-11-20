@@ -297,7 +297,7 @@ async fn an_unreadable_node_is_quarantined_and_its_key_is_reserved() {
 }
 
 #[tokio::test]
-async fn an_absent_target_refuses_instead_of_writing_nothing_and_saying_ok() {
+async fn an_absent_target_refuses_except_for_works_on_which_is_neo4j_s_no_op() {
     let store = ObrainGraphStore::open_temporary().unwrap();
     let missing = Uuid::new_v4();
     let profile = AnalysisProfile {
@@ -312,10 +312,14 @@ async fn an_absent_target_refuses_instead_of_writing_nothing_and_saying_ok() {
     assert!(store.create_analysis_profile(&profile).await.is_err());
     assert!(store.get_analysis_profile("p1").await.unwrap().is_none());
     store.create_or_get_user_profile("u").await.unwrap();
-    assert!(store.upsert_works_on("u", missing).await.is_err());
+    // Neo4j's no-op on an absent project or user, kept (the aggregator upserts a whole
+    // flush with `?`): Ok, and nothing written.
+    store.upsert_works_on("u", missing).await.unwrap();
+    assert!(store.get_works_on("u").await.unwrap().is_empty());
     let p = a_project();
     store.create_project(&p).await.unwrap();
-    assert!(store.upsert_works_on("nobody", p.id).await.is_err());
+    store.upsert_works_on("nobody", p.id).await.unwrap();
+    assert!(store.get_user_profile("nobody").await.unwrap().is_none());
     let nobody = project_orchestrator::profile::UserProfile::new("nobody");
     assert!(store.update_user_profile(&nobody).await.is_err());
     assert!(store.get_user_profile("nobody").await.unwrap().is_none());
@@ -331,52 +335,61 @@ async fn an_absent_target_refuses_instead_of_writing_nothing_and_saying_ok() {
     assert!(format!("{err:#}").contains("analytics"), "{err:#}");
 }
 
-#[tokio::test]
-async fn the_decisions_page_is_decoded_not_the_whole_log() {
+fn decision(
+    i: i64,
+) -> project_orchestrator::chat::provider::cognitive::decision::CognitiveDecision {
     use project_orchestrator::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
     use project_orchestrator::chat::provider::cognitive::mode::{
         LearningStage, ProviderRoutingMode,
     };
     use project_orchestrator::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+    CognitiveDecision {
+        snapshot: None,
+        arms_snapshot: Vec::new(),
+        id: Uuid::new_v4(),
+        at: Utc.timestamp_opt(1_700_000_000 + i, 0).unwrap(),
+        signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
+        chosen: Some(Pick::new("p", "m")),
+        score: None,
+        explored: false,
+        exploration_epsilon: 0.0,
+        confidence: None,
+        reason: format!("{i}"),
+        alternatives: vec![],
+        applied: false,
+        mode: ProviderRoutingMode::Full,
+        stage: LearningStage::Auto,
+        session_id: None,
+        task_id: None,
+        run_id: None,
+        turn_index: None,
+        outcome: None,
+        used: None,
+    }
+}
+
+/// Without a limit the page is Neo4j's 50, newest first; an offset past the end
+/// gives what is left.
+#[tokio::test]
+async fn the_decision_log_pages_newest_first_with_a_default_of_50() {
     use project_orchestrator::chat::provider::cognitive::store::DecisionFilter;
     let store = ObrainGraphStore::open_temporary().unwrap();
-    for i in 0..30 {
-        let d = CognitiveDecision {
-            snapshot: None,
-            arms_snapshot: Vec::new(),
-            id: Uuid::new_v4(),
-            at: Utc.timestamp_opt(1_700_000_000 + i, 0).unwrap(),
-            signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
-            chosen: Some(Pick::new("p", "m")),
-            score: None,
-            explored: false,
-            exploration_epsilon: 0.0,
-            confidence: None,
-            reason: format!("{i}"),
-            alternatives: vec![],
-            applied: false,
-            mode: ProviderRoutingMode::Full,
-            stage: LearningStage::Auto,
-            session_id: None,
-            task_id: None,
-            run_id: None,
-            turn_index: None,
-            outcome: None,
-            used: None,
-        };
-        store.put_routing_decision(&d).await.unwrap();
+    for i in 0..60 {
+        store.put_routing_decision(&decision(i)).await.unwrap();
     }
     let page = store
         .list_routing_decisions(&DecisionFilter::default())
         .await
         .unwrap();
-    // Default page: 50, so all 30, newest first.
-    assert_eq!(page.len(), 30);
-    assert_eq!(page[0].reason, "29");
+    assert_eq!(page.len(), 50);
+    assert_eq!(
+        (page[0].reason.as_str(), page[49].reason.as_str()),
+        ("59", "10")
+    );
     let page = store
         .list_routing_decisions(&DecisionFilter {
             limit: Some(5),
-            offset: 28,
+            offset: 58,
             ..Default::default()
         })
         .await
@@ -385,6 +398,301 @@ async fn the_decisions_page_is_decoded_not_the_whole_log() {
         page.iter().map(|d| d.reason.as_str()).collect::<Vec<_>>(),
         ["1", "0"]
     );
+}
+
+/// A decision whose document does not decode is quarantined by name at open and
+/// skipped by the list (Neo4j skips and logs); the rest of the log is served.
+#[tokio::test]
+async fn an_unreadable_decision_is_quarantined_and_the_log_still_reads() {
+    use project_orchestrator::chat::provider::cognitive::store::DecisionFilter;
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let bonne = decision(1);
+    {
+        let store = open(&base).await;
+        store.put_routing_decision(&bonne).await.unwrap();
+        store.close().await.unwrap();
+    }
+    let casse = Uuid::new_v4();
+    write_foreign(&base, move |db| {
+        db.create_node_with_props(
+            &["RoutingDecision"],
+            vec![
+                ("id", Value::from(casse.to_string())),
+                ("at", Value::from("2030-01-01T00:00:00.000Z")),
+                ("json", Value::from("{not json")),
+                ("project_slug", Value::from("")),
+                ("session_id", Value::from("")),
+            ],
+        );
+    })
+    .await;
+    let store = open(&base).await;
+    let q = store.rapport_d_ouverture().en_quarantaine.clone();
+    assert!(q.len() == 1 && q[0].contains("RoutingDecision"), "{q:?}");
+    let page = store
+        .list_routing_decisions(&DecisionFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(page.iter().map(|d| d.id).collect::<Vec<_>>(), [bonne.id]);
+    assert!(store.get_routing_decision(casse).await.is_err());
+    // Its id stays reserved: not rewritten over the unreadable node.
+    let mut d = decision(2);
+    d.id = casse;
+    assert!(store.put_routing_decision(&d).await.is_err());
+}
+
+/// Cut at every engine write of a multi-property rewrite, then reopened: the
+/// entity is wholly old (cut before the marker) or wholly new (finished from it).
+#[tokio::test]
+async fn a_cut_rewrite_of_a_decision_a_profile_or_a_user_is_wholly_old_or_wholly_new() {
+    let mut atteints = [0usize; 3];
+    for k in 1..=20 {
+        // A decision rewritten by id (the chat manager does it on every turn outcome).
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("d");
+        let store = open(&base).await;
+        let d = decision(1);
+        store.put_routing_decision(&d).await.unwrap();
+        let mut d2 = d.clone();
+        d2.reason = "rewritten".into();
+        d2.applied = true;
+        d2.at = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.put_routing_decision(&d2).await.is_err() {
+            atteints[0] += 1;
+            drop(store);
+            let store = open(&base).await;
+            let r = store.rapport_d_ouverture().clone();
+            assert!(r.en_quarantaine.is_empty(), "k={k}: {r:?}");
+            let lu = store.get_routing_decision(d.id).await.unwrap().unwrap();
+            let page = store
+                .list_routing_decisions(&Default::default())
+                .await
+                .unwrap();
+            if k == 1 {
+                assert_eq!((lu, r.mises_a_jour_achevees), (d.clone(), 0), "k={k}");
+            } else {
+                assert_eq!((lu, r.mises_a_jour_achevees), (d2.clone(), 1), "k={k}");
+            }
+            // The light entry (instant, filters) agrees with the document.
+            assert_eq!(page[0].at, if k == 1 { d.at } else { d2.at }, "k={k}");
+        }
+
+        // An analysis profile rewritten by id.
+        let base = dir.path().join("p");
+        let store = open(&base).await;
+        let mut prof = AnalysisProfile {
+            id: "prof".into(),
+            project_id: None,
+            name: "old".into(),
+            description: None,
+            edge_weights: Default::default(),
+            fusion_weights: Default::default(),
+            is_builtin: false,
+        };
+        store.create_analysis_profile(&prof).await.unwrap();
+        let ancien = prof.clone();
+        prof.name = "new".into();
+        prof.description = Some("d".into());
+        prof.edge_weights.insert("CALLS".into(), 2.0);
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.create_analysis_profile(&prof).await.is_err() {
+            atteints[1] += 1;
+            drop(store);
+            let store = open(&base).await;
+            let r = store.rapport_d_ouverture().clone();
+            assert!(r.en_quarantaine.is_empty(), "k={k}: {r:?}");
+            let lu =
+                serde_json::to_value(store.get_analysis_profile("prof").await.unwrap().unwrap())
+                    .unwrap();
+            let attendu = if k == 1 { &ancien } else { &prof };
+            assert_eq!(lu, serde_json::to_value(attendu).unwrap(), "k={k}");
+        }
+
+        // A user profile update.
+        let base = dir.path().join("u");
+        let store = open(&base).await;
+        let u = store.create_or_get_user_profile("u").await.unwrap();
+        let mut u2 = u.clone();
+        u2.verbosity = 0.9;
+        u2.language = "fr".into();
+        u2.interaction_count = 7;
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.update_user_profile(&u2).await.is_err() {
+            atteints[2] += 1;
+            drop(store);
+            let store = open(&base).await;
+            let r = store.rapport_d_ouverture().clone();
+            assert!(r.en_quarantaine.is_empty(), "k={k}: {r:?}");
+            let lu = store.get_user_profile("u").await.unwrap().unwrap();
+            let lu = (lu.verbosity, lu.language, lu.interaction_count);
+            if k == 1 {
+                assert_eq!(lu, (0.5, "en".to_string(), 0), "k={k}");
+            } else {
+                assert_eq!(lu, (0.9, "fr".to_string(), 7), "k={k}");
+            }
+        }
+    }
+    // Decision rewrite: marker + 9 properties + removal; profile: + 7; user: + 6.
+    assert!(
+        atteints[0] >= 10 && atteints[1] >= 8 && atteints[2] >= 7,
+        "{atteints:?}"
+    );
+}
+
+/// The real cut of `upsert_works_on` (new edge, then old edge deleted): cut before
+/// the creation, nothing moved; cut after it, two edges, and opening keeps the new.
+#[tokio::test]
+async fn a_cut_works_on_upsert_keeps_the_old_or_the_new_frequency() {
+    let mut atteints = 0;
+    for k in 1..=4 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project();
+        store.create_project(&p).await.unwrap();
+        store.create_or_get_user_profile("u").await.unwrap();
+        store.upsert_works_on("u", p.id).await.unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.upsert_works_on("u", p.id).await.is_ok() {
+            break;
+        }
+        atteints += 1;
+        drop(store);
+        let store = open(&base).await;
+        let r = store.rapport_d_ouverture().clone();
+        let w = store.get_works_on("u").await.unwrap();
+        assert_eq!(w.len(), 1, "k={k}");
+        if k == 1 {
+            assert_eq!((w[0].frequency, r.mises_a_jour_achevees), (1, 0), "k={k}");
+        } else {
+            assert_eq!((w[0].frequency, r.mises_a_jour_achevees), (2, 1), "k={k}");
+        }
+    }
+    assert_eq!(
+        atteints, 2,
+        "two engine writes: the new edge, the old one deleted"
+    );
+}
+
+/// A `WORKS_ON` edge that does not read is quarantined AND its relation reserved:
+/// an upsert would otherwise write a second edge at frequency 1 and lose its count.
+#[tokio::test]
+async fn an_unreadable_works_on_edge_reserves_its_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    {
+        let store = open(&base).await;
+        store.create_project(&p).await.unwrap();
+        store.create_or_get_user_profile("u").await.unwrap();
+        store.close().await.unwrap();
+    }
+    write_foreign(&base, |db| {
+        let store = db.store();
+        let u = store.nodes_by_label("UserProfile")[0];
+        let pr = store.nodes_by_label("Project")[0];
+        // No `last_active`: unreadable.
+        db.create_edge_with_props(u, pr, "WORKS_ON", [("frequency", Value::from(9i64))]);
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    assert!(store.get_works_on("u").await.is_err());
+    assert!(store.upsert_works_on("u", p.id).await.is_err());
+    // Nothing was written: still one edge after a reopen.
+    store.close().await.unwrap();
+    drop(store);
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+}
+
+/// A quarantined node never makes a list silently partial; an unrelated scope still reads.
+#[tokio::test]
+async fn a_list_that_could_miss_a_quarantined_node_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    open(&base).await.close().await.unwrap();
+    write_foreign(&base, |db| {
+        db.create_node_with_props(
+            &["RoutingArm"],
+            vec![
+                ("class", Value::from("c")),
+                ("provider_id", Value::from("prov")),
+                ("model", Value::from("m")),
+            ],
+        );
+        db.create_node_with_props(
+            &["TopologyRule"],
+            vec![("id", Value::from("r")), ("project_id", Value::from("p1"))],
+        );
+        db.create_node_with_props(
+            &["AnalysisProfile"],
+            vec![("id", Value::from("a")), ("project_id", Value::from("p1"))],
+        );
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 3);
+    assert!(store.list_routing_arms("c").await.is_err());
+    assert!(store.list_routing_arms("other").await.unwrap().is_empty());
+    // The quarantined arm itself: neither read nor observed.
+    let k = ArmKey::new("c", "prov", "m");
+    let e = store.observe_routing_arm(&k, &obs(1.0)).await.unwrap_err();
+    assert!(format!("{e:#}").contains("réservé"), "{e:#}");
+    assert!(store.list_topology_rules("p1").await.is_err());
+    assert!(store.list_topology_rules("p2").await.unwrap().is_empty());
+    assert!(store.list_analysis_profiles(Some("p1")).await.is_err());
+    assert!(store
+        .list_analysis_profiles(Some("p2"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.list_analysis_profiles(None).await.unwrap().is_empty());
+}
+
+/// Reserved keys never collide: a quarantined node's `id` does not reserve a
+/// `user_id` of the same text, and parts are not joined by a separator.
+#[tokio::test]
+async fn reserved_keys_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    open(&base).await.close().await.unwrap();
+    write_foreign(&base, |db| {
+        // An unreadable profile whose `id` is the text "alice".
+        db.create_node_with_props(
+            &["UserProfile"],
+            vec![
+                ("id", Value::from("alice")),
+                ("user_id", Value::from("zzz")),
+            ],
+        );
+        // An unreadable arm ("a|b", "c", "m").
+        db.create_node_with_props(
+            &["RoutingArm"],
+            vec![
+                ("class", Value::from("a|b")),
+                ("provider_id", Value::from("c")),
+                ("model", Value::from("m")),
+            ],
+        );
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
+    // "alice" is a user_id nobody reserved.
+    store.create_or_get_user_profile("alice").await.unwrap();
+    assert!(store.create_or_get_user_profile("zzz").await.is_err());
+    // ("a", "b|c", "m") is another arm than ("a|b", "c", "m").
+    store
+        .observe_routing_arm(&ArmKey::new("a", "b|c", "m"), &obs(1.0))
+        .await
+        .unwrap();
+    assert!(store
+        .observe_routing_arm(&ArmKey::new("a|b", "c", "m"), &obs(1.0))
+        .await
+        .is_err());
 }
 
 /// The 119 methods of the other sub-lots refuse by their own name, and none is
