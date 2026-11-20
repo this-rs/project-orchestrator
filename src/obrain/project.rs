@@ -638,6 +638,16 @@ const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
     ("fédération", &["McpServer", "McpTool"]),
     ("skills", &["Skill", "PublishedSkill"]),
     ("partage", &["SharingEvent", "Tombstone"]),
+    (
+        "analytics",
+        &[
+            "AnalysisProfile",
+            "TopologyRule",
+            "UserProfile",
+            "RoutingArm",
+            "RoutingDecision",
+        ],
+    ),
 ];
 
 /// What the nodes outside the addressed projects and plans are, by domain:

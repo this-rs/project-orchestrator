@@ -260,6 +260,16 @@ fn cles_d_un_noeud(label: &str, get: Lecteur) -> Vec<String> {
             cles.push(cle_reservee(label, &[&u.to_string()]));
         }
     }
+    // The analytics domain (`analytics.rs`) keys by a string `id`, a `user_id`, or the
+    // (class, provider, model) triple of an arm: reserved as they are written.
+    for champ in ["id", "user_id"] {
+        if let Some(s) = brut(champ).filter(|s| !s.is_empty()) {
+            cles.push(cle_reservee(label, &[&s]));
+        }
+    }
+    if let (Some(c), Some(p), Some(m)) = (brut("class"), brut("provider_id"), brut("model")) {
+        cles.push(cle_reservee(label, &[&c, &p, &m]));
+    }
     if let Some(k) = brut("dedup_key").filter(|k| !k.is_empty()) {
         cles.push(cle_reservee(label, &["cle", &k]));
     }
