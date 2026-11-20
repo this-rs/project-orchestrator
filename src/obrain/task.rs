@@ -282,13 +282,15 @@ fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
     // `datetime()`), `ZonedDatetime` (what the migrator writes). A PRESENT but
     // unreadable date is an error, so this node is quarantined by name — read as
     // undated instead, it is how 130 713 migrated nodes were lost.
-    let instant = |cle: &str| super::date_propriete(get, cle);
+    let instant_de =
+        |cle: &str, id: Uuid| super::date_optionnelle(get, cle, &format!("tâche {id}"));
     let entier = |cle: &str| get(cle).and_then(|v| v.as_int64());
     let positif = |cle: &str| entier(cle).filter(|&v| v > 0).map(|v| v as u32);
     let non_vide = |cle: &str| chaine(cle).filter(|s| !s.is_empty());
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Task sans propriété `id` lisible"))?;
+    let instant = |cle: &str| instant_de(cle, id);
     let requise =
         |cle: &str| chaine(cle).ok_or_else(|| anyhow!("tâche {id} sans propriété `{cle}`"));
     let statut_brut = requise("status")?;
@@ -303,7 +305,7 @@ fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
         description: requise("description")?,
         status,
         assigned_to: chaine("assigned_to"),
-        interrupted_at: instant("interrupted_at")?,
+        interrupted_at: instant("interrupted_at"),
         interrupted_reason: non_vide("interrupted_reason"),
         priority: entier("priority").map(|v| v as i32),
         tags: lire_liste(get, "tags", id)?,
@@ -314,9 +316,9 @@ fn lire_tache(get: &dyn Fn(&str) -> Option<Value>) -> Result<TaskNode> {
         due_date: non_vide("due_date").and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
         estimated_minutes: positif("estimated_minutes"),
         created_at,
-        updated_at: instant("updated_at")?,
-        started_at: instant("started_at")?,
-        completed_at: instant("completed_at")?,
+        updated_at: instant("updated_at"),
+        started_at: instant("started_at"),
+        completed_at: instant("completed_at"),
         frustration_score: get("frustration_score")
             .and_then(|v| v.as_float64())
             .unwrap_or(0.0),

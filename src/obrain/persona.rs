@@ -284,7 +284,7 @@ fn lire_persona(get: &dyn Fn(&str) -> Option<Value>) -> Result<PersonaNode> {
             .unwrap_or(0),
         success_rate: reel("success_rate").unwrap_or(0.0),
         avg_duration_secs: reel("avg_duration_secs").unwrap_or(0.0),
-        last_activated: super::date_propriete(get, "last_activated")?,
+        last_activated: super::date_optionnelle(get, "last_activated", &format!("persona {id}")),
         energy_boost_accumulated: reel("energy_boost_accumulated").unwrap_or(0.0),
         energy_history: chaine("energy_history")
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -293,7 +293,7 @@ fn lire_persona(get: &dyn Fn(&str) -> Option<Value>) -> Result<PersonaNode> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default(),
         created_at,
-        updated_at: super::date_propriete(get, "updated_at")?,
+        updated_at: super::date_optionnelle(get, "updated_at", &format!("persona {id}")),
     })
 }
 
