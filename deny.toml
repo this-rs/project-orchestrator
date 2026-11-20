@@ -19,6 +19,7 @@ yanked = "warn"
 # When a known advisory has no actionable fix yet, document the
 # exception with an explanatory comment + GHSA id below.
 ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — pulled by obrain (the consolidation branch depends on it; bincode 2.x is a breaking change). Remove when obrain migrates off bincode 1.x." },
 
     # ---------------------------------------------------------------------
     # Unmaintained transitive dependencies (informational, not vulnerabilities).
