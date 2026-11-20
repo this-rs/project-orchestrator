@@ -962,7 +962,10 @@ mod tests {
 
     fn assistant(blocks: Vec<ContentBlock>, parent: Option<&str>) -> Message {
         Message::Assistant {
-            message: AssistantMessage { content: blocks },
+            message: AssistantMessage {
+                usage: None,
+                content: blocks,
+            },
             parent_tool_use_id: parent.map(str::to_string),
         }
     }

@@ -1,4 +1,5 @@
 //! Neo4j Code structure, symbols, imports, calls, exploration, impact, and embeddings
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -2586,10 +2587,10 @@ impl Neo4jClient {
                 generics: vec![],
                 is_async: node.get("is_async").unwrap_or(false),
                 is_unsafe: node.get("is_unsafe").unwrap_or(false),
-                complexity: node.get::<i64>("complexity").unwrap_or(0) as u32,
+                complexity: unsigned(node.get::<i64>("complexity").unwrap_or(0), u32::MAX),
                 file_path: node.get("file_path")?,
-                line_start: node.get::<i64>("line_start")? as u32,
-                line_end: node.get::<i64>("line_end")? as u32,
+                line_start: unsigned(node.get::<i64>("line_start")?, u32::MAX),
+                line_end: unsigned(node.get::<i64>("line_end")?, u32::MAX),
                 docstring: node.get("docstring").ok(),
                 owner: node
                     .get::<String>("owner_type")
@@ -3800,7 +3801,7 @@ impl Neo4jClient {
                 implementors.push(TraitImplementorNode {
                     type_name,
                     file_path,
-                    line: row.get::<i64>("line").unwrap_or(0) as u32,
+                    line: unsigned(row.get::<i64>("line").unwrap_or(0), u32::MAX),
                 });
             }
         }
@@ -3870,8 +3871,8 @@ impl Neo4jClient {
                 let trait_name = trait_name.filter(|s| !s.is_empty());
                 blocks.push(ImplBlockDetailNode {
                     file_path,
-                    line_start: row.get::<i64>("line_start").unwrap_or(0) as u32,
-                    line_end: row.get::<i64>("line_end").unwrap_or(0) as u32,
+                    line_start: unsigned(row.get::<i64>("line_start").unwrap_or(0), u32::MAX),
+                    line_end: unsigned(row.get::<i64>("line_end").unwrap_or(0), u32::MAX),
                     trait_name,
                     methods: row.get("methods").unwrap_or_default(),
                 });
@@ -4031,10 +4032,10 @@ impl Neo4jClient {
                 generics: vec![],
                 is_async: node.get("is_async").unwrap_or(false),
                 is_unsafe: node.get("is_unsafe").unwrap_or(false),
-                complexity: node.get::<i64>("complexity").unwrap_or(0) as u32,
+                complexity: unsigned(node.get::<i64>("complexity").unwrap_or(0), u32::MAX),
                 file_path: node.get("file_path")?,
-                line_start: node.get::<i64>("line_start")? as u32,
-                line_end: node.get::<i64>("line_end")? as u32,
+                line_start: unsigned(node.get::<i64>("line_start")?, u32::MAX),
+                line_end: unsigned(node.get::<i64>("line_end")?, u32::MAX),
                 docstring: node.get("docstring").ok(),
                 owner: node
                     .get::<String>("owner_type")

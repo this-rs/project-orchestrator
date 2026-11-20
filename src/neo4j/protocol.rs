@@ -2,6 +2,7 @@
 //!
 //! Implements CRUD operations for Protocol, ProtocolState, and ProtocolTransition
 //! entities on the Neo4j graph.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -14,6 +15,25 @@ use anyhow::{Context, Result};
 use neo4rs::query;
 use tracing::warn;
 use uuid::Uuid;
+
+/// The timeout of a state as the graph stores it: seconds, or `-1` for "no
+/// timeout" (what [`stored_timeout`] writes). Read back as `None`, and the
+/// runner's default applies — never `v as u64` (`-1` would be `u64::MAX`
+/// seconds), and never `Some(0)` (a zero timeout expires the state on the
+/// spot: 0 is "no timeout" too, on both sides).
+fn stored_timeout_secs(stored: i64) -> Option<u64> {
+    u64::try_from(stored).ok().filter(|&s| s > 0)
+}
+
+/// The inverse: what is written for a state's timeout. `None` and `0` are `-1`;
+/// a duration above `i64::MAX` seconds saturates there instead of wrapping to a
+/// negative (`v as i64`), which the reader would take for "no timeout".
+fn stored_timeout(timeout: Option<u64>) -> i64 {
+    match timeout {
+        None | Some(0) => -1,
+        Some(v) => i64::try_from(v).unwrap_or(i64::MAX),
+    }
+}
 
 impl Neo4jClient {
     // ========================================================================
@@ -129,7 +149,10 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
+            state_timeout_secs: node
+                .get::<i64>("state_timeout_secs")
+                .ok()
+                .and_then(stored_timeout_secs),
         })
     }
 
@@ -439,6 +462,26 @@ impl Neo4jClient {
             r#"
             MATCH (proto:Protocol {id: $protocol_id})
             MERGE (s:ProtocolState {id: $id})
+            // `state_timeout_explicit`: this write SET a real timeout the state did not
+            // have (true), or it carries one over (kept), or it writes none (removed).
+            // A value merely read then written back (seed_prompt_fragments) is NOT a
+            // choice, so it earns no marker: that is what lets the boot repair tell a
+            // 255 someone chose from a 255 the driver bug stored (data_migrations.rs).
+            // CORNER CASE, chosen on purpose: a 255 someone CHOOSES on a state that
+            // already holds a phantom 255 is "equal", earns no marker, and is reset
+            // to "no timeout" at the next start. Marking on an equal value would
+            // close it, but would also make every read-then-write of a phantom (an
+            // old binary rewrites 255, a fixed one round-trips it before its next
+            // start) a choice for good — the more frequent of the two while old and
+            // fixed binaries coexist. No path writes `Some(n)` today; the day one
+            // does, choose a value other than the phantom's, or repair first.
+            WITH proto, s,
+                 CASE
+                   WHEN $state_timeout_secs > 0
+                        AND coalesce(s.state_timeout_secs, -1) <> $state_timeout_secs THEN true
+                   WHEN $state_timeout_secs > 0 THEN s.state_timeout_explicit
+                   ELSE null
+                 END AS timeout_explicit
             SET s.protocol_id = $protocol_id,
                 s.name = $name,
                 s.description = $description,
@@ -451,7 +494,8 @@ impl Neo4jClient {
                 s.prompt_fragment = $prompt_fragment,
                 s.available_tools_json = $available_tools_json,
                 s.forbidden_actions_json = $forbidden_actions_json,
-                s.state_timeout_secs = $state_timeout_secs
+                s.state_timeout_secs = $state_timeout_secs,
+                s.state_timeout_explicit = timeout_explicit
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -512,7 +556,7 @@ impl Neo4jClient {
         )
         .param(
             "state_timeout_secs",
-            state.state_timeout_secs.map(|v| v as i64).unwrap_or(-1),
+            stored_timeout(state.state_timeout_secs),
         );
 
         self.graph
@@ -768,8 +812,8 @@ impl Neo4jClient {
             triggered_by: node
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),
-            depth: node.get::<i64>("depth").unwrap_or(0) as u32,
-            version: node.get::<i64>("version").unwrap_or(0) as u64,
+            depth: unsigned(node.get::<i64>("depth").unwrap_or(0), u32::MAX),
+            version: unsigned(node.get::<i64>("version").unwrap_or(0), u64::MAX),
             runner_managed: node.get::<bool>("runner_managed").unwrap_or(false),
         })
     }
@@ -1257,7 +1301,7 @@ impl Neo4jClient {
             run_id: node.get::<String>("run_id")?.parse()?,
             generated_by: node.get::<String>("generated_by")?.parse()?,
             name: node.get("name")?,
-            index: node.get::<i64>("index").unwrap_or(0) as u32,
+            index: unsigned(node.get::<i64>("index").unwrap_or(0), u32::MAX),
             sub_protocol_id: node
                 .get::<String>("sub_protocol_id")
                 .ok()
@@ -1644,4 +1688,36 @@ pub struct ProducedArtefact {
     pub produced_at: chrono::DateTime<chrono::Utc>,
     /// Content preview (first 200 chars)
     pub summary: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stored_timeout, stored_timeout_secs};
+
+    #[test]
+    fn a_negative_stored_timeout_is_no_timeout() {
+        assert_eq!(stored_timeout_secs(-1), None);
+        assert_eq!(stored_timeout_secs(i64::MIN), None);
+        assert_eq!(stored_timeout_secs(255), Some(255));
+        assert_eq!(stored_timeout_secs(i64::MAX), Some(i64::MAX as u64));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_no_timeout_on_both_sides() {
+        // Read: 0 would expire the state at once (`Duration::from_secs(0)`).
+        assert_eq!(stored_timeout_secs(0), None);
+        // Write: normalised to the sentinel, so the graph never holds a 0.
+        assert_eq!(stored_timeout(Some(0)), -1);
+    }
+
+    #[test]
+    fn a_timeout_is_written_as_is_and_never_wraps_negative() {
+        assert_eq!(stored_timeout(None), -1);
+        assert_eq!(stored_timeout(Some(1)), 1);
+        assert_eq!(stored_timeout(Some(255)), 255);
+        assert_eq!(stored_timeout(Some(i64::MAX as u64)), i64::MAX);
+        // `u64::MAX as i64` is -1: it would be read back as "no timeout".
+        assert_eq!(stored_timeout(Some(i64::MAX as u64 + 1)), i64::MAX);
+        assert_eq!(stored_timeout(Some(u64::MAX)), i64::MAX);
+    }
 }

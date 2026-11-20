@@ -1135,6 +1135,10 @@ impl ChatManager {
     /// thread by this server, with a warning naming why — the child is closed right after,
     /// so nothing of it can run the call any more. It used to write nothing then, and the
     /// request stayed pending in the owner's attention.
+    ///
+    /// Also what the idle cleanup does before it closes a session that waited on a person
+    /// past the wait cap (`ChatManager::close_if_still_expired`): the request is refused on
+    /// the thread, never left orphaned under a `session_closed`.
     pub(crate) async fn deny_waiting_permissions(&self, sid: &str) {
         let live = self.agent_runtime.get(sid).await;
         let mut ids: Vec<String> = match &live {
@@ -1170,14 +1174,14 @@ impl ChatManager {
                 {
                     Ok(_) => continue,
                     Err(e) => tracing::warn!(
-                        child = %sid, request = %id, error = %e,
-                        "the provider did not take the sub-agent's deny: the refusal is written on its thread, and it is closed"
+                        session_id = %sid, request = %id, error = %e,
+                        "the provider did not take the deny: the refusal is written on the session's thread, and it is closed"
                     ),
                 }
             } else {
                 tracing::info!(
-                    child = %sid, request = %id,
-                    "sub-agent not live here: its undecided permission request is refused on its thread"
+                    session_id = %sid, request = %id,
+                    "session not live here: its undecided permission request is refused on its thread"
                 );
             }
             self.deny_on_thread_if_undecided(sid, &id, live.as_deref())

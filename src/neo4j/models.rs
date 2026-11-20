@@ -1066,6 +1066,21 @@ pub struct StepNode {
     pub persona: Option<String>,
 }
 
+/// What deleting a task removed along with it.
+///
+/// A task owns its steps and the decisions recorded on it
+/// (`(Task)-[:INFORMED_BY]->(Decision)`): deleting the task deletes them, as
+/// deleting a plan or a project does. That used to happen behind a `()`: the
+/// caller learned of the lost decisions when reading one answered 404
+/// (issue #1189). The cascade is unchanged; it is now reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDeletion {
+    /// Steps deleted with the task.
+    pub steps_deleted: usize,
+    /// Decisions deleted with the task.
+    pub deleted_decision_ids: Vec<Uuid>,
+}
+
 /// Status of a step
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -670,6 +670,15 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
+      # The marker of a TEST database: the writing suites refuse a Neo4j without it
+      # (tests/common/harness.rs), whatever port the service got. Written by the
+      # workflow that provisions the database, never by a test.
+      - name: Mark the Neo4j service as a test database
+        run: |
+          curl -sf -u neo4j:testpassword -H 'Content-Type: application/json' \
+            -X POST "http://localhost:${{ job.services.neo4j.ports['7474'] }}/db/neo4j/tx/commit" \
+            -d '{"statements":[{"statement":"MERGE (:__Harnais {name: \"ci\"})"}]}' > /dev/null
+
       - name: Run integration tests
         env:
           NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
@@ -689,11 +698,71 @@ jobs:
           # because something answers Cypher — hops, cache, unknown centre, stratified pick.
           # store_conformance: the one GraphStore conformance suite, instantiated per backend
           # (mock AND this Neo4j); REQUIRED, so its neo4j:: half never skips silently.
+          # anchor_sweeps_unscoped: the UNSCOPED anchor sweeps through the trait, one test
+          # alone in its binary (they write to every session: no parallel neighbour allowed).
+          # neo4j_integer_fidelity: what the server holds is what the driver reads (the
+          # integers -16..=-1 were read 240..=255, see vendor/neo4rs/PATCH.md) and a state
+          # without timeout stays without one. The only place the vendored driver is tested.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
+            --test anchor_sweeps_unscoped \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
-            --test file_paths --test neural_routing_sampler --test note_sweep
+            --test file_paths --test neural_routing_sampler --test note_sweep \
+            --test neo4j_integer_fidelity
+
+  # ==========================================================================
+  # Obrain backend — the one job that COMPILES AND RUNS the `obrain-backend`
+  # feature. Without it nothing executes src/obrain/: clippy --all-features
+  # compiles it, nextest runs the default features, and the assertion that counts
+  # the refused methods (tests/obrain_backend.rs) would protect nothing.
+  #
+  # No service: every base is a temporary directory, and the project conformance
+  # checks of the `obrain_project::` module need neither Neo4j nor Meilisearch
+  # (the `mock_project::`/`neo4j_project::` halves run in the jobs that have them).
+  # The kill -9 and inter-process tests re-execute this test binary as their child.
+  # ==========================================================================
+  obrain-backend:
+    name: Obrain backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-obrain-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: false
+
+      - name: Run the obrain backend tests and its share of the conformance suite
+        run: |
+          cargo test --features obrain-backend --test obrain_backend --test store_conformance \
+            --example obrain_mesures -- obrain_project:: with_the_feature an_unknown
+
+      # The task-and-step portage suite had no job at all, and it was measured
+      # red for a while without anybody seeing it (16/11/2026: three tests,
+      # including one that asserted the full flush per blob-sized write that
+      # obrain #172/#175 and the removal of `flush_complet` had just retired).
+      # A portage suite nothing runs is worse than no suite: it reads as
+      # coverage. No filter: every test of the file runs, and the compilation is
+      # already warm from the step above.
+      # `obrain_dates` rides along: it proves a migrated `ZonedDatetime` is READ
+      # (not replaced by `Utc::now()`), and the two suites are the same kind of
+      # guard — a portage behaviour nothing else asserts.
+      - name: Run the task-and-step and date portage tests
+        run: cargo test --features obrain-backend --test obrain_taches --test obrain_dates
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -905,6 +974,13 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "Neo4j + Meilisearch ready"
 
+      # The marker of a TEST database (tests/common/harness.rs): see the integration job.
+      - name: Mark the Neo4j service as a test database
+        run: |
+          curl -sf -u neo4j:testpassword -H 'Content-Type: application/json' \
+            -X POST "http://localhost:${{ job.services.neo4j.ports['7474'] }}/db/neo4j/tx/commit" \
+            -d '{"statements":[{"statement":"MERGE (:__Harnais {name: \"ci\"})"}]}' > /dev/null
+
       # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
       # into a single lcov (`--no-report` accumulates, `llvm-cov report` merges).
       # One run cannot do it: the unit tests span the whole workspace while the
@@ -978,13 +1054,15 @@ jobs:
             --test workspace_tests \
             --test neo4j_store_tests \
             --test harness_neo4j \
+            --test anchor_sweeps_unscoped \
             --test neo4j_decision_project \
             --test self_graph \
             --test code_graph_stable_key \
             --test file_paths \
             --test neural_routing_sampler \
             --test store_conformance \
-            --test note_sweep
+            --test note_sweep \
+            --test neo4j_integer_fidelity
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov

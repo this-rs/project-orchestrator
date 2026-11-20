@@ -18,17 +18,19 @@
 //!
 //! Run with:
 //! ```text
-//! NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpassword \
+//! NEO4J_URI=bolt://localhost:17687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpassword \
 //!   cargo test --test neo4j_store_tests
 //! ```
 //!
 //! Every test allocates fresh UUIDs and deletes what it created, so the suite
 //! is safe to run repeatedly against the same database and in parallel.
 //!
-//! WARNING: point `NEO4J_URI` at a disposable instance. The default
-//! `bolt://localhost:7687` is a real Neo4j on many dev machines.
+//! The target comes from `common::harness::neo4j_target`: the harness port 17687
+//! by default, and a refusal (never a skip) for the live service's 7687.
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
+
+mod common;
 
 use neo4rs::query;
 use project_orchestrator::chat::provider::cognitive::segment::{
@@ -49,9 +51,11 @@ use uuid::Uuid;
 /// skipped suite exits 0 and uploads a coverage report full of zeroes — so
 /// when `CI` is set, an unreachable Neo4j is a hard failure.
 async fn store() -> Option<Neo4jClient> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
 
     match Neo4jClient::new(&uri, &user, &password).await {
         Ok(client) => Some(client),
@@ -2075,9 +2079,11 @@ async fn the_windowed_reads_only_return_what_is_inside_the_window() {
 /// A raw connection for the Cypher the store does not expose: the fixtures below put
 /// rows in the shape the queries read, including the malformed ones the store must skip.
 async fn raw_graph() -> neo4rs::Graph {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     neo4rs::Graph::new(&uri, &user, &password)
         .await
         .expect("the raw connection opens once the store one did")

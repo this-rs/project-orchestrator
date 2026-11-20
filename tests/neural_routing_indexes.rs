@@ -18,6 +18,8 @@
 //!
 //!   docker run -d --rm --name po-nn -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
 //!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --test neural_routing_indexes
+mod common;
+
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
@@ -94,9 +96,11 @@ async fn bolt_reachable(uri: &str) -> bool {
 /// hard failure under `HARNESS_NEO4J_REQUIRED`, the switch the integration-tests
 /// CI job exports for every Neo4j suite).
 async fn store() -> Option<Arc<Neo4jTrajectoryStore>> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
 
     let connected = if bolt_reachable(&uri).await {
         neo4rs::Graph::new(&uri, &user, &password)

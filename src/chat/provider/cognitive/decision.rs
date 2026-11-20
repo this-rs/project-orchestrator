@@ -354,6 +354,11 @@ pub struct DecideRequest {
     /// `; segment: <note>` so a stored decision names why a direction changed.
     /// `None` when no boundary confirmed on this turn.
     pub segment_note: Option<String>,
+    /// Tokens du préfixe de prompt en force dans la session (ce que le cache du modèle
+    /// courant tient), tel que le fournisseur l'a rapporté après le tour précédent
+    /// (`TurnContext::context_tokens`). `None` = inconnu : aucune règle de coût de cache
+    /// ne s'applique. Jamais `0` par défaut, jamais estimé.
+    pub prefix_tokens: Option<u64>,
 }
 
 impl DecideRequest {
@@ -375,6 +380,7 @@ impl DecideRequest {
             steady: false,
             narrowed: Vec::new(),
             segment_note: None,
+            prefix_tokens: None,
         }
     }
 }

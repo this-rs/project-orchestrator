@@ -1,4 +1,5 @@
-# Everything is resolved from crates.io or from a git rev: no local patch.
+# Everything is resolved from crates.io or from a git rev, except neo4rs: a local
+# copy under vendor/neo4rs ([patch.crates-io] in Cargo.toml, see its PATCH.md).
 
 # `cargo xtask <subcommand>`: the after-merge checks of xtask/ (a standalone
 # std-only crate, excluded from the workspace). Run from the repo root.

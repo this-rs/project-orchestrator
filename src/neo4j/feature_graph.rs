@@ -1,4 +1,5 @@
 //! Neo4j Feature Graph operations
+use super::unsigned::unsigned_opt;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -1530,7 +1531,10 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| chrono::Utc::now()),
             entity_count: None,
             entry_function: node.get::<String>("entry_function").ok(),
-            build_depth: node.get::<i64>("build_depth").ok().map(|d| d as u32),
+            build_depth: node
+                .get::<i64>("build_depth")
+                .ok()
+                .and_then(unsigned_opt::<u32>),
             include_relations: node
                 .get::<String>("include_relations")
                 .ok()

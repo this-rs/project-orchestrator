@@ -49,7 +49,10 @@ impl Neo4jClient {
                 .get::<String>("complexity_default")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            timeout_secs: node.get::<i64>("timeout_secs").ok().map(|v| v as u64),
+            timeout_secs: node
+                .get::<i64>("timeout_secs")
+                .ok()
+                .and_then(super::unsigned::unsigned_opt::<u64>),
             max_cost_usd: node.get("max_cost_usd").ok(),
             model_preference: node
                 .get::<String>("model_preference")
@@ -2253,6 +2256,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::client::Neo4jClient;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::*;
     #[allow(unused_imports)]
@@ -3271,5 +3275,33 @@ mod tests {
         // energy_boost_accumulated can be set
         p.energy_boost_accumulated = 0.25;
         assert!((p.energy_boost_accumulated - 0.25).abs() < f64::EPSILON);
+    }
+
+    /// A persona's timeout is seconds, or absent. The graph's "none" (-1) must not
+    /// become `u64::MAX` seconds (`-1 as u64`), nor a value that wrapped.
+    #[test]
+    fn a_negative_stored_persona_timeout_is_none() {
+        use neo4rs::{BoltInteger, BoltList, BoltNode, BoltString, BoltType};
+        let read = |timeout: i64| {
+            let props = [
+                ("id", BoltType::from(Uuid::new_v4().to_string())),
+                ("name", BoltType::from("p")),
+                ("created_at", BoltType::from(Utc::now().to_rfc3339())),
+                ("updated_at", BoltType::from(Utc::now().to_rfc3339())),
+                ("timeout_secs", BoltType::from(timeout)),
+            ];
+            let node = neo4rs::Node::new(BoltNode::new(
+                BoltInteger::new(1),
+                BoltList::new(),
+                props
+                    .into_iter()
+                    .map(|(k, v)| (BoltString::new(k), v))
+                    .collect(),
+            ));
+            Neo4jClient::node_to_persona(&node).unwrap().timeout_secs
+        };
+        assert_eq!(read(-1), None);
+        assert_eq!(read(-16), None);
+        assert_eq!(read(600), Some(600));
     }
 }

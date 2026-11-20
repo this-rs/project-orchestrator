@@ -109,9 +109,17 @@ pub fn generer(racine: &Path, sortie: &Path) {
                 continue;
             }
             let nom_trait = t.ident.to_string();
-            let fait_main = portes
+            // The methods the hand-written impl of this trait for this target WRITES.
+            let ecrites: Option<Vec<String>> = portes
                 .iter()
-                .any(|(tr, ty)| *tr == nom_trait && ty == cible_courte);
+                .filter(|(tr, ty, _)| *tr == nom_trait && ty == cible_courte)
+                .map(|(_, _, ms)| ms.clone())
+                .reduce(|mut a, b| {
+                    a.extend(b);
+                    a
+                });
+            let fait_main = ecrites.is_some();
+            let ecrites = ecrites.unwrap_or_default();
 
             let mut methodes = String::new();
             for membre in &t.items {
@@ -123,6 +131,17 @@ pub fn generer(racine: &Path, sortie: &Path) {
                 };
                 let nom = format!("{nom_trait}::{}", f.sig.ident);
                 if fait_main {
+                    // A hand-written impl must WRITE every method of its trait. One
+                    // left out would inherit the contract's default body in silence,
+                    // and `Ok(vec![])` is exactly what this backend must never answer.
+                    let ident = f.sig.ident.to_string();
+                    assert!(
+                        ecrites.contains(&ident),
+                        "refus obrain : {nom} manque dans l'impl écrit à la main de \
+                         {nom_trait} pour {cible_courte} (src/obrain/). Écrivez-la, en refus \
+                         nommé si le domaine ne la porte pas : la laisser hériter du défaut du \
+                         contrat répondrait en silence."
+                    );
                     portees.push(nom);
                     continue;
                 }
@@ -191,10 +210,13 @@ pub fn generer(racine: &Path, sortie: &Path) {
         .unwrap_or_else(|e| panic!("refus obrain : écriture de {} : {e}", sortie.display()));
 }
 
+/// Exactly `#[cfg(test)]`, not any attribute whose text contains "test"
+/// (`#[cfg(not(test))]`, `#[cfg(feature = "mock-store")]`).
 fn est_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test"))
+    attrs.iter().any(|a| match &a.meta {
+        syn::Meta::List(l) => l.path.is_ident("cfg") && l.tokens.to_string() == "test",
+        _ => false,
+    })
 }
 
 fn rend_un_result(sortie: &syn::ReturnType) -> bool {
@@ -208,8 +230,8 @@ fn rend_un_result(sortie: &syn::ReturnType) -> bool {
 }
 
 /// Every `impl <Trait> for <Type>` at the top level of the files under `dir`,
-/// as `(trait, type)` short names.
-fn impls_ecrits_a_la_main(dir: &Path) -> Vec<(String, String)> {
+/// as `(trait, type, methods written)`, short names.
+fn impls_ecrits_a_la_main(dir: &Path) -> Vec<(String, String, Vec<String>)> {
     let mut fichiers: Vec<PathBuf> = Vec::new();
     lister_rs(dir, &mut fichiers);
     let mut out = Vec::new();
@@ -227,7 +249,15 @@ fn impls_ecrits_a_la_main(dir: &Path) -> Vec<(String, String)> {
                 continue;
             };
             if let (Some(tr), Some(ty)) = (chemin_trait.segments.last(), ty.path.segments.last()) {
-                out.push((tr.ident.to_string(), ty.ident.to_string()));
+                let methodes = i
+                    .items
+                    .iter()
+                    .filter_map(|m| match m {
+                        syn::ImplItem::Fn(f) => Some(f.sig.ident.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                out.push((tr.ident.to_string(), ty.ident.to_string(), methodes));
             }
         }
     }

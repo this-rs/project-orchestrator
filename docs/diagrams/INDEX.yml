@@ -459,3 +459,6 @@ diagrams:
       - "backend:docs/storage/**"
       - "backend:src/neo4j/graph_sampler.rs"
       - "backend:src/obrain/**"
+      # Lecture des entiers non signes (compte, taille, duree) depuis le graphe : un
+      # negatif est 0 ou None, jamais un geant. Transverse a tous les lecteurs src/neo4j/.
+      - "backend:src/neo4j/unsigned.rs"

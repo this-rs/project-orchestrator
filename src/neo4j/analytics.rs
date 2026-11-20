@@ -4,6 +4,7 @@ use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
+use super::unsigned::unsigned;
 use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
@@ -2325,12 +2326,12 @@ impl Neo4jClient {
                 cc_pagerank: row.get("cc_pagerank").unwrap_or(0.0),
                 cc_betweenness: row.get("cc_betweenness").unwrap_or(0.0),
                 cc_clustering: row.get("cc_clustering").unwrap_or(0.0),
-                cc_community_id: row.get::<i64>("cc_community_id").unwrap_or(0) as u32,
+                cc_community_id: unsigned(row.get::<i64>("cc_community_id").unwrap_or(0), u32::MAX),
                 cc_community_label: row.get("cc_community_label").unwrap_or_default(),
-                cc_imports_out: row.get::<i64>("cc_imports_out").unwrap_or(0) as usize,
-                cc_imports_in: row.get::<i64>("cc_imports_in").unwrap_or(0) as usize,
-                cc_calls_out: row.get::<i64>("cc_calls_out").unwrap_or(0) as usize,
-                cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
+                cc_imports_out: unsigned(row.get::<i64>("cc_imports_out").unwrap_or(0), usize::MAX),
+                cc_imports_in: unsigned(row.get::<i64>("cc_imports_in").unwrap_or(0), usize::MAX),
+                cc_calls_out: unsigned(row.get::<i64>("cc_calls_out").unwrap_or(0), usize::MAX),
+                cc_calls_in: unsigned(row.get::<i64>("cc_calls_in").unwrap_or(0), usize::MAX),
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
                 cc_fingerprint: {
@@ -2396,12 +2397,12 @@ impl Neo4jClient {
                 cc_pagerank: row.get("cc_pagerank").unwrap_or(0.0),
                 cc_betweenness: row.get("cc_betweenness").unwrap_or(0.0),
                 cc_clustering: row.get("cc_clustering").unwrap_or(0.0),
-                cc_community_id: row.get::<i64>("cc_community_id").unwrap_or(0) as u32,
+                cc_community_id: unsigned(row.get::<i64>("cc_community_id").unwrap_or(0), u32::MAX),
                 cc_community_label: row.get("cc_community_label").unwrap_or_default(),
-                cc_imports_out: row.get::<i64>("cc_imports_out").unwrap_or(0) as usize,
-                cc_imports_in: row.get::<i64>("cc_imports_in").unwrap_or(0) as usize,
-                cc_calls_out: row.get::<i64>("cc_calls_out").unwrap_or(0) as usize,
-                cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
+                cc_imports_out: unsigned(row.get::<i64>("cc_imports_out").unwrap_or(0), usize::MAX),
+                cc_imports_in: unsigned(row.get::<i64>("cc_imports_in").unwrap_or(0), usize::MAX),
+                cc_calls_out: unsigned(row.get::<i64>("cc_calls_out").unwrap_or(0), usize::MAX),
+                cc_calls_in: unsigned(row.get::<i64>("cc_calls_in").unwrap_or(0), usize::MAX),
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
                 cc_fingerprint: {

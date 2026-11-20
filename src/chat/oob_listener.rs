@@ -1341,6 +1341,7 @@ mod tests {
     #[test]
     fn test_assistant_text_concatenates_blocks() {
         let m = AssistantMessage {
+            usage: None,
             content: vec![
                 ContentBlock::Text(TextContent {
                     text: "Hello".into(),
@@ -1823,7 +1824,10 @@ mod tests {
 
     fn assistant_with(parent: Option<&str>, blocks: Vec<ContentBlock>) -> Message {
         Message::Assistant {
-            message: AssistantMessage { content: blocks },
+            message: AssistantMessage {
+                usage: None,
+                content: blocks,
+            },
             parent_tool_use_id: parent.map(str::to_string),
         }
     }

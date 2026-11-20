@@ -12,6 +12,8 @@
 //! Chaque test crée son propre projet (slug unique) et le supprime : le job partage une seule
 //! base entre plusieurs suites.
 
+mod common;
+
 use chrono::Utc;
 use neo4rs::{query, Graph};
 use project_orchestrator::graph::rules;
@@ -39,9 +41,11 @@ struct Env {
 }
 
 async fn env(label: &str) -> Option<Env> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
 
     let connected = async {
         let client = Neo4jClient::new(&uri, &user, &password).await.ok()?;

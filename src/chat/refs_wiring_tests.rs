@@ -344,6 +344,7 @@ async fn the_system_prompt_teaches_citations_only_when_refs_v1_is_on() {
 fn answers(text: &str) -> Message {
     Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::Text(TextContent { text: text.into() })],
         },
         parent_tool_use_id: None,

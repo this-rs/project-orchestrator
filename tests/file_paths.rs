@@ -8,10 +8,12 @@
 //! for `data_migrations`):
 //!   docker run -d --rm --name po-t7 -p 17688:7687 -e NEO4J_AUTH=neo4j/testpassword \
 //!     -e NEO4J_PLUGINS='["apoc"]' neo4j:5.26
-//!   NEO4J_URI=bolt://localhost:17688 NEO4J_PASSWORD=testpassword cargo test --test file_paths
+//!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --test file_paths
 //!
 //! The tests print a notice and return when no Neo4j is reachable;
 //! `HARNESS_NEO4J_REQUIRED=1` turns that into a failure.
+mod common;
+
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
@@ -28,9 +30,11 @@ struct Env {
 }
 
 async fn env() -> Option<Env> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17688".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     let connected = async {
         let client = Neo4jClient::new(&uri, &user, &password).await.ok()?;
         let raw = Graph::new(&uri, &user, &password).await.ok()?;
@@ -1144,9 +1148,11 @@ async fn the_cli_dispatches_the_migration_and_forwards_its_exit_code() {
     let Some(env) = env().await else {
         return;
     };
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17688".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     let orchestrator = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_orchestrator"))
             .args(["migrate", "file-paths"])

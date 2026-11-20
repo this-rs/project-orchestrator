@@ -48,7 +48,7 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # Trixie (Debian 13) provides glibc 2.40, required because ort-sys prebuilt
 # ONNX Runtime binaries reference __isoc23_* symbols (glibc ≥ 2.38).
 # Bookworm (glibc 2.36) fails with "undefined symbol: __isoc23_strtoll".
-FROM rust:1.99-trixie AS builder
+FROM rust:1.100-trixie AS builder
 
 WORKDIR /app
 
@@ -78,6 +78,20 @@ RUN sed -i 's/, "desktop\/src-tauri"//' Cargo.toml
 
 # Copy local crates (path dependencies referenced in Cargo.toml)
 COPY crates ./crates/
+
+# Local copy of neo4rs (the [patch.crates-io] entry, see vendor/neo4rs/PATCH.md):
+# a path dependency too, so it has to be here before the dependency-cache layer
+# runs — and it is the only reason this list is not just Cargo.toml + crates/ + src/.
+COPY vendor ./vendor/
+
+# Examples are declared as targets in Cargo.toml ([[example]] name = "mem_embed",
+# MEM-1). Cargo REFUSES to parse the manifest when a declared target file is
+# absent: `cargo build` does not build examples, but it validates every target
+# path first. Without this line every image build dies on
+#   error: Cargo.toml: can't find `mem_embed` example at `examples/mem_embed.rs`
+# and because that parse happens before anything compiles, the dependency-cache
+# layer below fails too (masked by `|| true`) instead of caching a build.
+COPY examples ./examples
 
 # Create dummy source files to build dependencies.
 # This must match the actual module layout so the dep-cache layer is valid.
@@ -133,7 +147,7 @@ RUN cargo build --release
 # =============================================================================
 # Built at the nexus revision Cargo.toml pins, with https (`--features tls`), by the same script as
 # the release archives and the CI. Its own stage: it only reruns when Cargo.toml changes.
-FROM rust:1.99-trixie AS nexus-tools-builder
+FROM rust:1.100-trixie AS nexus-tools-builder
 WORKDIR /src
 COPY Cargo.toml ./
 COPY scripts/build-nexus-tools.sh ./scripts/

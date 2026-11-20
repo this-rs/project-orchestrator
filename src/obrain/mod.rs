@@ -5,44 +5,145 @@
 //! on an embedded obrain base, **one domain at a time**. What is ported is
 //! written by hand here (one file per domain); everything else is refused by
 //! name — see [`NonPorte`] and `build/refus_obrain.rs`, which generates those
-//! refusals from the contracts so that none is written, or forgotten, by hand.
+//! refusals from the contracts so that none is written, or forgotten, by hand,
+//! and which FAILS THE BUILD if a hand-written `impl` leaves out a method of
+//! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), the core of [`PlanStore`](crate::neo4j::traits::PlanStore)
+//! (`plan.rs`: no tasks, steps or day plan yet; its constraints and its links
+//! to projects are written in `constraint.rs`),
+//! (`project.rs`), [`PlanStore`](crate::neo4j::traits::PlanStore) (`plan.rs`;
+//! tasks, dependencies, waves and day plan in `task.rs`, steps in `step.rs`;
+//! no constraints yet),
+//! [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
+//! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
+//! for releases, environments, deployments and milestones (`release.rs`), whose
+//! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
+//! [`ProtocolStore`](crate::neo4j::traits::ProtocolStore) (`protocol.rs`, all 11
+//! methods) and [`ProtocolRunStore`](crate::neo4j::traits::ProtocolRunStore)
+//! (`protocolrun.rs`, 14 of its 18; the four that name notes, decisions or
+//! reasoning trees are refused by name),
+//! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
+//! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), the note
+//! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
+//! methods; the others are refused by name there), and the node part of
+//! [`FederationStore`](crate::neo4j::traits::FederationStore)
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name),
+//! and the decision node of [`DecisionStore`](crate::neo4j::traits::DecisionStore)
+//! (`decision.rs`: the node, its direct project and its supersession are ported;
+//! the task-bound creation, the AFFECTS edges and the embeddings are refused by name).
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name),
+//! [`SkillStore`](crate::neo4j::traits::SkillStore) (`skill.rs`: skills, their note
+//! members, activation and the published-skill registry; `create_used_skill_relation` is
+//! refused by name, and some calls that reach a Decision are refused in context) and
+//! [`SharingStore`](crate::neo4j::traits::SharingStore) (`sharing.rs`: policy, note
+//! consent, events, tombstones; the decision consent is refused by name).
 //!
 //! # How obrain is used
 //!
-//! - Through its **Rust API** (`ObrainDB::create_node_with_props`,
-//!   `set_node_property`, `delete_node`, …), not through a query language: the
-//!   Cypher front-end is not covered by obrain's default CI, and one grouping
-//!   form is under investigation.
-//! - Those direct writes are outside any obrain transaction and are made
-//!   durable by `commit_wal()` (obrain `docs/LIMITES-v0.0.1.md`). So every
-//!   mutation here runs under ONE write lock, validates before it writes, and
-//!   ends with `commit_wal()`, the durability point obrain documents. What the
-//!   tests prove is narrower: a write survives a reopen without a clean close
-//!   (the process-crash model). That test passes with `commit_wal` removed
-//!   too (measured), so the fsync itself is NOT covered by a test here.
+//! - Through its **Rust API** (`ObrainDB::create_node`, `set_node_property`,
+//!   `delete_node`, …), not through a query language: the Cypher front-end is
+//!   not covered by obrain's default CI, and one grouping form is under
+//!   investigation.
+//! - Those direct writes are outside any obrain transaction: each property is
+//!   its own WAL record and there is no multi-property atomic write. Atomicity
+//!   is therefore built here, by ordering (see `project.rs`: a draft marker
+//!   written first and removed last, repaired at open).
+//! - **Durability** is the WAL fsync (`ObrainDB::flush_wal`), once per write,
+//!   which obrain documents as the source of truth that replay rebuilds the rest
+//!   from. Since obrain #123, a value above 256 bytes — a `String`, a `Bytes`, or
+//!   a bincode-encoded `List`/`Map`/`Path` — is journaled in the WAL WITH its
+//!   value (`BlobColumnWrite`/`BlobColumnClear` frames) and replayed on reopen,
+//!   so a write that carries one no longer pays the full flush per write. The
+//!   full flush (`commit_wal`) runs every [`FLUSH_COMPLET_TOUS_LES`] writes, once
+//!   [`FLUSH_COMPLET_APRES_OCTETS`] bytes of values have been written since the
+//!   last one, and at close: it bounds the WAL a restart replays (obrain
+//!   truncates its WAL only inside a full flush).
+//! - Two classes of value are still NOT recovered by obrain's WAL: a
+//!   `Value::Vector` (its `VecColumnWrite` frame carries no value) and a blob
+//!   value above obrain's `BLOB_WAL_MAX_BYTES` (32 MiB, [`PLAFOND_WAL_OBRAIN`]).
+//!   Every property write of a write closure goes through ONE point,
+//!   `Ecriture::poser` / `Ecriture::poser_arete` (a source scan in this module's
+//!   tests forbids a direct `set_node_property` / `set_edge_property` elsewhere),
+//!   and that point runs the full flush RIGHT AFTER writing such a value, before
+//!   anything else the closure writes (the draft marker's removal, a later
+//!   property): the value is on disk before the write can be acknowledged or
+//!   look committed. A full flush rather than a refusal because obrain's direct
+//!   API has no rollback: a refusal in the middle of a closure would leave the
+//!   properties written before it applied and unacknowledged.
+//! - **Known limit, obrain's, not closed here**: when obrain fails to APPEND a
+//!   value's frame to the WAL (`BlobColumnWrite`, or the inline `PropSetInline`),
+//!   it logs the failure (`tracing::error!`) and returns normally; the next
+//!   `flush_wal` fsyncs what was appended and returns `Ok`. The write is then
+//!   acknowledged by this backend while its value would not survive a kill
+//!   before the next full flush. obrain keeps no error on its writer for the
+//!   next fsync to return (obrain-db/obrain#161). The fsync itself is
+//!   proved by obrain's own counter (`wal_fsyncs`); what a power cut does to an
+//!   acknowledged write is obrain's guarantee, not re-proved here.
 //! - obrain addresses a node by an internal `NodeId`; the domain addresses it
 //!   by `Uuid`. The index between the two lives in memory and is **rebuilt
-//!   from the persisted nodes at every open** (`Etat::reconstruire`).
+//!   from the persisted nodes at every open** (a scan of the node zone: O(nodes),
+//!   measured in `examples/obrain_mesures.rs`).
 //! - **PO is the single writer** of the base. obrain v0.0.1 does not guarantee
 //!   properties written by two processes; it takes an exclusive lock on the
 //!   directory at open, and refuses a second writable handle in the same
 //!   process. This module adds nothing to that lock and never opens the base
 //!   in shared-write mode.
-//! - obrain calls are synchronous (mmap, fsync): they run on the blocking
-//!   pool, never on a runtime worker.
+//!
+//! # Locks
+//!
+//! Two levels, so that nobody reads behind an fsync:
+//! - `ecrivain` serializes WRITERS from validation to fsync;
+//! - `etat` (the indexes, which hold the decoded projects) is write-locked only
+//!   to publish a write — AFTER its fsync — never around disk or fsync. A reader
+//!   waits, at worst, for a handful of in-memory operations, and is served the
+//!   previous state until the write is durable (create, update, delete alike).
+//!
+//! Reads are served inline (obrain reads are mmap and hash lookups); writes run
+//! on the blocking pool.
 
+mod auth;
+mod chat;
+mod code;
+mod commit;
+mod constraint;
+mod decision;
+mod featuregraph;
+mod federation;
+#[cfg(any(test, feature = "mock-store"))]
+mod mesure;
+mod note;
+mod persona;
+mod plan;
+mod planrun;
 mod project;
+mod protocol;
+mod protocolrun;
+mod release;
+mod sharing;
+mod skill;
+mod step;
+mod task;
+mod trigger;
+mod workspace;
 
+#[cfg(any(test, feature = "mock-store"))]
+pub use mesure::{Durabilite, Interruption, ValeurBrute};
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_engine::ObrainDB;
+use uuid::Uuid;
 
+use crate::neo4j::models::{ProgressKind, TaskCounts};
 use crate::neo4j::traits::{GraphStore, StoreCapabilities};
 
 // The refusals: one generated `impl` per trait no file of this module
@@ -63,15 +164,338 @@ pub fn methodes_refusees() -> &'static [&'static str] {
     REFUSEES
 }
 
-/// Every contract method of a trait implemented by hand, as `<Trait>::<method>`.
+/// Every method of a trait implemented by hand, as `<Trait>::<method>`. The
+/// build has checked that each one is written (see `build/refus_obrain.rs`).
 pub fn methodes_portees() -> &'static [&'static str] {
     PORTEES
+}
+
+/// The methods of `NoteStore` refused on every call, as `NoteStore::<method>`
+/// (`note.rs`). Three more note methods refuse only in some cases.
+pub fn refusees_note() -> &'static [&'static str] {
+    note::REFUSEES
+}
+
+/// The methods of `CommitStore` refused on every call, as
+/// `CommitStore::<method>` (`commit.rs`): the dependency analysis (the code
+/// graph), the task links, and the freshness ping over `Note → File` links.
+pub fn refusees_commit() -> &'static [&'static str] {
+    commit::REFUSEES
+}
+
+/// The methods of `ReleaseStore` refused on every call, as
+/// `ReleaseStore::<method>` (`release.rs`): they read or link a `Task`, a
+/// `Plan`, a `Commit` or a `Step`, domains not yet ported.
+pub fn refusees_release() -> &'static [&'static str] {
+    release::REFUSEES
+}
+
+/// The methods of `ChatStore` refused on every call, as `ChatStore::<method>`
+/// (`chat.rs`).
+pub fn refusees_chat() -> &'static [&'static str] {
+    chat::REFUSEES
+}
+
+/// The methods of `DecisionStore` refused on every call, as
+/// `DecisionStore::<method>` (`decision.rs`): the task-bound creation, the
+/// AFFECTS edges to code entities, and the three embedding methods.
+pub fn refusees_decision() -> &'static [&'static str] {
+    decision::REFUSEES
+}
+
+/// A stored date, decoded from the three shapes the corpus actually holds:
+/// an ISO 8601 string (what Neo4j worked with, and what this portage writes),
+/// a `Timestamp` (obrain's own `datetime()`), and a `ZonedDatetime` (what the
+/// migrator writes, faithful to Neo4j's zoned `DateTime`).
+///
+/// `Ok(None)` means ABSENT: the caller decides what an absent date means, and
+/// matches Neo4j's own default where that default is documented.
+///
+/// A value that is PRESENT but cannot be read is an `Err`, which quarantines
+/// the node BY NAME at open. That distinction is the whole point: the previous
+/// shape was `as_str()`, so a `ZonedDatetime` was indistinguishable from a
+/// missing property — every migrated node was read as "no date" (130 713 of
+/// them quarantined) and `decided_at` was then replaced by the time of the
+/// read, silently. A default that hides a present value is an invention.
+pub(crate) fn date_propriete(
+    get: &dyn Fn(&str) -> Option<Value>,
+    cle: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    match get(cle) {
+        Some(v) => date_valeur(&v, cle),
+        None => Ok(None),
+    }
+}
+
+/// The value-level half of [`date_propriete`], for the callers that already hold
+/// the `Value` (an open-time index scan, for instance).
+pub(crate) fn date_valeur(v: &Value, cle: &str) -> Result<Option<DateTime<Utc>>> {
+    let micros = match v {
+        Value::Null => return Ok(None),
+        Value::String(s) => {
+            // The portage WRITES `""` for an absent optional date (`trigger.rs`
+            // and `persona.rs` writers do `d.map(instant).unwrap_or_else(|| texte(""))`).
+            // An empty string is therefore the stored shape of "no date", not a
+            // corrupt value: read as absent, or every node carrying an unset
+            // optional date is quarantined at open. Measured: 15 tests of
+            // `obrain_backend` fell on `human_confirmed_at` «  ».
+            if s.trim().is_empty() {
+                return Ok(None);
+            }
+            return s
+                .parse::<DateTime<Utc>>()
+                .map(Some)
+                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"));
+        }
+        Value::Timestamp(t) => t.as_micros(),
+        Value::ZonedDatetime(z) => z.as_timestamp().as_micros(),
+        _ => {
+            return Err(anyhow!(
+                "`{cle}` : type inattendu pour une date (attendu chaîne ISO, Timestamp ou \
+                 ZonedDatetime)"
+            ))
+        }
+    };
+    DateTime::<Utc>::from_timestamp_micros(micros)
+        .map(Some)
+        .ok_or_else(|| anyhow!("`{cle}` : date hors bornes ({micros} µs depuis l'époque)"))
+}
+
+/// The methods of `SkillStore` refused on every call, as `SkillStore::<method>`
+/// (`skill.rs`). Some more refuse only in context (a Decision member).
+pub fn refusees_skill() -> &'static [&'static str] {
+    skill::REFUSEES
+}
+
+/// The methods of `SharingStore` refused on every call, as
+/// `SharingStore::<method>` (`sharing.rs`).
+pub fn refusees_sharing() -> &'static [&'static str] {
+    sharing::REFUSEES
+}
+
+/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
+/// (`plan.rs`): tasks, steps, the day plan, dependencies, the graphs and
+/// waves, and the enrichment.
+/// (`plan.rs`; the causes of the task-side ones are in `task::REFUS`).
+pub fn refusees_plan() -> &'static [&'static str] {
+    // COMPOSED, never duplicated. `task::REFUS` is where the four task-and-step
+    // refusals are declared with their cause, `plan::REFUSEES` holds the
+    // plan-level ones. This account was emptied once while four methods still
+    // refused (`assign_task`, `analyze_task_impact`, the two enrichments): a
+    // hand-kept second list cannot be right, so it is derived now.
+    static COMPLET: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    COMPLET.get_or_init(|| {
+        let mut liste: Vec<&'static str> = plan::REFUSEES.to_vec();
+        liste.extend(task::REFUS.iter().map(|(m, _)| *m));
+        liste
+    })
+}
+
+/// The methods of `ProtocolRunStore` refused by name (the runs' links to notes,
+/// decisions and reasoning trees).
+pub fn refusees_protocolrun() -> &'static [&'static str] {
+    protocolrun::REFUSEES
+}
+
+/// The methods of `PlanRunStore` refused on every call, as
+/// `PlanRunStore::<method>` (`planrun.rs`): the agent executions (they need a
+/// `Task`) and the statistics of the code graph.
+pub fn refusees_planrun() -> &'static [&'static str] {
+    planrun::REFUSEES
+}
+
+/// The methods of `PersonaStore` refused on every call, as `PersonaStore::<method>`
+/// (`persona.rs`): skills, protocols, decisions, files and functions, and every
+/// matching that reads the code graph or the note synapses. `get_persona_subgraph`
+/// refuses only for a persona with an edge this backend does not resolve.
+pub fn refusees_persona() -> &'static [&'static str] {
+    persona::REFUSEES
+}
+
+/// The methods of `FeatureGraphStore` refused on every call, as
+/// `FeatureGraphStore::<method>` (`featuregraph.rs`): they read or write the code
+/// graph. `get_feature_graph_detail` refuses only for a graph that includes entities.
+pub fn refusees_featuregraph() -> &'static [&'static str] {
+    featuregraph::REFUSEES
+}
+
+/// The methods of `CodeStore` refused on every call, as `CodeStore::<method>`
+/// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`,
+/// and the file domain (its two writes, which would store a hash before the refused
+/// symbols, and its eight reads, which would answer empty on a base nothing can fill).
+pub fn refusees_code() -> &'static [&'static str] {
+    code::REFUSEES
+}
+
+/// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
+/// contract default loops over getters of other domains), the five
+/// `FederationStore` methods whose relation writes and backfills are not ported
+/// (`federation.rs`), and the ten `WorkspaceStore` methods whose domains (plan,
+/// cross-workspace listing) are not ported. They are in [`methodes_portees`]
+/// because they are written, not because they work.
+pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
+    "GraphStore::get_progress_batch",
+    "FederationStore::create_mcp_similar_to",
+    "FederationStore::create_mcp_co_activated",
+    "FederationStore::create_mcp_often_follows",
+    "FederationStore::backfill_co_activated_with",
+    "FederationStore::backfill_often_follows",
+    // WorkspaceStore: the domains they read (plan, cross-workspace listing) are not ported.
+    "WorkspaceStore::list_all_workspace_milestones_filtered",
+    "WorkspaceStore::count_all_workspace_milestones",
+    "WorkspaceStore::add_task_to_workspace_milestone",
+    "WorkspaceStore::remove_task_from_workspace_milestone",
+    "WorkspaceStore::link_plan_to_workspace_milestone",
+    "WorkspaceStore::unlink_plan_from_workspace_milestone",
+    "WorkspaceStore::get_workspace_milestone_progress",
+    "WorkspaceStore::get_workspace_milestone_tasks",
+    "WorkspaceStore::get_workspace_milestone_steps",
+    "WorkspaceStore::compute_coupling_matrix",
+];
+
+/// The methods that really serve something: the ported methods of the domains,
+/// without the hand-written refusals and without `GraphStore`'s own manifest.
+pub fn methodes_qui_servent() -> Vec<&'static str> {
+    PORTEES
+        .iter()
+        .copied()
+        .filter(|m| {
+            !REFUS_ECRITS_A_LA_MAIN.contains(m)
+                && !release::REFUSEES.contains(m)
+                && !note::REFUSEES.contains(m)
+                && !commit::REFUSEES.contains(m)
+                && !chat::REFUSEES.contains(m)
+                && !decision::REFUSEES.contains(m)
+                && !plan::REFUSEES.contains(m)
+                && !protocolrun::REFUSEES.contains(m)
+                && !planrun::REFUSEES.contains(m)
+                && !persona::REFUSEES.contains(m)
+                && !featuregraph::REFUSEES.contains(m)
+                && !skill::REFUSEES.contains(m)
+                && !sharing::REFUSEES.contains(m)
+                && !code::REFUSEES.contains(m)
+                && !m.starts_with("GraphStore::")
+        })
+        .collect()
 }
 
 /// Contract methods that cannot carry a refusal (they do not return a
 /// `Result`): the default body of the contract is kept for them.
 pub fn defauts_conserves() -> &'static [&'static str] {
     DEFAUTS_CONSERVES
+}
+
+/// A full flush (`commit_wal`) every this many writes, on top of the per-write
+/// WAL fsync: it bounds how much WAL a restart has to replay.
+pub const FLUSH_COMPLET_TOUS_LES: u64 = 256;
+
+/// A full flush as well once this many bytes of property values have been
+/// written since the last one: [`FLUSH_COMPLET_TOUS_LES`] counts writes, and 256
+/// writes of 30 MiB values would otherwise leave gigabytes of WAL for a restart
+/// to replay (obrain measures ~3 ms per MiB replayed at open). Counted by
+/// [`borne_encodee`], an upper bound of what each value weighs in a frame.
+pub const FLUSH_COMPLET_APRES_OCTETS: u64 = 64 * 1024 * 1024;
+
+/// obrain's `BLOB_WAL_MAX_BYTES` (`obrain-substrate/src/store.rs`, rev pinned in
+/// `Cargo.toml`): a blob value whose tagged encoding (one type byte, then the
+/// bytes) is LONGER than this is written to its column but not journaled. Not
+/// re-exported by `obrain-engine`, hence mirrored; a pin bump re-reads it.
+pub const PLAFOND_WAL_OBRAIN: usize = 32 * 1024 * 1024;
+
+/// An upper bound of the bytes `valeur` weighs once encoded by obrain: the tagged
+/// blob for a `String`/`Bytes` (exact: one type byte and the bytes), and a bound
+/// of the bincode varint encoding for the others (each length or variant prefix
+/// counted at its widest). Over-counting only brings a full flush forward.
+pub fn borne_encodee(valeur: &Value) -> usize {
+    fn bincode(v: &Value) -> usize {
+        // Variant index: a varint u32, at most 5 bytes. A length: a varint u64, at
+        // most 10. A fixed-width scalar (temporals measured at 9 to 29 bytes): 32.
+        5 + match v {
+            Value::String(s) => 10 + s.len(),
+            Value::Bytes(b) => 10 + b.len(),
+            Value::List(l) => 10 + l.iter().map(bincode).sum::<usize>(),
+            Value::Map(m) => {
+                10 + m
+                    .iter()
+                    .map(|(k, x)| 10 + k.as_str().len() + bincode(x))
+                    .sum::<usize>()
+            }
+            Value::Path { nodes, edges } => {
+                20 + nodes.iter().chain(edges.iter()).map(bincode).sum::<usize>()
+            }
+            Value::Vector(x) => 10 + 4 * x.len(),
+            _ => 32,
+        }
+    }
+    match valeur {
+        Value::String(s) => 1 + s.len(),
+        Value::Bytes(b) => 1 + b.len(),
+        autre => 1 + bincode(autre),
+    }
+}
+
+/// Whether obrain's WAL would NOT recover `valeur` after a kill: a vector (its
+/// frame carries no value), or a blob longer than [`PLAFOND_WAL_OBRAIN`]. Exact
+/// for a `String`/`Bytes`, conservative for a bincode-encoded value.
+pub fn hors_du_wal(valeur: &Value) -> bool {
+    matches!(valeur, Value::Vector(_)) || borne_encodee(valeur) > PLAFOND_WAL_OBRAIN
+}
+
+/// What makes a write durable, once per write. In a production build only the WAL
+/// fsync exists; the test builds add the measures' and the tests' variants
+/// (`mesure.rs`).
+#[cfg(not(any(test, feature = "mock-store")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durabilite {
+    /// The WAL fsync (`flush_wal`), and a full flush every
+    /// [`FLUSH_COMPLET_TOUS_LES`] writes.
+    Wal,
+}
+
+/// The file that says a base is PO's: written when PO creates the base (or by the
+/// migration that produces one), required at open. Any directory with a
+/// `substrate.meta` is an obrain base; only one with this file is a PO base.
+pub const MARQUEUR_PO: &str = "po-obrain-base";
+/// Its content: the schema of what PO writes in the base. Bumped by a lot that
+/// changes the shape of a node this backend writes.
+pub const SCHEMA_PO: &str = "schema = 1\n";
+
+/// Whether opening may create the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Creation {
+    /// The directory must already hold a base (`substrate.meta`).
+    Interdite,
+    /// An absent or empty directory becomes a new base.
+    Permise,
+}
+
+/// What opening found and repaired. Nothing here is fatal; everything here is
+/// logged by the factory and readable by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RapportOuverture {
+    /// `Project`, `McpServer` and `McpTool` nodes of a creation that never reached
+    /// its commit point (the draft marker still there, or nothing on the node):
+    /// deleted, whatever they held (`project.rs`, "Atomicity").
+    pub brouillons_supprimes: usize,
+    /// Deletions that had started and not finished (a `Workspace`, an `Environment`,
+    /// a `Persona` or a `FeatureGraph` carrying the `_suppression` marker,
+    /// `workspace.rs`, `release.rs`, `persona.rs`, `featuregraph.rs`): finished at
+    /// open, the node and what it held.
+    pub suppressions_achevees: usize,
+    /// Projects whose path trio (`root_path`, `declared_path`,
+    /// `canonical_path`) was torn by an interrupted update: recomputed from
+    /// `root_path`, which is written last.
+    pub chemins_repares: usize,
+    /// `ProtocolRun` updates cut after their update marker: finished from the
+    /// marker (`protocolrun.rs`, "Atomicity").
+    pub mises_a_jour_achevees: usize,
+    /// `Project` nodes this backend cannot address (no readable `id`/`name`/
+    /// `slug`/`created_at`, or an id or slug already taken): left untouched,
+    /// ignored, named here.
+    pub en_quarantaine: Vec<String>,
+    /// Plans whose `unlink_plan_from_project` was interrupted after its marker:
+    /// finished at open (`constraint.rs`).
+    pub deliaisons_achevees: usize,
 }
 
 /// The graph store on obrain.
@@ -82,10 +506,25 @@ pub struct ObrainGraphStore {
 struct Interne {
     db: ObrainDB,
     chemin: PathBuf,
-    /// The `Uuid → NodeId` indexes. The lock is also THE write lock: a
-    /// mutation holds it from its first check to its `commit_wal`, so readers
-    /// never see half an update and two commits never overlap.
+    /// Serializes the writers, from validation to the end of the fsync.
+    ecrivain: Mutex<()>,
+    /// The `Uuid → NodeId` indexes. Never held across disk or fsync.
     etat: RwLock<Etat>,
+    ferme: AtomicBool,
+    /// The last durability step failed: what is on disk is unknown.
+    indetermine: AtomicBool,
+    ecritures: AtomicU64,
+    /// Bytes of property values written since the last full flush
+    /// ([`FLUSH_COMPLET_APRES_OCTETS`]).
+    octets_depuis_flush: AtomicU64,
+    /// Full flushes run by the write path (periodic, by bytes, or for a value the
+    /// WAL does not recover). Not the one of `close`.
+    flushs_complets: AtomicU64,
+    durabilite: Durabilite,
+    rapport: RapportOuverture,
+    /// A test hook: the point where the next write stops (`mesure.rs`).
+    #[cfg(any(test, feature = "mock-store"))]
+    interruption: Mutex<Option<Interruption>>,
     /// The directory itself, when the base is a throwaway one
     /// ([`ObrainGraphStore::open_temporary`]). Declared LAST: fields drop in
     /// order, so the base is closed before its directory is removed.
@@ -96,25 +535,314 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    plans: plan::IndexPlans,
+    protocoles: protocol::IndexProtocoles,
+    runs: protocolrun::IndexRuns,
+
+    contraintes: constraint::IndexContraintes,
+    taches: task::IndexTaches,
+    auth: auth::IndexAuth,
+    releases: release::IndexReleases,
+    espaces: workspace::IndexEspaces,
+    notes: note::IndexNotes,
+    chat: chat::IndexChat,
+    decisions: decision::IndexDecisions,
+    federation: federation::IndexFederation,
+    commits: commit::IndexCommits,
+
+    surveillance: trigger::IndexSurveillance,
+    executions: planrun::IndexExecutions,
+
+    graphes: featuregraph::IndexGraphes,
+    personas: persona::IndexPersonas,
+    skills: skill::IndexSkills,
+    partage: sharing::IndexPartage,
+
+    code: code::IndexCode,
 }
 
-impl Etat {
-    fn reconstruire(db: &ObrainDB) -> Result<Self> {
-        Ok(Self {
-            projets: project::IndexProjets::reconstruire(db)?,
+/// What a write closure is given: the engine, the indexes, and the durability
+/// step.
+struct Ecriture<'a> {
+    db: &'a ObrainDB,
+    interne: &'a Interne,
+    rendu_durable: bool,
+    /// The full flush run right after a value the WAL does not recover failed:
+    /// [`Ecriture::rendre_durable`] returns it, so the write is not acknowledged.
+    echec_flush_immediat: Option<String>,
+    /// How many engine writes of this closure have been made (the test hook
+    /// `Interruption::AvantEtape` counts them).
+    #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
+    etapes: usize,
+}
+
+impl Ecriture<'_> {
+    fn index(&self) -> Result<RwLockReadGuard<'_, Etat>> {
+        self.interne
+            .etat
+            .read()
+            .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))
+    }
+
+    /// Write-lock the indexes. Hold the guard for in-memory work only.
+    fn index_mut(&self) -> Result<RwLockWriteGuard<'_, Etat>> {
+        self.interne
+            .etat
+            .write()
+            .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))
+    }
+
+    /// A test hook, compiled for test builds only: stop here if the test armed
+    /// this point. Nothing is durable, nothing is published — what a crash at
+    /// this instant leaves is what the engine has written so far.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn point(&mut self, point: Interruption) -> Result<()> {
+        let mut arme = self
+            .interne
+            .interruption
+            .lock()
+            .map_err(|_| anyhow!("verrou du point d'interruption empoisonné"))?;
+        if *arme == Some(point) {
+            *arme = None;
+            bail!("interruption injectée par le test : {point:?}");
+        }
+        Ok(())
+    }
+
+    /// A test hook at each `etape()` call: a crash simulation at the k-th call. Where that
+    /// is relative to the write depends on the call site: `note.rs` calls it BEFORE each
+    /// write (the k-th write not yet made), `workspace.rs` and `release.rs` AFTER each
+    /// delete. The variant name keeps the note convention. Nothing in production.
+    fn etape(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "mock-store"))]
+        {
+            self.etapes += 1;
+            let n = self.etapes;
+            self.point(Interruption::AvantEtape(n))?;
+        }
+        Ok(())
+    }
+
+    /// Test hook: when `quoi` is armed (`Interruption::SuppressionEchouee`,
+    /// `Interruption::SuppressionDAreteEchouee`), the next deletion of that kind answers
+    /// "not deleted" without calling the engine. The engine does not produce that answer on
+    /// a healthy base; this reaches the branches that handle it. Nothing in production.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn refus_simule(&mut self, quoi: Interruption) -> bool {
+        let Ok(mut arme) = self.interne.interruption.lock() else {
+            return false;
+        };
+        if *arme == Some(quoi) {
+            *arme = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `Interruption::SuppressionEchouee` armed: the next node deletion is refused.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn suppression_de_noeud_refusee(&mut self) -> bool {
+        self.refus_simule(Interruption::SuppressionEchouee)
+    }
+
+    #[cfg(not(any(test, feature = "mock-store")))]
+    fn suppression_de_noeud_refusee(&mut self) -> bool {
+        false
+    }
+
+    /// `Interruption::SuppressionDAreteEchouee` armed: the next edge deletion is refused.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn suppression_d_arete_refusee(&mut self) -> bool {
+        self.refus_simule(Interruption::SuppressionDAreteEchouee)
+    }
+
+    #[cfg(not(any(test, feature = "mock-store")))]
+    fn suppression_d_arete_refusee(&mut self) -> bool {
+        false
+    }
+
+    /// A failure AFTER the engine was written to (decoding what was just written)
+    /// leaves the base and the index disagreeing: the store is indeterminate
+    /// until a restart rebuilds the index from the base.
+    fn apres_ecriture<T>(&self, resultat: Result<T>) -> Result<T> {
+        resultat.map_err(|e| {
+            self.interne.indetermine.store(true, Ordering::Release);
+            e.context(format!(
+                "base obrain {} : écriture appliquée mais non relisible ; l'index et la base \
+                 divergent. Tout est refusé jusqu'au redémarrage, qui reconstruit l'index",
+                self.interne.chemin.display()
+            ))
+        })
+    }
+
+    /// Refuse, writing nothing, when one of these nodes is held by the index and
+    /// absent from the engine: the index and the base disagree.
+    fn verifier_vivants(&self, noeuds: &[obrain_common::types::NodeId], quoi: &str) -> Result<()> {
+        if let Some(absent) = noeuds.iter().find(|n| self.db.get_node(**n).is_none()) {
+            bail!(
+                "{quoi} : le nœud {absent:?} est indexé mais absent de la base (index et base \
+                 divergent) ; rien n'a été supprimé"
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete these nodes, in this order, so that an `Err` keeps its meaning:
+    /// - every node must be live in the engine BEFORE the first deletion; one that
+    ///   the index holds and the engine does not have is refused with NOTHING
+    ///   written (the index and the base disagree; deleting the others first would
+    ///   leave the index serving them);
+    /// - an engine refusal after a first deletion leaves the base written and the
+    ///   index stale: the store becomes indeterminate ([`Self::apres_ecriture`]).
+    ///
+    /// Each deletion is one step of [`Self::etape`] (the test hook).
+    fn supprimer_noeuds(
+        &mut self,
+        noeuds: &[obrain_common::types::NodeId],
+        quoi: &str,
+    ) -> Result<()> {
+        self.verifier_vivants(noeuds, quoi)?;
+        for (k, noeud) in noeuds.iter().enumerate() {
+            if !self.db.delete_node(*noeud) {
+                let e = anyhow!("{quoi} : obrain a refusé la suppression du nœud {noeud:?}");
+                return if k == 0 {
+                    Err(e)
+                } else {
+                    self.apres_ecriture(Err(e))
+                };
+            }
+            self.etape()?;
+        }
+        Ok(())
+    }
+
+    /// THE point where a write closure sets a node property. Never call
+    /// `set_node_property` directly in a closure (the source scan of this
+    /// module's tests refuses it): this is where a value obrain's WAL does not
+    /// recover ([`hors_du_wal`]) is made durable by a full flush at once, and
+    /// where the bytes for [`FLUSH_COMPLET_APRES_OCTETS`] are counted.
+    fn poser(&mut self, noeud: NodeId, cle: &str, valeur: Value) {
+        let (octets, hors) = (borne_encodee(&valeur), hors_du_wal(&valeur));
+        self.db.set_node_property(noeud, cle, valeur);
+        self.apres_pose(octets, hors);
+    }
+
+    /// [`Ecriture::poser`] for an edge property.
+    fn poser_arete(&mut self, arete: EdgeId, cle: &str, valeur: Value) {
+        let (octets, hors) = (borne_encodee(&valeur), hors_du_wal(&valeur));
+        self.db.set_edge_property(arete, cle, valeur);
+        self.apres_pose(octets, hors);
+    }
+
+    fn apres_pose(&mut self, octets: usize, hors_du_wal: bool) {
+        self.interne
+            .octets_depuis_flush
+            .fetch_add(octets as u64, Ordering::Relaxed);
+        if !hors_du_wal || self.echec_flush_immediat.is_some() {
+            return;
+        }
+        let resultat = match self.interne.durabilite {
+            Durabilite::Wal => self.flush_complet(),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Complet | Durabilite::LenteAPourTest(_) => self.flush_complet(),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Aucune => Ok(()),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::EchoueAPourTest => Err(obrain_common::utils::error::Error::Internal(
+                "échec injecté par le test".into(),
+            )),
+        };
+        if let Err(e) = resultat {
+            // The store is indeterminate from now on; the closure goes on (it has no
+            // rollback either way) and `rendre_durable` refuses to acknowledge.
+            self.interne.indetermine.store(true, Ordering::Release);
+            self.echec_flush_immediat = Some(format!(
+                "flush complet d'une valeur hors du WAL d'obrain : {e}"
+            ));
+        }
+    }
+
+    /// `commit_wal`, counted, and the byte counter reset.
+    fn flush_complet(&self) -> obrain_common::utils::error::Result<()> {
+        self.db.commit_wal()?;
+        self.interne.octets_depuis_flush.store(0, Ordering::Relaxed);
+        self.interne.flushs_complets.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Make what was written durable. Call it BEFORE publishing the write to
+    /// readers when the write is a creation; [`ObrainGraphStore::ecrire`] calls
+    /// it itself if the closure did not.
+    fn rendre_durable(&mut self) -> Result<()> {
+        self.rendu_durable = true;
+        let n = self.interne.ecritures.fetch_add(1, Ordering::Relaxed) + 1;
+        let resultat = match self.interne.durabilite {
+            _ if self.echec_flush_immediat.is_some() => {
+                Err(obrain_common::utils::error::Error::Internal(
+                    self.echec_flush_immediat.clone().unwrap_or_default(),
+                ))
+            }
+            Durabilite::Wal => {
+                let wal = self.db.flush_wal();
+                let octets = self.interne.octets_depuis_flush.load(Ordering::Relaxed);
+                match wal {
+                    Ok(())
+                        if n.is_multiple_of(FLUSH_COMPLET_TOUS_LES)
+                            || octets >= FLUSH_COMPLET_APRES_OCTETS =>
+                    {
+                        self.flush_complet()
+                    }
+                    autre => autre,
+                }
+            }
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Complet => self.flush_complet(),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Aucune => Ok(()),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::LenteAPourTest(ms) => {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                self.db.flush_wal()
+            }
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::EchoueAPourTest => Err(obrain_common::utils::error::Error::Internal(
+                "échec injecté par le test".into(),
+            )),
+        };
+        resultat.map_err(|e| {
+            self.interne.indetermine.store(true, Ordering::Release);
+            anyhow!(
+                "base obrain {} : la durabilité de la dernière écriture n'est pas assurée ({e}). \
+                 L'écriture est appliquée en mémoire ; l'état sur disque est INDÉTERMINÉ. \
+                 Toute écriture et toute lecture sont refusées jusqu'au redémarrage, qui rejoue \
+                 le journal",
+                self.interne.chemin.display()
+            )
         })
     }
 }
 
 impl ObrainGraphStore {
-    /// Open (or create) the obrain base at `chemin` and rebuild the indexes
-    /// from what it holds. Synchronous: call it from the blocking pool.
+    /// Open the obrain base at `chemin` and rebuild the indexes from what it
+    /// holds. Synchronous: call it from the blocking pool.
+    ///
+    /// Guards, because opening is "open or create" in obrain and a typo would
+    /// otherwise become a new empty base that PO then serves:
+    /// - the path must be ABSOLUTE;
+    /// - a directory that holds files but no `substrate.meta` is refused (the
+    ///   engine would write its own files into it, over what is there);
+    /// - an obrain base that is not PO's (no [`MARQUEUR_PO`]) is refused;
+    /// - an absent or empty directory is a new base only with
+    ///   [`Creation::Permise`]: a base is created on purpose, never by accident.
     ///
     /// Fails if the base is already open for writing — by this process or by
     /// another one. That refusal is obrain's, and it is what makes PO the
     /// single writer.
-    pub fn open(chemin: impl AsRef<Path>) -> Result<Self> {
-        Self::ouvrir(chemin.as_ref().to_path_buf(), None)
+    pub fn open(chemin: impl AsRef<Path>, creation: Creation) -> Result<Self> {
+        let chemin = chemin.as_ref().to_path_buf();
+        let creer = Self::garde_fou_d_ouverture(&chemin, creation)?;
+        Self::ouvrir(chemin, Durabilite::Wal, creer, None)
     }
 
     /// A base in a fresh temporary directory, removed when the store is
@@ -124,26 +852,207 @@ impl ObrainGraphStore {
             .prefix("po-obrain-")
             .tempdir()
             .context("création du répertoire temporaire de la base obrain")?;
-        Self::ouvrir(dir.path().to_path_buf(), Some(dir))
+        Self::ouvrir(dir.path().to_path_buf(), Durabilite::Wal, true, Some(dir))
     }
 
-    fn ouvrir(chemin: PathBuf, jetable: Option<tempfile::TempDir>) -> Result<Self> {
+    /// `Ok(true)` when the directory holds no base and one may be created there.
+    fn garde_fou_d_ouverture(chemin: &Path, creation: Creation) -> Result<bool> {
+        if !chemin.is_absolute() {
+            bail!(
+                "chemin de base obrain relatif refusé : « {} » (il dépendrait du répertoire de \
+                 lancement). Donner un chemin absolu dans `storage.obrain_path`",
+                chemin.display()
+            );
+        }
+        if chemin.join("substrate.meta").is_file() {
+            if !chemin.join(MARQUEUR_PO).is_file() {
+                bail!(
+                    "{} est une base obrain mais pas une base PO : le fichier `{MARQUEUR_PO}` \
+                     manque. Une base d'un autre outil ne s'ouvre pas ici ; une base migrée le \
+                     porte. Rien n'a été touché",
+                    chemin.display()
+                );
+            }
+            return Ok(false);
+        }
+        // `metadata` follows a link: a link to a directory is that directory.
+        let existe = match std::fs::metadata(chemin) {
+            Ok(m) if m.is_dir() => true,
+            Ok(_) => bail!(
+                "« {} » existe et n'est pas un répertoire : pas une base obrain",
+                chemin.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(e).with_context(|| format!("lecture de {}", chemin.display()));
+            }
+        };
+        if existe {
+            let mut contenu = std::fs::read_dir(chemin)
+                .with_context(|| format!("lecture du répertoire {}", chemin.display()))?;
+            if let Some(premier) = contenu.next() {
+                let premier = premier?.file_name();
+                bail!(
+                    "le répertoire {} n'est pas vide (il contient {:?}…) et n'a pas de \
+                     `substrate.meta` : ce n'est pas une base obrain, et l'ouvrir écrirait les \
+                     fichiers du moteur par-dessus. Rien n'a été touché",
+                    chemin.display(),
+                    premier
+                );
+            }
+        }
+        match creation {
+            Creation::Permise => Ok(true),
+            Creation::Interdite => bail!(
+                "aucune base obrain dans {} ({}) et la création n'est pas demandée : une faute \
+                 de frappe dans `storage.obrain_path` donnerait sinon une base vide, servie comme \
+                 si de rien n'était. Pour CRÉER une base, poser `storage.obrain_create: true` \
+                 (ou STORAGE_OBRAIN_CREATE=true)",
+                chemin.display(),
+                if existe {
+                    "répertoire vide"
+                } else {
+                    "répertoire absent"
+                }
+            ),
+        }
+    }
+
+    fn ouvrir(
+        chemin: PathBuf,
+        durabilite: Durabilite,
+        creer: bool,
+        jetable: Option<tempfile::TempDir>,
+    ) -> Result<Self> {
         let db = ObrainDB::open(&chemin)
             .map_err(|e| anyhow!("ouverture de la base obrain {} : {e}", chemin.display()))?;
-        let etat = Etat::reconstruire(&db).with_context(|| {
+        if creer {
+            // The base is PO's from its first instant: the marker is written before
+            // anything else, and a failure here is an open failure.
+            std::fs::write(chemin.join(MARQUEUR_PO), SCHEMA_PO).with_context(|| {
+                format!(
+                    "écriture du marqueur {MARQUEUR_PO} dans {}",
+                    chemin.display()
+                )
+            })?;
+        }
+        let contexte = || {
             format!(
                 "reconstruction des index de la base obrain {}",
                 chemin.display()
             )
-        })?;
-        Ok(Self {
+        };
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        constraint::achever_les_deliaisons(&db, &mut rapport);
+        let (plans, brouillons, quarantaine) =
+            plan::IndexPlans::reconstruire(&db, &projets).with_context(contexte)?;
+        rapport.brouillons_supprimes += brouillons;
+        rapport.en_quarantaine.extend(quarantaine);
+        let protocoles = protocol::IndexProtocoles::reconstruire(&db, &mut rapport);
+        let runs = protocolrun::IndexRuns::reconstruire(&db, &protocoles, &mut rapport);
+
+        let contraintes = constraint::IndexContraintes::reconstruire(&db, &plans, &mut rapport);
+        let taches =
+            task::IndexTaches::reconstruire(&db, &plans, &mut rapport).with_context(contexte)?;
+        let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
+        let (releases, rapport_releases) =
+            release::IndexReleases::reconstruire(&db).with_context(contexte)?;
+        rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport.suppressions_achevees += rapport_releases.suppressions_achevees;
+        rapport
+            .en_quarantaine
+            .extend(rapport_releases.en_quarantaine);
+        let espaces = workspace::IndexEspaces::reconstruire(&db, &projets, &mut rapport)
+            .with_context(contexte)?;
+        let notes =
+            note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let chat = chat::IndexChat::reconstruire(&db, &mut rapport).with_context(contexte)?;
+        let decisions = decision::IndexDecisions::reconstruire(&db, &projets, &mut rapport)
+            .with_context(contexte)?;
+        // After the notes: a skill's memberships resolve against the note index.
+        let skills =
+            skill::IndexSkills::reconstruire(&db, &notes, &mut rapport).with_context(contexte)?;
+        let partage =
+            sharing::IndexPartage::reconstruire(&db, &mut rapport).with_context(contexte)?;
+        let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
+            .with_context(|| {
+                format!(
+                    "reconstruction des index fédération de la base obrain {}",
+                    chemin.display()
+                )
+            })?;
+        rapport.brouillons_supprimes += brouillons;
+        rapport.en_quarantaine.extend(quarantaine);
+        // Before the commits: the code domain deletes the draft `File` nodes the commit
+        // scan would otherwise quarantine as "sans `path`".
+        let code = code::IndexCode::reconstruire(&db, &projets, &mut rapport);
+        let commits =
+            commit::IndexCommits::reconstruire(&db, &mut rapport).with_context(contexte)?;
+
+        let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
+        let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
+            .with_context(contexte)?;
+
+        // After the notes: a persona's edges are resolved against the notes and the
+        // feature graphs.
+        let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
+        let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
+
+        let etat = Etat {
+            projets,
+            plans,
+            protocoles,
+            runs,
+
+            contraintes,
+            taches,
+            auth,
+            releases,
+            espaces,
+            notes,
+            chat,
+            decisions,
+            federation,
+            commits,
+
+            surveillance,
+            executions,
+
+            graphes,
+            personas,
+            skills,
+            partage,
+
+            code,
+        };
+        let store = Self {
             interne: Arc::new(Interne {
                 db,
                 chemin,
+                ecrivain: Mutex::new(()),
                 etat: RwLock::new(etat),
+                ferme: AtomicBool::new(false),
+                indetermine: AtomicBool::new(false),
+                ecritures: AtomicU64::new(0),
+                octets_depuis_flush: AtomicU64::new(0),
+                flushs_complets: AtomicU64::new(0),
+                durabilite,
+                rapport,
+                #[cfg(any(test, feature = "mock-store"))]
+                interruption: Mutex::new(None),
                 _jetable: jetable,
             }),
-        })
+        };
+        // What opening repaired is made durable before anything else runs.
+        if store.interne.rapport != RapportOuverture::default() {
+            store
+                .interne
+                .db
+                .flush_wal()
+                .map_err(|e| anyhow!("réparations d'ouverture non rendues durables : {e}"))?;
+        }
+        Ok(store)
     }
 
     /// The directory of the base.
@@ -151,17 +1060,35 @@ impl ObrainGraphStore {
         &self.interne.chemin
     }
 
+    /// What opening found and repaired.
+    pub fn rapport_d_ouverture(&self) -> &RapportOuverture {
+        &self.interne.rapport
+    }
+
+    /// How many fsyncs the WAL has really run (obrain's oracle `wal_fsyncs`): between
+    /// two acknowledged writes of the single writer it must have grown. (The other
+    /// oracle, `wal_octets_durables`, is only published by the commit path of a
+    /// session, not by an explicit `fsync_wal`: it reads 0 here whatever happens.)
+    #[doc(hidden)]
+    pub fn fsyncs_du_wal(&self) -> Option<u64> {
+        self.interne.db.wal_fsyncs()
+    }
+
     /// Flush and close the base. Dropping the store does the same but can only
     /// log a failure; call this where the failure must be seen. Once closed,
-    /// the directory can be opened again.
+    /// EVERY operation on this store refuses, and the directory can be opened
+    /// again.
     pub async fn close(&self) -> Result<()> {
         let interne = self.interne.clone();
         tokio::task::spawn_blocking(move || {
-            // Under the write lock: no mutation is half-way when we flush.
-            let _etat = interne
-                .etat
-                .write()
-                .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))?;
+            // The writers drain first: nothing is half-way when we flush.
+            let _ecrivain = interne
+                .ecrivain
+                .lock()
+                .map_err(|_| anyhow!("verrou d'écriture obrain empoisonné"))?;
+            if interne.ferme.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
             interne
                 .db
                 .close()
@@ -171,44 +1098,81 @@ impl ObrainGraphStore {
         .context("tâche bloquante obrain interrompue")?
     }
 
-    /// Run a read on the blocking pool, under the read lock.
-    async fn lire<R, F>(&self, f: F) -> Result<R>
-    where
-        R: Send + 'static,
-        F: FnOnce(&ObrainDB, &Etat) -> Result<R> + Send + 'static,
-    {
-        let interne = self.interne.clone();
-        tokio::task::spawn_blocking(move || {
-            let etat = interne
-                .etat
-                .read()
-                .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))?;
-            f(&interne.db, &etat)
-        })
-        .await
-        .context("tâche bloquante obrain interrompue")?
+    fn garde(&self) -> Result<()> {
+        if self.interne.ferme.load(Ordering::Acquire) {
+            bail!(
+                "la base obrain {} est fermée : l'opération est refusée",
+                self.interne.chemin.display()
+            );
+        }
+        if self.interne.indetermine.load(Ordering::Acquire) {
+            bail!(
+                "la base obrain {} est dans un état indéterminé (échec de durabilité) : redémarrer",
+                self.interne.chemin.display()
+            );
+        }
+        Ok(())
     }
 
-    /// Run a mutation on the blocking pool, under the write lock, and make it
+    /// Run a read, inline, under the read lock of the indexes.
+    fn lire<R>(&self, f: impl FnOnce(&ObrainDB, &Etat) -> Result<R>) -> Result<R> {
+        self.garde()?;
+        let etat = self
+            .interne
+            .etat
+            .read()
+            .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))?;
+        f(&self.interne.db, &etat)
+    }
+
+    /// Run a mutation on the blocking pool, as the one writer, and make it
     /// durable before answering.
     ///
-    /// `f` must validate BEFORE it writes: obrain's direct API has no
-    /// rollback, so an `Err` has to mean "nothing was written".
-    async fn ecrire<R, F>(&self, f: F) -> Result<R>
+    /// `preparer` runs first, on the blocking pool but BEFORE the writer lock: the
+    /// place for what touches the filesystem (resolving a root) without holding
+    /// anyone. The closure must validate BEFORE it writes (obrain's direct API has
+    /// no rollback, so an `Err` has to mean "nothing was written"), must publish to
+    /// the index only after its durability step, and must hold the write lock of
+    /// the indexes for in-memory work only.
+    async fn ecrire<P, R, Prep, F>(&self, preparer: Prep, f: F) -> Result<R>
     where
+        P: Send + 'static,
         R: Send + 'static,
-        F: FnOnce(&ObrainDB, &mut Etat) -> Result<R> + Send + 'static,
+        Prep: FnOnce() -> P + Send + 'static,
+        F: FnOnce(P, &mut Ecriture<'_>) -> Result<R> + Send + 'static,
     {
         let interne = self.interne.clone();
         tokio::task::spawn_blocking(move || {
-            let mut etat = interne
-                .etat
-                .write()
-                .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))?;
-            let rendu = f(&interne.db, &mut etat)?;
-            interne.db.commit_wal().map_err(|e| {
-                anyhow!("écriture obrain appliquée en mémoire mais non rendue durable : {e}")
-            })?;
+            let prepare = preparer();
+            let _ecrivain = interne
+                .ecrivain
+                .lock()
+                .map_err(|_| anyhow!("verrou d'écriture obrain empoisonné"))?;
+            // Checked under the writer lock: `close` takes it too.
+            if interne.ferme.load(Ordering::Acquire) {
+                bail!(
+                    "la base obrain {} est fermée : l'opération est refusée",
+                    interne.chemin.display()
+                );
+            }
+            if interne.indetermine.load(Ordering::Acquire) {
+                bail!(
+                    "la base obrain {} est dans un état indéterminé (échec de durabilité) : \
+                     redémarrer",
+                    interne.chemin.display()
+                );
+            }
+            let mut ecriture = Ecriture {
+                db: &interne.db,
+                interne: &interne,
+                rendu_durable: false,
+                echec_flush_immediat: None,
+                etapes: 0,
+            };
+            let rendu = f(prepare, &mut ecriture)?;
+            if !ecriture.rendu_durable {
+                ecriture.rendre_durable()?;
+            }
             Ok(rendu)
         })
         .await
@@ -222,11 +1186,22 @@ impl GraphStore for ObrainGraphStore {
     /// queries of the contract, and no query of the contract runs on obrain
     /// yet: the one ported domain goes through the Rust API. The uniqueness of
     /// `Project.id` / `Project.slug` is enforced by this adapter under its
-    /// write lock (`project.rs`), not by an engine constraint, so
+    /// writer lock (`project.rs`), not by an engine constraint, so
     /// `unique_constraints` stays false. A flag turns true in the lot that
     /// proves it.
     fn capabilities(&self) -> StoreCapabilities {
         StoreCapabilities::default()
+    }
+
+    /// Written by hand and refusing: the contract's default loops over the task
+    /// getters of other domains, so it would refuse anyway — but by the name of
+    /// whichever getter it reached first, and only for a non-empty `ids`.
+    async fn get_progress_batch(
+        &self,
+        _kind: ProgressKind,
+        _ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, TaskCounts>> {
+        Err(NonPorte("GraphStore::get_progress_batch").into())
     }
 }
 
@@ -330,5 +1305,65 @@ impl neural_routing_runtime::TrajectoryStore for ObrainTrajectoryStore {
         _entities: &[neural_routing_runtime::TouchedEntity],
     ) -> neural_routing_runtime::routing_error::Result<()> {
         trajectoire_non_portee("TrajectoryStore::link_touched_entities_batch")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every property write of a write closure goes through `Ecriture::poser` /
+    /// `poser_arete`: a direct engine call would skip the full flush of a value
+    /// the WAL does not recover. The only exceptions are marked `hors-poser:`
+    /// on the line above, with their reason.
+    #[test]
+    fn every_property_write_goes_through_the_single_pass_point() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/obrain");
+        let mut fautes = Vec::new();
+        for entree in std::fs::read_dir(&dir).unwrap() {
+            let chemin = entree.unwrap().path();
+            let nom = chemin.file_name().unwrap().to_string_lossy().into_owned();
+            // `mod.rs` holds the pass point; `mesure.rs` is the test-only bulk loader.
+            if !nom.ends_with(".rs") || nom == "mod.rs" || nom == "mesure.rs" {
+                continue;
+            }
+            let texte = std::fs::read_to_string(&chemin).unwrap();
+            let lignes: Vec<&str> = texte.lines().collect();
+            for (i, ligne) in lignes.iter().enumerate() {
+                let code = ligne.split("//").next().unwrap_or("");
+                let ecrit = ["set_node_property(", "set_edge_property(", "_with_props("]
+                    .iter()
+                    .any(|m| code.contains(m));
+                let excuse = i > 0 && lignes[i - 1].trim_start().starts_with("// hors-poser:");
+                if ecrit && !excuse {
+                    fautes.push(format!("{nom}:{} {}", i + 1, ligne.trim()));
+                }
+            }
+        }
+        assert!(
+            fautes.is_empty(),
+            "property writes outside `Ecriture::poser`: {fautes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_blob_is_out_of_the_wal_exactly_past_obrain_s_cap() {
+        // The tagged blob is one type byte, then the bytes: obrain journals it up
+        // to `BLOB_WAL_MAX_BYTES` included.
+        let au_plafond = Value::from("E".repeat(PLAFOND_WAL_OBRAIN - 1));
+        let au_dela = Value::from("E".repeat(PLAFOND_WAL_OBRAIN));
+        assert_eq!(borne_encodee(&au_plafond), PLAFOND_WAL_OBRAIN);
+        assert!(!hors_du_wal(&au_plafond));
+        assert!(hors_du_wal(&au_dela));
+        let octets: Vec<u8> = vec![7; PLAFOND_WAL_OBRAIN];
+        assert!(hors_du_wal(&Value::Bytes(octets.into())));
+        assert!(hors_du_wal(&Value::Vector(vec![0.5_f32; 3].into())));
+        assert!(!hors_du_wal(&Value::from("court")));
+        assert!(!hors_du_wal(&Value::from(42_i64)));
+        // A list is counted through its elements: past the cap together, out.
+        let moitie = Value::from("x".repeat(PLAFOND_WAL_OBRAIN / 2));
+        assert!(hors_du_wal(&Value::List(
+            vec![moitie.clone(), moitie].into()
+        )));
     }
 }

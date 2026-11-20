@@ -1085,32 +1085,168 @@ const ENGINE_RESULT_WAIT: Duration = Duration::from_secs(90);
 /// Result` — naming no cause at all. It now fails at once, on the message the
 /// engine emitted, and a real timeout appends the tail of the fake's own record
 /// (what it received), which is where the answer usually is.
+///
+/// The `Result` is ALSO looked for in the store. `rx` is subscribed AFTER the
+/// call that starts the turn (`create_session`, `switch_session_provider`)
+/// returns — the switch makes a new channel, there is nothing to subscribe to
+/// before — and a broadcast only hands a receiver what is sent after its
+/// `subscribe`. The scripted fake answers in milliseconds, so on a loaded runner
+/// the whole turn, `Result` included, could be over before the test subscribed:
+/// the receiver then heard only the trailing events and waited 180 s for a
+/// `Result` already gone (CI 13/11/2026, job 131952359580: `run_codex_column/codex:
+/// no event for 180s, after 2 event(s)` while the fake's record shows `turn/start`
+/// received, so the fake had played the whole turn). The agent engine stores
+/// every `Result` it broadcasts, so a `Result` past `results_before` in the store
+/// is this turn's answer, whenever it was sent.
+///
+/// Returns how many `Result`s the store holds once this one is in it, the
+/// `results_before` of the next turn of the same session.
 async fn await_turn_result(
     rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>,
     phase: &str,
     deadline: Duration,
     record: &Path,
-) {
+    graph: &MockGraphStore,
+    sid: &str,
+    results_before: usize,
+) -> usize {
     let mut seen = 0usize;
+    let mut heard_result = false;
+    let mut last_event = tokio::time::Instant::now();
     loop {
-        match tokio::time::timeout(deadline, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => return,
+        let stored = match stored_turn(&stored_records(graph, sid).await, results_before) {
+            StoredTurn::Answered(results) => return results,
+            StoredTurn::Failed(failure) => panic!(
+                "{phase}: the engine reported an error instead of a Result (read in the store): {failure}\n{}",
+                record_tail(record)
+            ),
+            StoredTurn::Pending(results) => results,
+        };
+        if heard_result {
+            // Heard live: its write is awaited right behind the broadcast
+            // (`emit_one`), so it lands within the poll — unless it was lost.
+            if last_event.elapsed() >= STORED_RESULT_WAIT {
+                panic!(
+                    "{phase}: a Result was broadcast but never stored ({stored} stored, {results_before} before)"
+                );
+            }
+            tokio::time::sleep(STORED_RESULT_POLL).await;
+            continue;
+        }
+        match tokio::time::timeout(STORED_RESULT_POLL, rx.recv()).await {
+            Ok(Ok(ChatEvent::Result { .. })) => {
+                heard_result = true;
+                last_event = tokio::time::Instant::now();
+            }
             Ok(Ok(ChatEvent::Error { message, code, .. })) => panic!(
                 "{phase}: the engine reported an error instead of a Result: {message} (code: {code:?})\n{}",
                 record_tail(record)
             ),
-            Ok(Ok(_)) => seen += 1,
+            Ok(Ok(_)) => {
+                seen += 1;
+                last_event = tokio::time::Instant::now();
+            }
             Ok(Err(err)) => panic!(
                 "{phase}: the event channel closed after {seen} event(s): {err}\n{}",
                 record_tail(record)
             ),
-            Err(_) => panic!(
-                "{phase}: no event for {}s, after {seen} event(s)\n{}",
+            Err(_) if last_event.elapsed() >= deadline => panic!(
+                "{phase}: no event for {}s, after {seen} event(s), and no Result stored ({stored} stored, {results_before} before)\n{}",
                 deadline.as_secs(),
                 record_tail(record)
             ),
+            Err(_) => {}
         }
     }
+}
+
+/// How often [`await_turn_result`] looks at the store between two live events.
+const STORED_RESULT_POLL: Duration = Duration::from_millis(200);
+
+/// How long a `Result` heard live may take to show in the store.
+const STORED_RESULT_WAIT: Duration = Duration::from_secs(10);
+
+/// What the store says of the turn after the first `results_before` `Result`s.
+#[derive(Debug, PartialEq)]
+enum StoredTurn {
+    /// No `Result` past `results_before` yet; the count of the stored ones.
+    Pending(usize),
+    /// A successful `Result`; the count of the stored ones, it included.
+    Answered(usize),
+    /// The turn failed: an `Error`, or a `Result { is_error: true }`, stored
+    /// past `results_before`. A fast failure stored before the subscription
+    /// must turn the test red, not pass for an answer.
+    Failed(String),
+}
+
+/// The events the store holds for `sid`, in `seq` order.
+async fn stored_records(
+    graph: &MockGraphStore,
+    sid: &str,
+) -> Vec<crate::neo4j::models::ChatEventRecord> {
+    let Ok(uuid) = Uuid::parse_str(sid) else {
+        return Vec::new();
+    };
+    let mut records = graph
+        .get_chat_events(uuid, 0, 5_000)
+        .await
+        .unwrap_or_default();
+    records.sort_by_key(|r| r.seq);
+    records
+}
+
+/// Reads the turn that follows the first `results_before` `Result`s. The
+/// records are picked by their `event_type`, never by whether their payload
+/// parses: a `result` or `error` line that does not parse panics, naming it,
+/// instead of vanishing from the count and giving a false diagnosis.
+fn stored_turn(
+    records: &[crate::neo4j::models::ChatEventRecord],
+    results_before: usize,
+) -> StoredTurn {
+    let parse = |r: &crate::neo4j::models::ChatEventRecord| {
+        serde_json::from_str::<ChatEvent>(&r.data).unwrap_or_else(|e| {
+            panic!(
+                "stored `{}` event (seq {}) does not parse: {e}: {}",
+                r.event_type, r.seq, r.data
+            )
+        })
+    };
+    let mut results = 0usize;
+    for r in records {
+        match r.event_type.as_str() {
+            "result" => {
+                results += 1;
+                if results <= results_before {
+                    continue;
+                }
+                return match parse(r) {
+                    ChatEvent::Result {
+                        is_error: true,
+                        subtype,
+                        result_text,
+                        ..
+                    } => StoredTurn::Failed(format!(
+                        "Result {{ is_error: true, subtype: {subtype:?}, result_text: {result_text:?} }}"
+                    )),
+                    ChatEvent::Result { .. } => StoredTurn::Answered(results),
+                    other => panic!(
+                        "stored `result` event (seq {}) is a {other:?}",
+                        r.seq
+                    ),
+                };
+            }
+            "error" if results >= results_before => {
+                return match parse(r) {
+                    ChatEvent::Error { message, code, .. } => {
+                        StoredTurn::Failed(format!("{message} (code: {code:?})"))
+                    }
+                    other => panic!("stored `error` event (seq {}) is a {other:?}", r.seq),
+                };
+            }
+            _ => {}
+        }
+    }
+    StoredTurn::Pending(results)
 }
 
 /// The last lines the fake wrote: the requests it received, so a stuck turn
@@ -5537,11 +5673,14 @@ async fn run_acp_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_acp_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    await_turn_result(
+    let results = await_turn_result(
         &mut rx,
         "run_acp_column/native",
         ENGINE_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        0,
     )
     .await;
 
@@ -5560,6 +5699,9 @@ async fn run_acp_column() -> Measures {
         "run_acp_column/acp",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        results,
     )
     .await;
 
@@ -5733,11 +5875,14 @@ async fn run_codex_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_codex_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    await_turn_result(
+    let results = await_turn_result(
         &mut rx,
         "run_codex_column/native",
         ENGINE_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        0,
     )
     .await;
 
@@ -5756,6 +5901,9 @@ async fn run_codex_column() -> Measures {
         "run_codex_column/codex",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        results,
     )
     .await;
 
@@ -6105,6 +6253,85 @@ fn a_request_without_the_version_header_is_a_real_gap_of_the_harness() {
         anthropic_messages_verdict(&[post], true, ANTHROPIC_KEY).expect("the headers are reported");
     assert!(!ok, "a missing version header is a gap: {seen}");
     assert!(seen.contains("anthropic-version=false"), "{seen}");
+}
+
+fn stored(seq: i64, event: &ChatEvent) -> crate::neo4j::models::ChatEventRecord {
+    crate::neo4j::models::ChatEventRecord {
+        id: Uuid::new_v4(),
+        session_id: Uuid::nil(),
+        seq,
+        event_type: event.event_type().to_string(),
+        data: serde_json::to_string(event).unwrap(),
+        created_at: Utc::now(),
+    }
+}
+
+fn stored_result(is_error: bool) -> ChatEvent {
+    serde_json::from_value(json!({
+        "type": "result", "session_id": "s", "duration_ms": 1,
+        "subtype": if is_error { "error_during_execution" } else { "success" },
+        "is_error": is_error,
+    }))
+    .unwrap()
+}
+
+fn stored_error(message: &str) -> ChatEvent {
+    serde_json::from_value(json!({"type": "error", "message": message, "code": "provider_failed"}))
+        .unwrap()
+}
+
+#[test]
+fn a_stored_turn_is_read_past_the_results_of_the_earlier_turns() {
+    let records = vec![
+        stored(0, &stored_result(false)),
+        stored(1, &stored_result(false)),
+    ];
+    assert_eq!(stored_turn(&records[..1], 1), StoredTurn::Pending(1));
+    assert_eq!(stored_turn(&records, 1), StoredTurn::Answered(2));
+    assert_eq!(stored_turn(&records, 0), StoredTurn::Answered(1));
+}
+
+#[test]
+fn a_fast_failure_stored_before_the_subscription_is_a_failure_not_an_answer() {
+    // Codex/ACP failing at once: an Error, then a Result { is_error }.
+    let records = vec![
+        stored(0, &stored_result(false)),
+        stored(1, &stored_error("codex app-server exited")),
+        stored(2, &stored_result(true)),
+    ];
+    match stored_turn(&records, 1) {
+        StoredTurn::Failed(failure) => assert!(
+            failure.contains("codex app-server exited"),
+            "the failure names the message: {failure}"
+        ),
+        other => panic!("a stored Error must fail the turn, got {other:?}"),
+    }
+    // The Result { is_error } alone fails it too.
+    let records = vec![
+        stored(0, &stored_result(false)),
+        stored(1, &stored_result(true)),
+    ];
+    assert!(
+        matches!(stored_turn(&records, 1), StoredTurn::Failed(f) if f.contains("is_error: true"))
+    );
+}
+
+#[test]
+fn an_error_of_an_earlier_turn_is_not_this_turns() {
+    let records = vec![
+        stored(0, &stored_error("earlier")),
+        stored(1, &stored_result(false)),
+        stored(2, &stored_result(false)),
+    ];
+    assert_eq!(stored_turn(&records, 1), StoredTurn::Answered(2));
+}
+
+#[test]
+#[should_panic(expected = "does not parse")]
+fn a_stored_result_that_does_not_parse_is_named_not_skipped() {
+    let mut bad = stored(1, &stored_result(false));
+    bad.data = "{not json".to_string();
+    stored_turn(&[stored(0, &stored_result(false)), bad], 1);
 }
 
 #[test]

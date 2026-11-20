@@ -644,16 +644,26 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
-/// Delete a task and all its related data
+/// Delete a task and all its related data.
+///
+/// The task's steps and decisions go with it — the same ownership rule as
+/// deleting a plan or a project. The answer stays an empty 204; what went with
+/// the task is logged here, so the cascade is at least on the record.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
+    let report = state
         .orchestrator
         .plan_manager()
         .delete_task(task_id)
         .await?;
+    tracing::info!(
+        %task_id,
+        steps_deleted = report.steps_deleted,
+        decisions_deleted = report.deleted_decision_ids.len(),
+        "task deleted with its steps and decisions"
+    );
     state
         .event_bus
         .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
@@ -4827,10 +4837,7 @@ pub async fn update_fabric_scores(
 
     // Also compute churn, knowledge_density, and risk scores
     let neo = state.orchestrator.neo4j();
-    let churn = neo
-        .compute_churn_scores(project_id)
-        .await
-        .unwrap_or_default();
+    let churn = neo.compute_churn_scores(project_id).await?;
     let churn_count = churn.len();
     let _ = neo.batch_update_churn_scores(&churn).await;
 
@@ -6912,10 +6919,9 @@ pub async fn get_plan_dependency_graph(
 
     // Batch-fetch enrichment data (counts + step details) for all tasks
     let task_ids: Vec<String> = tasks.iter().map(|t| t.id.to_string()).collect();
-    let enrichment = neo4j
-        .get_task_enrichment_data(&task_ids)
-        .await
-        .unwrap_or_default();
+    // A refusal must not become an empty enrichment: steps and counters at 0
+    // read as "nothing to do", which is a different answer from "cannot read".
+    let enrichment = neo4j.get_task_enrichment_data(&task_ids).await?;
 
     // Which of those sessions are actually running. This used to be read from
     // `cs.is_streaming` in Neo4j, a property nothing writes, so
@@ -10972,9 +10978,33 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_supersede_decision() {
-        let app = test_app().await;
-        let new_id = uuid::Uuid::new_v4();
-        let old_id = uuid::Uuid::new_v4();
+        // Two decisions that exist: the old one becomes superseded, the new
+        // one keeps its status. (This test used to supersede two random ids
+        // and expect 204 — the silent success of issue #1189.)
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(auth_post_json(
+                    &format!("/api/tasks/{}/decisions", task.id),
+                    serde_json::json!({ "description": "d", "rationale": "r" }),
+                ))
+                .await
+                .unwrap();
+            ids.push(
+                resp_json(resp).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            );
+        }
+        let (new_id, old_id) = (ids[0], ids[1]);
+        let new_status_before = graph.get_decision(new_id).await.unwrap().unwrap().status;
         let uri = format!("/api/decisions/{}/supersedes/{}", new_id, old_id);
         let resp = app
             .oneshot(
@@ -10989,6 +11019,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+        assert_eq!(
+            graph.get_decision(old_id).await.unwrap().unwrap().status,
+            crate::neo4j::models::DecisionStatus::Superseded
+        );
+        assert_eq!(
+            graph.get_decision(new_id).await.unwrap().unwrap().status,
+            new_status_before
+        );
     }
 
     // ----------------------------------------------------------------
@@ -13929,6 +13967,116 @@ pub(crate) mod tests {
             Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap())
         );
         assert_eq!(stored.estimated_minutes, Some(45));
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #1189 — a write that changes nothing does not answer success
+    // ----------------------------------------------------------------
+
+    /// `task enrich` caches the rendered prompt on the task and the runner
+    /// serves that cache as is. A write that changes what the prompt says must
+    /// drop it, or the agent is still given the old criteria and the old steps.
+    #[tokio::test]
+    async fn a_write_that_changes_the_prompt_drops_the_cached_prompt() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let step_id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "a step" }),
+        )
+        .await;
+
+        let writes = [
+            (
+                format!("/api/tasks/{task_id}"),
+                serde_json::json!({ "acceptance_criteria": ["new criterion"] }),
+            ),
+            (
+                format!("/api/tasks/{task_id}"),
+                serde_json::json!({ "description": "new statement" }),
+            ),
+            (
+                format!("/api/steps/{step_id}"),
+                serde_json::json!({ "status": "skipped" }),
+            ),
+            (
+                format!("/api/steps/{step_id}"),
+                serde_json::json!({ "description": "new wording" }),
+            ),
+        ];
+        for (uri, body) in writes {
+            graph
+                .update_task_enrichment(task_id, None, None, Some("STALE PROMPT"))
+                .await
+                .unwrap();
+            let resp = app
+                .clone()
+                .oneshot(auth_patch_json(&uri, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            let cached = graph.get_task(task_id).await.unwrap().unwrap().prompt_cache;
+            assert_eq!(cached, None, "PATCH {uri} {body} left the cached prompt");
+        }
+
+        // A status change alone says nothing the prompt renders: the cache stays.
+        graph
+            .update_task_enrichment(task_id, None, None, Some("STILL GOOD"))
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{task_id}"),
+                serde_json::json!({ "status": "in_progress" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            graph.get_task(task_id).await.unwrap().unwrap().prompt_cache,
+            Some("STILL GOOD".to_string())
+        );
+    }
+
+    /// Kept as it is on main, on purpose: superseding two ids that name no
+    /// decision answers 204 and writes nothing. Refusing it is a contract
+    /// change, made in the contract PR, not here.
+    #[tokio::test]
+    async fn superseding_two_unknown_ids_still_answers_204() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!(
+                    "/api/decisions/{}/supersedes/{}",
+                    Uuid::new_v4(),
+                    Uuid::new_v4()
+                ),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A task in the mock store, with its id.
+    async fn seeded_task(graph: &crate::neo4j::mock::MockGraphStore) -> Uuid {
+        let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        task.id
+    }
+
+    async fn posted_id(app: &axum::Router, uri: &str, body: serde_json::Value) -> String {
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(uri, body))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "POST {uri}: {}", resp.status());
+        resp_json(resp).await["id"].as_str().unwrap().to_string()
     }
 }
 

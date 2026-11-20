@@ -204,6 +204,7 @@ pub async fn stored_entries(
                 is_default: false,
                 allowed_for_project: allowed,
                 endpoint_origin: (!st::is_process_kind(&i.kind)).then(|| i.origin.clone()),
+                origin: st::is_process_kind(&i.kind).then(|| i.origin.clone()),
                 credential: i.credential_ref,
                 health: HealthEntry::unknown(),
                 models,

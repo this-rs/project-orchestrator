@@ -7,10 +7,12 @@
 //! par le test de migration. Ici, chaque chemin d'écriture est joué et relu.
 //!
 //! ```text
-//! NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpassword \
+//! NEO4J_URI=bolt://localhost:17687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpassword \
 //!   cargo test --test code_graph_stable_key
 //! ```
 //! Chaque test alloue des chemins uniques et supprime ce qu'il a créé.
+
+mod common;
 
 use chrono::Utc;
 use project_orchestrator::neo4j::models::*;
@@ -18,9 +20,11 @@ use project_orchestrator::neo4j::Neo4jClient;
 use uuid::Uuid;
 
 async fn store() -> Option<Neo4jClient> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     match Neo4jClient::new(&uri, &user, &password).await {
         Ok(client) => Some(client),
         Err(err) => {

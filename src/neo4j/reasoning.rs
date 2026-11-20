@@ -7,6 +7,7 @@
 //! blob for the tree structure (not individual nodes — too heavy for v1).
 //! A `REASONING_FOR` relation links the tree to the ProtocolRun or Note
 //! that it was associated with.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -208,8 +209,8 @@ impl Neo4jClient {
                 id: node.get::<String>("id")?.parse()?,
                 request: node.get("request")?,
                 confidence: node.get("confidence").unwrap_or(0.0),
-                node_count: node.get::<i64>("node_count").unwrap_or(0) as usize,
-                depth: node.get::<i64>("depth").unwrap_or(0) as usize,
+                node_count: unsigned(node.get::<i64>("node_count").unwrap_or(0), usize::MAX),
+                depth: unsigned(node.get::<i64>("depth").unwrap_or(0), usize::MAX),
                 created_at: node
                     .get::<String>("created_at")
                     .ok()
@@ -244,8 +245,8 @@ impl Neo4jClient {
         tree.id = node.get::<String>("id")?.parse()?;
         tree.roots = roots;
         tree.confidence = node.get("confidence").unwrap_or(0.0);
-        tree.node_count = node.get::<i64>("node_count").unwrap_or(0) as usize;
-        tree.depth = node.get::<i64>("depth").unwrap_or(0) as usize;
+        tree.node_count = unsigned(node.get::<i64>("node_count").unwrap_or(0), usize::MAX);
+        tree.depth = unsigned(node.get::<i64>("depth").unwrap_or(0), usize::MAX);
         tree.created_at = node
             .get::<String>("created_at")
             .ok()

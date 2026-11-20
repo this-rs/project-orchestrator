@@ -156,6 +156,11 @@ pub struct ProviderEntry {
     pub allowed_for_project: Option<bool>,
     /// Origin (scheme, host, port) of the endpoint, never a path or a credential.
     pub endpoint_origin: Option<String>,
+    /// Identity a consent is tied to for a kind that has no endpoint URL: `process:codex`,
+    /// `process:acp:<preset>`, or the `ssh:<host>:<port>` of a remote Claude Code.
+    /// Absent for an endpoint kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// Credential REFERENCE (`vault:<name>`, `env:<VAR>`, `none`), never the value.
     pub credential: String,
     /// Health.
@@ -244,6 +249,7 @@ pub fn builtin_claude_code(
         is_default: false,
         allowed_for_project: asked_project.then_some(true),
         endpoint_origin: None,
+        origin: None,
         credential: "none".to_string(),
         health,
         models,

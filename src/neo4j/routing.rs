@@ -10,6 +10,7 @@
 //!
 //! [`Neo4jRoutingStore`] adapts any [`GraphStore`] to the
 //! [`RoutingArmStore`] the scorer, the feedback and the report depend on.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -49,11 +50,11 @@ fn arm_from_row(row: &neo4rs::Row) -> Result<ArmStats> {
         ),
         alpha: row.get("alpha")?,
         beta: row.get("beta")?,
-        n: row.get::<i64>("n")?.max(0) as u64,
+        n: unsigned(row.get::<i64>("n")?, u64::MAX),
         cost_sum_usd: row.get("cost_sum_usd")?,
-        cost_n: row.get::<i64>("cost_n")?.max(0) as u64,
-        latency_sum_ms: row.get::<i64>("latency_sum_ms")?.max(0) as u64,
-        latency_n: row.get::<i64>("latency_n")?.max(0) as u64,
+        cost_n: unsigned(row.get::<i64>("cost_n")?, u64::MAX),
+        latency_sum_ms: unsigned(row.get::<i64>("latency_sum_ms")?, u64::MAX),
+        latency_n: unsigned(row.get::<i64>("latency_n")?, u64::MAX),
         updated_at: DateTime::parse_from_rfc3339(&updated_at)
             .map(|t| t.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),

@@ -1,4 +1,5 @@
 //! Neo4j Chat Session and Event operations
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -3357,7 +3358,7 @@ fn anchor_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::Anchor> 
         snapshot_path: anchor_opt(s("snapshot_path")),
         snapshot_type: anchor_opt(s("snapshot_type")),
         rev: anchor_opt(s("rev")),
-        version: node.get::<i64>("version").unwrap_or(1).max(1) as u64,
+        version: unsigned(node.get::<i64>("version").unwrap_or(1), u64::MAX).max(1),
         created_at: parse_ts(&s("created_at"))?,
         updated_at: parse_ts(&s("updated_at"))?,
     })
@@ -3370,7 +3371,7 @@ fn anchor_event_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::An
     let json = |k: &str| anchor_opt(s(k)).and_then(|j| serde_json::from_str(&j).ok());
     Ok(AnchorEvent {
         id: s("id").parse()?,
-        seq: node.get::<i64>("seq").unwrap_or(0).max(0) as u64,
+        seq: unsigned(node.get::<i64>("seq").unwrap_or(0), u64::MAX),
         session_id: s("session_id").parse()?,
         anchor_id: s("anchor_id").parse()?,
         kind: AnchorEventKind::parse(&s("kind")).ok_or_else(|| bad("kind"))?,
@@ -3440,7 +3441,7 @@ impl Neo4jClient {
             // The number this operation takes IF it writes an event (otherwise the
             // transaction is rolled back below, so the number is not consumed:
             // no gap). The lock above serializes writers, hence no duplicate.
-            let seq = locked.get::<i64>("seq")?.max(0) as u64;
+            let seq = unsigned(locked.get::<i64>("seq")?, u64::MAX);
             // The version the set had before this operation.
             let current = seq.saturating_sub(1);
             if let Some(expected) = if_match.filter(|v| *v != current) {
@@ -3592,7 +3593,7 @@ impl Neo4jClient {
         let Some(row) = result.next().await? else {
             return Ok(None);
         };
-        let version = row.get::<i64>("version")?.max(0) as u64;
+        let version = unsigned(row.get::<i64>("version")?, u64::MAX);
         let nodes: Vec<neo4rs::Node> = row.get("anchors")?;
         let anchors = nodes
             .iter()
@@ -3712,19 +3713,35 @@ impl Neo4jClient {
 
     /// See `AnalyticsStore::backfill_project_anchors`.
     pub async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        self.backfill_project_anchors_for(None).await
+    }
+
+    /// [`Self::backfill_project_anchors`] restricted to the sessions whose `project_slug` is
+    /// one of `slugs` (`None` = every session, the operator's sweep). The unscoped sweep
+    /// writes to every session of the database, so anything sharing the database with it (the
+    /// parallel tests of `harness_neo4j`) must scope it to what it owns.
+    pub async fn backfill_project_anchors_for(
+        &self,
+        slugs: Option<&[String]>,
+    ) -> Result<crate::chat::anchor::BackfillReport> {
         use crate::chat::anchor::*;
         let mut result = self
             .graph
-            .execute(query(
-                // `s.id IS NOT NULL` too: a session node created by something else (a test, an
-                // older writer) may carry `project_slug` without `id`, and reading a missing
-                // property ABORTS the whole backfill ("The property does not exist", measured on
-                // CI 11/11/2026, job Integration Tests). A malformed node is skipped and counted,
-                // never a reason to fail the sweep.
-                "MATCH (s:ChatSession) WHERE s.id IS NOT NULL \
+            .execute(
+                query(
+                    // `s.id IS NOT NULL` too: a session node created by something else (a test, an
+                    // older writer) may carry `project_slug` without `id`, and reading a missing
+                    // property ABORTS the whole backfill ("The property does not exist", measured on
+                    // CI 11/11/2026, job Integration Tests). A malformed node is skipped and counted,
+                    // never a reason to fail the sweep.
+                    "MATCH (s:ChatSession) WHERE s.id IS NOT NULL \
                  AND s.project_slug IS NOT NULL AND s.project_slug <> '' \
+                 AND (NOT $scoped OR s.project_slug IN $slugs) \
                  RETURN s.id AS id, s.project_slug AS slug ORDER BY s.id",
-            ))
+                )
+                .param("scoped", slugs.is_some())
+                .param("slugs", slugs.map(<[String]>::to_vec).unwrap_or_default()),
+            )
             .await?;
         let mut sessions = Vec::new();
         while let Some(row) = result.next().await? {
@@ -3780,14 +3797,32 @@ impl Neo4jClient {
 
     /// See `AnalyticsStore::backfill_spawned_by_edges`.
     pub async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        self.backfill_spawned_by_edges_for(None).await
+    }
+
+    /// [`Self::backfill_spawned_by_edges`] restricted to the children `children` (`None` =
+    /// every session). See [`Self::backfill_project_anchors_for`].
+    pub async fn backfill_spawned_by_edges_for(&self, children: Option<&[Uuid]>) -> Result<usize> {
         let mut result = self
             .graph
-            .execute(query(
-                "MATCH (c:ChatSession) \
+            .execute(
+                query(
+                    "MATCH (c:ChatSession) \
                  WHERE c.spawned_by IS NOT NULL AND c.spawned_by <> '' \
                    AND NOT EXISTS { (c)-[:SPAWNED_BY]->(:ChatSession) } \
+                   AND (NOT $scoped OR c.id IN $ids) \
                  RETURN c.id AS id, c.spawned_by AS sb ORDER BY c.id",
-            ))
+                )
+                .param("scoped", children.is_some())
+                .param(
+                    "ids",
+                    children
+                        .unwrap_or_default()
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>(),
+                ),
+            )
             .await?;
         let mut todo = Vec::new();
         while let Some(row) = result.next().await? {
@@ -3825,12 +3860,19 @@ impl Neo4jClient {
 
     /// See `GraphStore::revert_inferred_anchors`. One statement, hence atomic.
     pub async fn revert_inferred_anchors(&self) -> Result<usize> {
+        self.revert_inferred_anchors_for(None).await
+    }
+
+    /// [`Self::revert_inferred_anchors`] restricted to the anchors of `sessions` (`None` =
+    /// every session). See [`Self::backfill_project_anchors_for`].
+    pub async fn revert_inferred_anchors_for(&self, sessions: Option<&[Uuid]>) -> Result<usize> {
         let mut result = self
             .graph
             .execute(
                 query(
                     "MATCH (a:Anchor) \
                      WHERE a.inferred = true AND a.by = 'system' AND a.version = 1 \
+                       AND (NOT $scoped OR a.session_id IN $sids) \
                        AND EXISTS { MATCH (x:AnchorEvent {anchor_id: a.id, kind: 'added', actor: $actor}) } \
                      OPTIONAL MATCH (e:AnchorEvent {anchor_id: a.id}) \
                      WITH a, collect(e) AS evs \
@@ -3839,7 +3881,16 @@ impl Neo4jClient {
                      DELETE a \
                      RETURN count(aid) AS n",
                 )
-                .param("actor", crate::chat::anchor::BACKFILL_ACTOR),
+                .param("actor", crate::chat::anchor::BACKFILL_ACTOR)
+                .param("scoped", sessions.is_some())
+                .param(
+                    "sids",
+                    sessions
+                        .unwrap_or_default()
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>(),
+                ),
             )
             .await?;
         Ok(match result.next().await? {

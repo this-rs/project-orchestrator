@@ -35,6 +35,10 @@ pub mod close_reason {
     pub const PROCESS_DIED: &str = "process_died";
     /// The session was a sub-agent's, and its call returned.
     pub const SUBAGENT_FINISHED: &str = "subagent_finished";
+    /// The idle cleanup closed it: idle past its timeout, or its turn waited on a person
+    /// past the person wait cap (`ChatManager::idle_cleanup_pass`); also the close that
+    /// frees a slot when the session table is full (`reclaim_idle_slot`).
+    pub const IDLE_TIMEOUT: &str = "idle_timeout";
     /// The session was torn down for an in-place provider switch. It writes no episode:
     /// the same thread must see only `provider_switched`.
     pub const SWITCHED: &str = "switched";

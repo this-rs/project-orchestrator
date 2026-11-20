@@ -64,6 +64,7 @@ pub mod trajectory;
 pub mod trajectory_migration;
 pub mod trajectory_store;
 mod trigger;
+mod unsigned;
 mod user;
 mod workspace;
 

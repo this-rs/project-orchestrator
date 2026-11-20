@@ -224,6 +224,26 @@ impl std::fmt::Display for UnknownWindow {
     }
 }
 
+/// Lecture du cache de prompt Anthropic : 0,1 × le prix d'entrée.
+pub const ANTHROPIC_CACHE_READ_FACTOR: f64 = 0.1;
+/// Écriture du cache de prompt Anthropic (TTL 5 min) : 1,25 × le prix d'entrée.
+pub const ANTHROPIC_CACHE_WRITE_FACTOR: f64 = 1.25;
+
+/// Complète les prix de cache d'un modèle Anthropic à partir de son prix d'entrée publié.
+/// Un prix de cache déjà présent est gardé ; un prix d'entrée absent ou non fini laisse
+/// `None` (jamais de prix inventé).
+pub fn with_anthropic_cache_prices(mut price: ModelPrice) -> ModelPrice {
+    if price.input_per_mtok.is_finite() && price.input_per_mtok > 0.0 {
+        price.cache_read_per_mtok = price
+            .cache_read_per_mtok
+            .or(Some(price.input_per_mtok * ANTHROPIC_CACHE_READ_FACTOR));
+        price.cache_write_per_mtok = price
+            .cache_write_per_mtok
+            .or(Some(price.input_per_mtok * ANTHROPIC_CACHE_WRITE_FACTOR));
+    }
+    price
+}
+
 /// The Claude Code models the router may choose from: one per model of the
 /// live Anthropic catalog, with the window the Models API reports for it
 /// (`max_input_tokens`) and the other capabilities the Claude Code provider

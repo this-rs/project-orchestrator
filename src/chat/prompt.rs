@@ -732,7 +732,7 @@ Manage tasks.
 | list | `plan_id`, `search`, `limit`, `offset` | List tasks |
 | create | `plan_id` (req), `title` (req), `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Create task |
 | get | `task_id` (req) | Get task by UUID |
-| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `assigned_to`, `priority`, `tags` | Update task |
+| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Update task |
 | delete | `task_id` (req) | Delete a task |
 | get_next | `plan_id` (req) | Get next actionable task |
 | add_dependencies | `task_id` (req), `dependency_ids` (req, array) | Add task dependencies |
@@ -764,7 +764,7 @@ Manage steps within tasks.
 |--------|---------------|-------------|
 | list | `task_id` (req) | List steps for task |
 | create | `task_id` (req), `description` (req), `verification` | Create a step |
-| update | `step_id` (req), `status` (req: pending/in_progress/completed/skipped) | Update step status |
+| update | `step_id` (req), `status` (pending/in_progress/completed/skipped), `description`, `verification` | Update a step |
 | get | `step_id` (req) | Get step by UUID |
 | delete | `step_id` (req) | Delete a step |
 | get_progress | `task_id` (req) | Get step completion progress |
