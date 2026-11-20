@@ -6304,10 +6304,6 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
          add_task_dependency pushes a duplicate edge on repeat",
     ),
     mock(
-        "check_absent_entity_matrix",
-        "increment_frustration/decrement_frustration/get_frustration on an unknown task are Err(\"Task not found\") where Neo4j answers Ok(0.0)",
-    ),
-    mock(
         "check_cascade_delete_project",
         "files upserted with a project_id are not counted under it (count_project_files 0 before the delete); \
          delete_project neither removes the File nodes by path nor archives the project's notes (status archived, project_id None)",
