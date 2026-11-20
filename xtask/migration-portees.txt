@@ -5,7 +5,9 @@
 # fichier soit EXACTEMENT cet ensemble ; `cargo xtask migration-gate --base` refuse
 # qu'une ligne disparaisse depuis la base. Il ne fait que GROSSIR.
 # Mis à jour : 20/11/2026, sur la branche de consolidation (tête 7e1b92dd).
-# Pas encore portés (ni listés) : AnalyticsStore (PR #1250), SearchStore (PR #1251).
+# Pas encore porté (ni listé) : SearchStore (PR #1251).
+# AnalyticsStore : porté en partie (PR #1250, sous-lot A1 : 25 méthodes servies, 119 refusées par nom).
+AnalyticsStore
 AuthStore
 ChatStore
 CodeStore
