@@ -1534,10 +1534,116 @@ async fn a_reinforcement_cut_at_every_write_leaves_a_readable_prefix() {
             s.iter().all(|x| proche(x.1, 0.5) || proche(x.1, 0.7)),
             "k={k}: a weight is the old or the new one, never a mix: {s:?}"
         );
+        store.close().await.unwrap();
+        // Every property of every edge, as the engine holds it. The weight is written LAST of
+        // an edge's properties: an edge whose weight is the new one carries ALL the new
+        // properties; one whose weight is the old one carries a prefix of them (counter and
+        // stamps new or still old) and nothing else (source and creation date never move).
+        let brutes = base_brute(&base, |db| aretes_brutes(db, "SYNAPSE")).await;
+        assert_eq!(brutes.len(), 2, "k={k}: no edge lost or added");
+        for e in &brutes {
+            let compte = e.2["reinforcement_count"].as_int64().unwrap();
+            assert_eq!(e.2["source"].as_str(), Some("coactivation"), "k={k}");
+            assert!(e.2.contains_key("created_at"), "k={k}");
+            if proche(poids(e), 0.7) {
+                assert_eq!(compte, 2, "k={k}: a new weight carries the new counter");
+                for c in ["last_reinforced_at", "decayed_at"] {
+                    assert!(e.2.contains_key(c), "k={k}: {c}");
+                }
+            } else {
+                assert!(proche(poids(e), 0.5), "k={k}: {}", poids(e));
+                assert!(compte == 1 || compte == 2, "k={k}: {compte}");
+            }
+        }
         // And the base keeps working: the next reinforcement goes through.
+        let store = open(&base).await;
         store.reinforce_synapses(&ids, 0.1).await.unwrap();
     }
     panic!("the cut never ran out of writes: raise the bound");
+}
+
+/// `rate_limited_energy_boost` cut at every engine write: the persona reads back either as
+/// before or with the energy raised; the accumulator (written last) never runs ahead of the
+/// energy, so a cut never charges a boost that was not given.
+#[tokio::test]
+async fn a_persona_boost_cut_at_every_write_never_charges_an_unapplied_boost() {
+    let mut fin = None;
+    for k in 1..=6 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = une_persona(0.5, 0.0);
+        store.create_persona(&p).await.unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .rate_limited_energy_boost(p.id, 0.2, 0.5)
+            .await
+            .is_ok()
+        {
+            fin = Some(k);
+            break;
+        }
+        assert!(store.get_persona(p.id).await.is_err(), "k={k}: indéterminé");
+        drop(store);
+        let store = open(&base).await;
+        let l = store.get_persona(p.id).await.unwrap().unwrap();
+        assert!(
+            proche(l.energy, 0.5) || proche(l.energy, 0.7),
+            "k={k}: {l:?}"
+        );
+        if proche(l.energy_boost_accumulated, 0.2) {
+            assert!(
+                proche(l.energy, 0.7),
+                "k={k}: charged without the boost: {l:?}"
+            );
+        } else {
+            assert!(proche(l.energy_boost_accumulated, 0.0), "k={k}: {l:?}");
+        }
+    }
+    assert_eq!(fin, Some(4), "three engine writes");
+}
+
+/// `COALESCE(e.path, e.id)`: a target that carries a `path` property answers it.
+#[tokio::test]
+async fn an_entity_link_answers_the_target_path_when_it_has_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (p, n, q);
+    {
+        let store = open(&base).await;
+        p = projet_actif(&store).await;
+        q = projet_actif(&store).await;
+        n = des_notes(&store, Some(p.id), 1).await;
+        store
+            .link_note_to_entity(n[0].id, &EntityType::Project, &q.id.to_string(), None, None)
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+    let qid = q.id;
+    base_brute(&base, move |db| {
+        for x in db.store().nodes_by_label("Project") {
+            let id = db
+                .get_node(x)
+                .unwrap()
+                .get_property("id")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap();
+            if id == qid.to_string() {
+                db.set_node_property(x, "path", Value::from("src/lib.rs"));
+            }
+        }
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(
+        store.get_project_note_entity_links(p.id).await.unwrap(),
+        vec![(
+            n[0].id.to_string(),
+            "unknown".to_string(),
+            "src/lib.rs".to_string()
+        )]
+    );
 }
 
 /// A boost and a scar cut at every engine write: the note reads back, with an energy that is

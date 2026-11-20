@@ -69,7 +69,9 @@
 //! store refuses everything until reopened (`indetermine`), and each property of the
 //! prefix is valid on its own (a weight stays in range, a counter only grows). The
 //! property that carries the meaning is written last (the weight of a reinforcement,
-//! the energy of a boost).
+//! the energy of a boost, the accumulator of a persona's rate limit). The decay pass
+//! writes the energy THEN its stamp: a cut leaves the old stamp, so the next pass decays
+//! again from it and never loses a decay.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -409,10 +411,14 @@ fn reveiller(w: &mut Ecriture<'_>, a: NodeId, b: NodeId, methode: &str) -> Resul
 }
 
 /// The per-pair checks done before any write: no parallel `SYNAPSE` or `FORGOTTEN` edge.
-fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<()> {
+/// `avec_oubli`: also the archived `FORGOTTEN` edges, for the writers that read them
+/// (a revival); `create_synapses` never reads them.
+fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId, avec_oubli: bool) -> Result<()> {
     for (x, y) in [(a, b), (b, a)] {
         sans_doublon(db, x, y, SYNAPSE)?;
-        sans_doublon(db, x, y, OUBLIE)?;
+        if avec_oubli {
+            sans_doublon(db, x, y, OUBLIE)?;
+        }
     }
     Ok(())
 }
@@ -525,7 +531,7 @@ impl ObrainGraphStore {
                     (src, cibles)
                 };
                 for (n, _) in &cibles {
-                    pair_sans_doublon(w.db, src, *n)?;
+                    pair_sans_doublon(w.db, src, *n, false)?;
                 }
                 let mut lignes = 0usize;
                 ecritures(w, |w| {
@@ -898,7 +904,7 @@ impl ObrainGraphStore {
             }
         }
         for (a, b) in &paires {
-            pair_sans_doublon(w.db, *a, *b)?;
+            pair_sans_doublon(w.db, *a, *b, true)?;
         }
         Ok(paires)
     }
@@ -1069,15 +1075,29 @@ impl ObrainGraphStore {
         &self,
         projet: Uuid,
     ) -> Result<Vec<(String, String, String)>> {
-        self.lire(move |_, etat| {
+        self.lire(move |db, etat| {
             refus_si_notes_en_quarantaine(etat, "get_project_note_entity_links")?;
-            let mut v: Vec<(String, String, String)> = etat
-                .notes
-                .liens_du_projet(projet)?
-                .into_iter()
-                // A `Project` or a `Note` is none of the code entities the Cypher names.
-                .map(|(note, entite)| (note.to_string(), "unknown".to_string(), entite))
-                .collect();
+            let mut v: Vec<(String, String, String)> = Vec::new();
+            for (note, entite) in etat.notes.liens_du_projet(projet)? {
+                // `COALESCE(e.path, e.id, ...)`: the target's `path` property when it has
+                // one, else its id. The type is `unknown`: a `Project` or a `Note` is none of
+                // the code entities (File, Function, Struct, Trait, Enum) the Cypher names.
+                let cible = entite
+                    .parse::<Uuid>()
+                    .ok()
+                    .and_then(|u| etat.notes.noeud_de(u).or_else(|| etat.projets.noeud_de(u)));
+                let id = match cible {
+                    Some(n) => match propriete(db, n, "path")? {
+                        Some(p) => p
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("nœud {n:?} : `path` n'est pas une chaîne"))?,
+                        None => entite,
+                    },
+                    None => entite,
+                };
+                v.push((note.to_string(), "unknown".to_string(), id));
+            }
             v.sort();
             Ok(v)
         })
@@ -1135,11 +1155,14 @@ impl ObrainGraphStore {
                 let mut mises_a_jour = 0usize;
                 ecritures(w, |w| {
                     for (id, avant, apres) in &a_faire {
-                        let mut p = vec![("energy_updated_at", Value::from(now.to_rfc3339()))];
+                        // The energy first, the stamp last: a cut between the two leaves the
+                        // old stamp, so the next pass decays from it again (never loses a decay).
+                        let mut p = Vec::new();
                         if (avant - apres).abs() > 0.001 {
                             p.push(("energy", Value::from(*apres)));
                             mises_a_jour += 1;
                         }
+                        p.push(("energy_updated_at", Value::from(now.to_rfc3339())));
                         if let Some(e) = note::poser_proprietes_de_note(w, *id, p)? {
                             publiees.push(e);
                         }
@@ -1182,9 +1205,9 @@ impl ObrainGraphStore {
                         w,
                         id,
                         vec![
-                            ("energy", Value::from(nouvelle)),
                             ("last_activated", Value::from(now.clone())),
                             ("energy_updated_at", Value::from(now.clone())),
+                            ("energy", Value::from(nouvelle)),
                         ],
                     )
                 })?;
@@ -1458,7 +1481,7 @@ impl ObrainGraphStore {
                 }
                 let energie = e.persona.energy;
                 let proprietes = vec![
-                    ("energy_boost_accumulated", Value::from(accumule + boost)),
+                    ("updated_at", Value::from(Utc::now().to_rfc3339())),
                     (
                         "energy",
                         Value::from(if energie + boost > 1.0 {
@@ -1467,7 +1490,8 @@ impl ObrainGraphStore {
                             energie + boost
                         }),
                     ),
-                    ("updated_at", Value::from(Utc::now().to_rfc3339())),
+                    // The accumulator last: it is what bounds the next boost.
+                    ("energy_boost_accumulated", Value::from(accumule + boost)),
                 ];
                 ecritures(w, |w| {
                     persona::ecrire_proprietes_de_persona(w, persona_id, proprietes)
