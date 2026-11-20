@@ -72,7 +72,10 @@ Preuves rejouées (20/11/2026) :
 | ligne `ProjectStore` retirée du cliquet | test : `NON CONSIGNÉ ["ProjectStore"]` ; porte avec base : `CLIQUET RÉDUIT`, exit 1 |
 | `AnalyticsStore` listé sans être porté | test : `RÉGRESSION ["AnalyticsStore"]` |
 
-**Limite connue** : la porte exécute le code de la PR. Une PR qui réécrit la porte elle-même
+**Limites connues** : un `impl` dont toutes les méthodes refusent à la main compte comme
+porté (le générateur compte les méthodes écrites, voir `REFUS_ECRITS_A_LA_MAIN`) ; `GraphStore`
+figure parmi les portés parce que son `impl` manuel est imposé (`capabilities` n'a pas de
+défaut), ce qui rend le compte « 20 / 22 » un peu flatteur. La porte exécute le code de la PR. Une PR qui réécrit la porte elle-même
 (changer le chemin du cliquet, par exemple) peut la neutraliser. Ce risque se règle par la
 relecture des changements de `xtask/` et du cliquet, et par la protection de la branche.
 
@@ -81,12 +84,13 @@ Même commande que G2 (second contrôle). C'est un **détecteur** sur la source,
 de comportement. Refusé quand :
 - `DEFAULT_BACKEND` n'est pas défini **exactement une fois** avec la valeur `"default"`
   (une seconde définition sous `#[cfg]`, ou cachée dans une chaîne, est refusée) ;
-- la fabrique de stockage ne construit plus le backend Neo4j pour `BackendKind::Default` ;
+- le bras `BackendKind::Default` de la fabrique n'appelle plus `Self::default_backend(`
+  (contrôle de texte : ce que fait `default_backend` n'est pas vérifié) ;
 - `src/lib.rs` ne retombe plus, **dans le code**, sur `DEFAULT_BACKEND` quand rien n'est
   configuré (une copie dans une chaîne ne compte pas) ;
 - un fichier de déploiement suivi par git fixe `STORAGE_BACKEND` ou `backend:` à obrain :
-  `*.yml`, `*.yaml`, `*.env`, `*.service`, `*.sh`, `*.toml`, `Dockerfile*`,
-  `docker-compose*`, leurs variantes `.example`, y compris `.github/workflows/` et une liste
+  `*.yml`, `*.yaml`, `*.env`, `*.service`, `*.sh`, `*.toml`, `*.json`, `*.tpl`, `*.j2`,
+  `Dockerfile*`, `docker-compose*`, leurs variantes `.example`, y compris `.github/workflows/` et une liste
   d'environnement Kubernetes (`- name: STORAGE_BACKEND` / `value: obrain`). Sont exclus :
   `docs/`, `tests/`, `examples/`, `tools/`, `benches/`, `xtask/`, `src/`, `build/`.
 
@@ -94,9 +98,17 @@ Preuves rejouées sur une copie indépendante : bras `Default` recâblé sur obr
 remplacé avec une copie gardée dans une chaîne, service systemd, `config.yaml.example`,
 liste d'environnement k8s : tous refusés, exit 1. L'arbre réel ne produit aucun faux positif.
 
-**Angles morts** (non détectés) : un repli sur obrain placé avant le défaut dans
-`src/lib.rs` ; une copie du câblage dans du code mort ; une valeur de déploiement atteinte
-par indirection (`ARG B=obrain` puis `ENV STORAGE_BACKEND=$B`). Ce que la constante
+**Angles morts** (non détectés, mesurés le 20/11/2026) :
+- dans `src/lib.rs` : un repli sur obrain placé **avant** le défaut, ou une transformation
+  **après** lui (`….replace("default", "obrain")`) ; une copie du câblage dans du code mort ;
+- dans la fabrique : un `return Self::obrain_backend(…)` placé au début de `default_backend`
+  (le bras appelle toujours `default_backend`, la porte reste verte) ;
+- dans le déploiement : une valeur atteinte par indirection (`ARG B=obrain` puis
+  `ENV STORAGE_BACKEND=$B`) ; une liste k8s où `value: obrain` précède
+  `name: STORAGE_BACKEND` ; une clé `backend:` dont la valeur est sur la ligne suivante ;
+  une extension hors de la liste ci-dessus.
+
+Ce que la constante
 sélectionne est couvert par le test `default_backend_is_selected_for_the_default_value`,
 qui vérifie la correspondance valeur → variant, et non que le variant construit Neo4j.
 

@@ -114,9 +114,12 @@ mod with_the_feature {
     /// Migration gate G2 (docs/migration/GATES.md). The ratchet of ported traits
     /// (`xtask/migration-portees.txt`) must be EXACTLY the set of traits the build
     /// generator (`build/refus_obrain.rs`, parsed with `syn`) treats as implemented
-    /// by hand. This is the compiler's notion of "ported", not a text search: a
-    /// port hidden in a disabled module, a macro, a comment or a string is not a
-    /// port here either.
+    /// by hand: the build's notion of "ported", not a text search (a port left in
+    /// a comment or a string is not one). The generator walks the files without
+    /// evaluating attributes, so an impl disabled by `#[cfg]` still counts as
+    /// ported — and then the build fails (the supertrait `GraphStore` is not
+    /// satisfied, or the generated refusal conflicts), which is the safe side.
+    /// An impl whose methods all refuse by hand still counts as ported.
     /// - a listed trait whose port is gone fails (RÉGRESSION);
     /// - a ported trait left out of the ratchet fails (NON CONSIGNÉ), so a new
     ///   port is protected from the change that introduces it.

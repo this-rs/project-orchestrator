@@ -311,6 +311,9 @@ fn is_deploy_file(path: &str) -> bool {
         || name.ends_with(".service")
         || name.ends_with(".sh")
         || name.ends_with(".toml")
+        || name.ends_with(".json")
+        || name.ends_with(".tpl")
+        || name.ends_with(".j2")
         || name.starts_with("Dockerfile")
         || name.starts_with("docker-compose")
 }
