@@ -389,7 +389,14 @@ jobs:
       # un trait de contrat porté à la main ne peut pas perdre son port, et le
       # backend par défaut reste neo4j tant que la migration n'est pas finie.
       - name: migration-gate — les traits portés ne régressent pas, le défaut reste neo4j
-        run: cargo xtask migration-gate --strict
+        # Rend son verdict même si une étape précédente a échoué. La base est la
+        # cible de la PR (ou le commit précédent sur un push) : une ligne retirée
+        # du cliquet depuis cette base est refusée. Vide (schedule, dispatch) =
+        # pas de comparaison. fetch-depth: 0 rend la base résoluble.
+        if: ${{ !cancelled() }}
+        env:
+          GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: cargo xtask migration-gate --strict --base "$GATE_BASE"
 
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
@@ -722,9 +729,12 @@ jobs:
   # compiles it, nextest runs the default features, and the assertion that counts
   # the refused methods (tests/obrain_backend.rs) would protect nothing.
   #
-  # No service: every base is a temporary directory, and the project conformance
-  # checks of the `obrain_project::` module need neither Neo4j nor Meilisearch
-  # (the `mock_project::`/`neo4j_project::` halves run in the jobs that have them).
+  # No service: every base is a temporary directory, and the obrain conformance
+  # checks (every `obrain_*` module of tests/store_conformance.rs, one per ported
+  # domain) need neither Neo4j nor Meilisearch (the `mock_*`/`neo4j_*` halves run in
+  # the jobs that have them). The filter was `obrain_project::` alone (10 tests):
+  # widened to `obrain_` (86 tests, ~10 s measured locally on 20/11/2026) so the
+  # obrain leg of the conformance gate (docs/migration/GATES.md, G4) actually runs.
   # The kill -9 and inter-process tests re-execute this test binary as their child.
   # ==========================================================================
   obrain-backend:
@@ -754,7 +764,7 @@ jobs:
       - name: Run the obrain backend tests and its share of the conformance suite
         run: |
           cargo test --features obrain-backend --test obrain_backend --test store_conformance \
-            --example obrain_mesures -- obrain_project:: with_the_feature an_unknown
+            --example obrain_mesures -- obrain_ with_the_feature an_unknown
 
       # The task-and-step portage suite had no job at all, and it was measured
       # red for a while without anybody seeing it (16/11/2026: three tests,
