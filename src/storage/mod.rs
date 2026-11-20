@@ -173,13 +173,14 @@ impl StorageBackend {
             // No migration configured. The rollback still re-selects the
             // source (it never touches its data).
             if mig.rollback && requested != BackendKind::Default {
-                tracing::error!(
-                    requested = ?requested,
-                    "storage: rollback demanded by configuration — staying on the source \
-                     backend ('default'); writes made on the requested backend are not visible \
-                     there"
+                // Refused, not served: without `from` no rollback trace is
+                // written, so writes made on the requested backend would
+                // silently disappear from the source. Keep `from` while rolling back.
+                bail!(
+                    "storage.migration.rollback requires storage.migration.from = '{DEFAULT_BACKEND}': \
+                     without it the rollback leaves no trace and the writes made on \
+                     '{requested:?}' would vanish silently"
                 );
-                return Ok(plain(BackendKind::Default));
             }
             return Ok(plain(requested));
         };

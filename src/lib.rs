@@ -1193,6 +1193,7 @@ impl Config {
             .unwrap_or(false),
             from: std::env::var("STORAGE_MIGRATION_FROM")
                 .ok()
+                .filter(|v| !v.trim().is_empty())
                 .or(yaml.storage.migration.from.clone())
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
@@ -3970,8 +3971,9 @@ chat:
         assert!(!config.storage_migration.rollback);
         assert!(!config.storage_migration.disposable);
         assert_eq!(
-            config.storage_migration.from, None,
-            "an empty env value is unset"
+            config.storage_migration.from.as_deref(),
+            Some("default"),
+            "an empty env value is unset: the YAML decides"
         );
 
         // An unreadable flag is a named boot error, never a silent fallback to

@@ -1321,7 +1321,8 @@ mod with_the_feature {
                 let long = p.description.as_ref().unwrap().len() > 256;
                 i += 1;
                 store.create_project(&p).await.unwrap();
-                writeln!(log, "{}\t{}", p.id, i - 1).unwrap();
+                log.write_all(format!("{}\t{}\n", p.id, i - 1).as_bytes())
+                    .unwrap();
                 if mode != "wal" {
                     continue;
                 }
@@ -1593,7 +1594,8 @@ mod with_the_feature {
                     .await
                     .unwrap();
                 use std::io::Write as _;
-                writeln!(log, "{k}\t{}", u.id).unwrap();
+                log.write_all(format!("{k}\t{}\n", u.id).as_bytes())
+                    .unwrap();
             }
         }
 
