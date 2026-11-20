@@ -1,9 +1,10 @@
 //! Startup migration gate — the pieces PO itself owns for the source → target
 //! storage-backend switch.
 //!
-//! The data copy (reading Neo4j, writing obrain) is the migrator's job and
-//! lives outside this repository (the spike-migrateur). What PO owns, and what
-//! this module provides, is the *guarding* and the *decision*:
+//! The data copy (reading Neo4j, writing obrain) is the migrator's job: with
+//! the `obrain-backend` feature it is `storage::migrator::Neo4jToObrain`
+//! (wired by `StorageBackend::from_config`); without it, [`NoMigrator`]. What
+//! this module provides is the *guarding* and the *decision*:
 //!
 //! - a **read-only gate** ([`ReadOnlyGate`], raised by an RAII
 //!   [`ReadOnlyScope`]): while a migration is in progress every write route
@@ -292,9 +293,9 @@ pub fn decide(
 
 // ── The startup orchestration ───────────────────────────────────────────────
 
-/// The data-copy seam. The real migrator (reading Neo4j, writing obrain) lives
-/// outside this repository; PO drives it through this trait and owns the gate
-/// and the decision. An implementation READS the source and WRITES only to
+/// The data-copy seam. The real migrator (reading Neo4j, writing obrain) is
+/// `storage::migrator::Neo4jToObrain` (feature `obrain-backend`); PO drives it
+/// through this trait and owns the gate and the decision. An implementation READS the source and WRITES only to
 /// `dest`: the source is never modified.
 #[async_trait::async_trait]
 pub trait Migrator: Send + Sync {
@@ -307,7 +308,8 @@ pub trait Migrator: Send + Sync {
     async fn target_counts(&self, dest: &Path) -> anyhow::Result<PerTypeCounts>;
 }
 
-/// The migrator wired in a build that carries none: every step fails by name,
+/// The migrator wired in a build without the `obrain-backend` feature (and in
+/// the tests of the gate): every step fails by name,
 /// so a migration request fails CLOSED instead of switching blind.
 pub struct NoMigrator;
 

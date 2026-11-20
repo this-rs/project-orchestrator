@@ -48,7 +48,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) aux 18 modules `obrain_` (86 tests). **Trou** : les 28 contrôles transverses (`all_checks!`) ne tournent que sur Neo4j et le mock |
 | G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
-| G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | **non automatisé** | **non fait** ; le migrateur réel est hors dépôt (attendu avant la bascule) |
+| G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine démontrés sur une base jetable de 13 nœuds ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
 | G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **non conçu** |
 | G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` (branche de #1248) | implémenté et testé sur #1248, **non fusionné** |
@@ -151,8 +151,24 @@ vaut plus : elle portait sur une branche où les dates étaient mal lues.
 ### G7 — oracle de copie
 Copie jetable, comptes par type égaux, empreinte par label égale, zéro nœud en quarantaine,
 dates relues à la microseconde. C'est la porte que demande #1246. La spécification
-`obrain-migration-spec.md` est **hors dépôt** (à la racine du dossier de travail) ; le
-migrateur réel aussi (tâche `MIGRATEUR-REEL`, reportée jusqu'à la fin de la migration).
+`obrain-migration-spec.md` est **hors dépôt** (à la racine du dossier de travail).
+
+Le migrateur réel est dans le dépôt : `src/storage/migrator/` (feature `obrain-backend`), branché
+par `StorageBackend::from_config` ; il implémente `Migrator`. Décision sur l'empreinte (§0 point 10
+de la spécification) : **elle entre dans la vérification de bascule**, au sein de `Migrator::copy`
+(le trait ne change pas). Après l'écriture, la base est relue DEPUIS LE DISQUE (chaque slot de nœud
+et de lien, indépendamment des compteurs du moteur) et comparée, par label et par type, à ce que
+le côté source a calculé sur les valeurs converties : nombre d'entités, nombre de propriétés, somme
+(commutative) des hachages `(clé, valeur)` par entité, extrémités d'un lien comprises. Un écart
+fait échouer la copie avec le label nommé, donc PO reste sur la source. Coût : un parcours de plus
+de la cible. Limite : l'empreinte prouve que le moteur a stocké ce qu'on lui a donné, pas que la
+conversion Bolt → obrain est fidèle à ce que Neo4j dit de la valeur (c'est l'oracle `verif` du
+spike, `valueType()`/`toString()` côté serveur, manuel, qui a trouvé le défaut des entiers
+négatifs de neo4rs ; ce défaut est corrigé par `vendor/neo4rs`, et vérifié par la jambe
+`counts_equal_switch_once…` : -1 et -16 relus négatifs dans la cible). Mono-label : un nœud à
+plusieurs labels refuse la copie, par son nom.
+
+Rejouer : voir l'en-tête de `tests/obrain_migrateur.rs` (Neo4j jetable sur 27688, jamais 7687).
 
 ### G8 — performance
 Barre de `CONSOLIDATION.md`. Mesurée le 20/11 à 100 k et 1 M documents sur SearchStore, avec
