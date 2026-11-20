@@ -96,6 +96,28 @@ fn is_write_method(method: &axum::http::Method) -> bool {
         || *method == Method::DELETE
 }
 
+/// `GET /api/tasks/{task_id}/plan`: the plan a task belongs to, or 404.
+///
+/// `task(action: "enrich")` used to demand a `plan_id` the task already carries
+/// (issue #1189 §6); the MCP tool resolves it through this route.
+async fn get_task_plan(
+    axum::extract::State(state): axum::extract::State<OrchestratorState>,
+    axum::extract::Path(task_id): axum::extract::Path<uuid::Uuid>,
+) -> Result<axum::Json<serde_json::Value>, handlers::AppError> {
+    let plan_id = state
+        .orchestrator
+        .neo4j_arc()
+        .get_task_plan_id(task_id)
+        .await
+        .map_err(handlers::AppError::Internal)?
+        .ok_or_else(|| {
+            handlers::AppError::NotFound(format!("Task {task_id} belongs to no plan"))
+        })?;
+    Ok(axum::Json(
+        serde_json::json!({ "task_id": task_id, "plan_id": plan_id }),
+    ))
+}
+
 /// Create the API router with public + protected route groups.
 ///
 /// Frontend serving behavior depends on the build:
@@ -955,6 +977,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/tasks/{task_id}/execution-places",
             get(super::execution_place_handlers::list_execution_place_events),
         )
+        .route("/api/tasks/{task_id}/plan", get(get_task_plan))
         // Pre-enrichment pipeline
         .route("/api/plans/{plan_id}/enrich", post(handlers::enrich_plan))
         .route(

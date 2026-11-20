@@ -613,10 +613,19 @@ async fn test_code_impact() {
         .await
         .unwrap();
 
+    // A file the running instance has not indexed is a named 404, not an
+    // empty analysis (issue #1189).
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let error: Value = resp.json().await.unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("file not found in graph"), "{message}");
+        assert!(message.contains("src/lib.rs"), "{message}");
+        return;
+    }
     assert!(resp.status().is_success());
 
     let impact: Value = resp.json().await.unwrap();
-    assert_eq!(impact["target"], "src/lib.rs");
+    assert!(impact["target"].as_str().unwrap().ends_with("src/lib.rs"));
     assert!(impact["directly_affected"].is_array());
     assert!(impact["risk_level"].is_string());
 }

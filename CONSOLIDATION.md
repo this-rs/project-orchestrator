@@ -9,7 +9,7 @@ Plan jumeau pour la migration des données : `250c63fb-0298-4980-bb16-7e6d3773b5
 ## Règles de la branche
 
 1. **Rien ne remonte dans `main` avant que la porte de bascule soit verte.** Aucune PR vers `main` n'est ouverte tant que ce fichier dit autre chose.
-2. **`main` redescend ICI** (`git merge origin/main` dans cette branche), jamais l'inverse. Une branche qui ne voit jamais `main` pendant des mois devient infusible : c'est exactement ce qui est arrivé à `consolidation/obrain` (2 commits, abandonnée). Dernière descente : #1156 incluse.
+2. **`main` redescend ICI** (`git merge origin/main` dans cette branche), jamais l'inverse. Une branche qui ne voit jamais `main` pendant des mois devient infusible : c'est exactement ce qui est arrivé à `consolidation/obrain` (2 commits, abandonnée). Dernière descente : #1249 incluse (20/11/2026, PR `merge/main-into-consolidation-2026-11-20`, draft : #1223 #1237 #1238 #1239 #1240 #1241 #1242 #1243 #1244 #1245 #1247 #1249 ; tests de `manager.rs` côté branche : 577 → 578 (côté main : 559, dont le test ajouté par main), ce test rangé sous `src/chat/manager/tests/tests.rs`). Avant elle : #1235 (`d79bcf30`).
 3. **Chaque agent travaille dans son propre worktree**, sur une branche fille de celle-ci, et ouvre sa PR **vers cette branche**. Jamais dans un checkout principal, jamais directement sur cette branche.
 4. **Un lot = un domaine.** Un commit qui touche stockage ET routes n'est pas relisible : on le coupe.
 5. **Aucun défaut connu ne reste « hors périmètre ».** Ce qu'une revue relève est corrigé, dans la PR ou dans une PR empilée ; il n'est pas listé pour plus tard.

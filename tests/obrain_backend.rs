@@ -114,6 +114,45 @@ mod with_the_feature {
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// Migration gate G2 (docs/migration/GATES.md). The ratchet of ported traits
+    /// (`xtask/migration-portees.txt`) must be EXACTLY the set of traits the build
+    /// generator (`build/refus_obrain.rs`, parsed with `syn`) treats as implemented
+    /// by hand: the build's notion of "ported", not a text search (a port left in
+    /// a comment or a string is not one). The generator walks the files without
+    /// evaluating attributes, so an impl disabled by `#[cfg]` still counts as
+    /// ported — and then the build fails (the supertrait `GraphStore` is not
+    /// satisfied, or the generated refusal conflicts), which is the safe side.
+    /// An impl whose methods all refuse by hand still counts as ported.
+    /// - a listed trait whose port is gone fails (RÉGRESSION);
+    /// - a ported trait left out of the ratchet fails (NON CONSIGNÉ), so a new
+    ///   port is protected from the change that introduces it.
+    ///
+    /// Removing a port AND its ratchet line together is caught by
+    /// `cargo xtask migration-gate --base` (the ratchet cannot shrink).
+    #[test]
+    fn the_migration_ratchet_is_exactly_the_set_of_ported_traits() {
+        let ratchet: std::collections::BTreeSet<&str> =
+            include_str!("../xtask/migration-portees.txt")
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+        let ported: std::collections::BTreeSet<&str> = methodes_portees()
+            .iter()
+            .filter_map(|m| m.split_once("::").map(|(t, _)| t))
+            .collect();
+        let lost: Vec<_> = ratchet.difference(&ported).collect();
+        let unrecorded: Vec<_> = ported.difference(&ratchet).collect();
+        assert!(
+            lost.is_empty(),
+            "RÉGRESSION : listés dans xtask/migration-portees.txt mais plus portés : {lost:?}"
+        );
+        assert!(
+            unrecorded.is_empty(),
+            "NON CONSIGNÉ : portés mais absents de xtask/migration-portees.txt : {unrecorded:?}"
+        );
+    }
     use uuid::Uuid;
 
     fn a_project(name: &str) -> ProjectNode {
@@ -1367,7 +1406,12 @@ mod with_the_feature {
                 let mut etat: std::collections::HashMap<(&str, Uuid), MajVue> =
                     std::collections::HashMap::new();
                 let log = std::fs::read_to_string(&acquittes).unwrap();
-                for ligne in log.lines() {
+                // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+                for ligne in log
+                    .split_inclusive('\n')
+                    .filter(|l| l.ends_with('\n'))
+                    .map(|l| l.trim_end_matches('\n'))
+                {
                     let (id, i) = ligne.split_once('\t').unwrap();
                     let (id, i): (Uuid, u32) = (id.parse().unwrap(), i.parse().unwrap());
                     let p = store.get_project(id).await.unwrap().unwrap_or_else(|| {
@@ -1581,7 +1625,13 @@ mod with_the_feature {
                 "round {tour}: an auth write killed half-way is repaired, never quarantined: \
                  {rapport:?}"
             );
-            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+            // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+            for ligne in std::fs::read_to_string(&acquittes)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|l| l.ends_with('\n'))
+                .map(|l| l.trim_end_matches('\n'))
+            {
                 let (k, id) = ligne.split_once('\t').unwrap();
                 let id: Uuid = id.parse().unwrap();
                 let u = store
@@ -3952,6 +4002,98 @@ mod with_the_feature {
         }
     }
 
+    /// #1189 (main, #1223/#1245) on obrain: the project-scoped suffix lookup filters
+    /// by the CONTAINS edge BEFORE its limit, and membership is that edge, never the
+    /// `project_id` property — the two conformance checks
+    /// `check_project_scoped_suffix_lookup_filters_before_limit` and
+    /// `check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path`, here
+    /// because the file domain is closed outside test builds. Checked again after a
+    /// close and a reopen: the answer comes from the edges on disk.
+    #[tokio::test]
+    async fn project_file_membership_is_the_contains_edge_and_filters_before_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvert(open(&base).await);
+        let suffix = "/tag/src/lib.rs";
+        let wanted = a_project("suffix wanted");
+        store.create_project(&wanted).await.unwrap();
+        let mut others = Vec::new();
+        for i in 0..7 {
+            let other = a_project(&format!("suffix other {i}"));
+            store.create_project(&other).await.unwrap();
+            store
+                .upsert_file(&a_file(&format!("a{i}{suffix}"), "rust", Some(other.id)))
+                .await
+                .unwrap();
+            others.push(other);
+        }
+        let wanted_path = format!("z-wanted{suffix}");
+        store
+            .upsert_file(&a_file(&wanted_path, "rust", Some(wanted.id)))
+            .await
+            .unwrap();
+        // A file of the SAME project that does not end with the suffix: it sorts
+        // before the wanted one, so only the suffix filter keeps it out of the
+        // answer (without a filter this test would not see the difference).
+        store
+            .upsert_file(&a_file("z-wanted/README.md", "markdown", Some(wanted.id)))
+            .await
+            .unwrap();
+        // A project that does not exist: the node is written, nothing contains it.
+        let ghost = Uuid::new_v4();
+        store
+            .upsert_file(&a_file(&format!("ghost{suffix}"), "rust", Some(ghost)))
+            .await
+            .unwrap();
+
+        let check = |s: ObrainGraphStore| {
+            let (wanted, others, wanted_path) =
+                (wanted.clone(), others.clone(), wanted_path.clone());
+            async move {
+                assert_eq!(
+                    s.find_project_files_by_path_suffix(wanted.id, suffix, 2)
+                        .await
+                        .unwrap(),
+                    vec![wanted_path.clone()],
+                    "filtered before the limit"
+                );
+                assert_eq!(
+                    s.find_project_files_by_path_suffix(others[0].id, suffix, 2)
+                        .await
+                        .unwrap(),
+                    vec![format!("a0{suffix}")]
+                );
+                assert!(s
+                    .find_project_files_by_path_suffix(ghost, suffix, 10)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert!(s
+                    .project_contains_file(wanted.id, &wanted_path)
+                    .await
+                    .unwrap());
+                assert!(!s
+                    .project_contains_file(others[0].id, &wanted_path)
+                    .await
+                    .unwrap());
+                assert!(!s
+                    .project_contains_file(ghost, &format!("ghost{suffix}"))
+                    .await
+                    .unwrap());
+                // Over all projects: path order before the limit.
+                let first = s.find_files_by_path_suffix(suffix, 1).await.unwrap();
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].0, format!("a0{suffix}"));
+                s
+            }
+        };
+        let store = check(store).await;
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvert(open(&base).await);
+        check(store).await;
+    }
+
     /// The end-to-end proof of the code domain: write every kind of file operation,
     /// CLOSE, REOPEN, read back. A passing test here means the files, their edges to
     /// the projects, the updates, the deletions and the three project switches are on
@@ -4271,6 +4413,19 @@ mod with_the_feature {
         assert_eq!(
             not_ported(store.find_files_by_path_suffix(".rs", 10).await),
             NonPorte("CodeStore::find_files_by_path_suffix")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .find_project_files_by_path_suffix(p.id, ".rs", 10)
+                    .await
+            ),
+            NonPorte("CodeStore::find_project_files_by_path_suffix")
+        );
+        assert_eq!(
+            not_ported(store.project_contains_file(p.id, "src/main.rs").await),
+            NonPorte("CodeStore::project_contains_file"),
+            "never a `false` that looks like \"not in the project\""
         );
         assert_eq!(
             not_ported(store.list_project_files(p.id).await),
@@ -4683,7 +4838,13 @@ mod with_the_feature {
             // A line without its three fields was cut by the kill: ignored.
             let mut derniers: std::collections::HashMap<String, (Option<String>, Option<String>)> =
                 Default::default();
-            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+            // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+            for ligne in std::fs::read_to_string(&acquittes)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|l| l.ends_with('\n'))
+                .map(|l| l.trim_end_matches('\n'))
+            {
                 let champs: Vec<&str> = ligne.split('\t').collect();
                 let [genre, path, hash] = champs[..] else {
                     continue;

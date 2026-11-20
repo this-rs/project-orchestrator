@@ -96,8 +96,8 @@ Manage tasks within plans.
 | `list` | List tasks with filters | `plan_id`, `search`, `status`, `tags`, `assigned_to`, `limit`, `offset` |
 | `create` | Create a task | `plan_id`, `title`, `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `get` | Get task details | `task_id` |
-| `update` | Update task fields | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
-| `delete` | Delete task | `task_id` |
+| `update` | Update task fields. A published parameter this update does not write is refused (`unsupported_fields`), not dropped. A key the tool does not publish is ignored. An update that writes nothing is refused (`empty_update`). A malformed list (`acceptance_criteria`, `affected_files`) is not written and is named in `rejected_fields` of the answer. `acceptance_criteria: []` and `affected_files: []` clear the lists. `updated` is `false` when only a refused list was given | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
+| `delete` | Delete task, with its steps and its decisions (the answer lists `deleted_decision_ids`) | `task_id` |
 | `get_next` | Next unblocked task (highest priority) | `plan_id` |
 | `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |
 | `remove_dependency` | Remove a dependency | `task_id`, `dependency_id` |
@@ -116,7 +116,7 @@ Manage steps (sub-tasks) within tasks.
 |--------|-------------|----------------|
 | `list` | List steps for a task | `task_id` |
 | `create` | Add step to task | `task_id`, `description`, `verification` |
-| `update` | Update a step | `step_id`, `status` (pending/in_progress/completed/skipped), `description`, `verification` |
+| `update` | Update a step. An unknown `step_id` is an error (404). A published parameter it does not write (`task_id`) is refused (`unsupported_fields`). An update that writes nothing is refused (`empty_update`); a key the tool does not publish is ignored | `step_id`, `status` (pending/in_progress/completed/skipped), `description`, `verification` |
 | `get` | Get step by ID | `step_id` |
 | `delete` | Delete step | `step_id` |
 | `get_progress` | Step completion progress | `task_id` |
@@ -139,7 +139,7 @@ Manage architectural decisions with semantic search and impact tracking.
 | `remove_affects` | Remove impact link | `decision_id`, `entity_type`, `entity_id` |
 | `list_affects` | List impacted entities | `decision_id` |
 | `get_affecting` | Decisions affecting an entity | `entity_type`, `entity_id` |
-| `supersede` | Replace with new decision | `decision_id`, `superseded_by_id` |
+| `supersede` | Mark `decision_id` (the old decision) as superseded by `superseded_by_id` (the new one) | `decision_id`, `superseded_by_id` |
 | `get_timeline` | Decision timeline | `task_id`, `from`, `to` |
 
 ---
