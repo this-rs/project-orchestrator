@@ -1211,7 +1211,7 @@ impl ObrainGraphStore {
     /// Writes the properties `champs` computes from the current task (`None`:
     /// nothing to write) and publishes the new state. Answers whether it wrote.
     /// A task the base does not hold is a silent no-op, as Neo4j's `MATCH`.
-    async fn tache_ecrire<F>(&self, task_id: Uuid, champs: F) -> Result<bool>
+    pub(super) async fn tache_ecrire<F>(&self, task_id: Uuid, champs: F) -> Result<bool>
     where
         F: FnOnce(&TaskNode) -> Result<Option<Vec<(&'static str, Option<Value>)>>> + Send + 'static,
     {

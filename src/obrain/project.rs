@@ -639,6 +639,16 @@ const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
     ("skills", &["Skill", "PublishedSkill"]),
     ("partage", &["SharingEvent", "Tombstone"]),
     ("recherche", super::search::LABELS),
+    (
+        "analytics",
+        &[
+            "AnalysisProfile",
+            "TopologyRule",
+            "UserProfile",
+            "RoutingArm",
+            "RoutingDecision",
+        ],
+    ),
 ];
 
 /// What the nodes outside the addressed projects and plans are, by domain:

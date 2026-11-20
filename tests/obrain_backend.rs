@@ -100,11 +100,12 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_code, refusees_commit, refusees_decision, refusees_featuregraph,
-        refusees_note, refusees_persona, refusees_plan, refusees_planrun, refusees_protocolrun,
-        refusees_release, refusees_sharing, refusees_skill, Creation, Durabilite, Interruption,
-        NonPorte, ObrainGraphStore, RapportOuverture, FLUSH_COMPLET_APRES_OCTETS, MARQUEUR_PO,
-        PLAFOND_WAL_OBRAIN, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_analytics, refusees_chat, refusees_code, refusees_commit, refusees_decision,
+        refusees_featuregraph, refusees_note, refusees_persona, refusees_plan, refusees_planrun,
+        refusees_protocolrun, refusees_release, refusees_sharing, refusees_skill, Creation,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, RapportOuverture,
+        FLUSH_COMPLET_APRES_OCTETS, MARQUEUR_PO, PLAFOND_WAL_OBRAIN, REFUS_ECRITS_A_LA_MAIN,
+        SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4856,9 +4857,13 @@ mod with_the_feature {
 
         assert!(refusees_skill().iter().all(|m| written.contains(m)));
         assert!(refusees_sharing().iter().all(|m| written.contains(m)));
+        assert!(refusees_analytics().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
-        assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
+        // `run_data_migrations` was the one: `analytics.rs` now writes it (an empty list,
+        // the contract's own "no migration"), so nothing inherits a default any more.
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(written.contains(&"AnalyticsStore::run_data_migrations"));
         // No name twice, no ported method refused.
         let mut all: Vec<&str> = refused.iter().chain(written).chain(kept).copied().collect();
         let total = all.len();

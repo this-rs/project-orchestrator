@@ -13897,7 +13897,8 @@ impl AnalyticsStore for MockGraphStore {
             task.frustration_score = (task.frustration_score + delta).min(1.0);
             Ok(task.frustration_score)
         } else {
-            anyhow::bail!("Task not found: {}", task_id)
+            // Neo4j's `MATCH (t:Task {id})` finds no row: 0.0, not an error.
+            Ok(0.0)
         }
     }
 
@@ -13907,7 +13908,8 @@ impl AnalyticsStore for MockGraphStore {
             task.frustration_score = (task.frustration_score - delta).max(0.0);
             Ok(task.frustration_score)
         } else {
-            anyhow::bail!("Task not found: {}", task_id)
+            // Neo4j's `MATCH (t:Task {id})` finds no row: 0.0, not an error.
+            Ok(0.0)
         }
     }
 
@@ -13916,7 +13918,8 @@ impl AnalyticsStore for MockGraphStore {
         if let Some(task) = tasks.get(&task_id) {
             Ok(task.frustration_score)
         } else {
-            anyhow::bail!("Task not found: {}", task_id)
+            // Neo4j's `MATCH (t:Task {id})` finds no row: 0.0, not an error.
+            Ok(0.0)
         }
     }
 
@@ -15605,7 +15608,12 @@ impl AnalyticsStore for MockGraphStore {
         class: &str,
     ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::store::ArmStats>> {
         use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.arms_of_class(class).await
+        let mut arms = self.routing.arms_of_class(class).await?;
+        // Neo4j: `ORDER BY a.provider_id, a.model`.
+        arms.sort_by(|a, b| {
+            (&a.key.provider_id, &a.key.model).cmp(&(&b.key.provider_id, &b.key.model))
+        });
+        Ok(arms)
     }
 
     async fn observe_routing_arm(

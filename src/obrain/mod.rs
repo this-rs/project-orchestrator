@@ -103,6 +103,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod analytics;
 mod auth;
 mod chat;
 mod code;
@@ -328,6 +329,12 @@ pub fn refusees_code() -> &'static [&'static str] {
     code::REFUSEES
 }
 
+/// The methods of `AnalyticsStore` refused on every call, as
+/// `AnalyticsStore::<method>` (`analytics.rs`): every sub-lot but the first.
+pub fn refusees_analytics() -> &'static [&'static str] {
+    analytics::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -375,6 +382,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !skill::REFUSEES.contains(m)
                 && !sharing::REFUSEES.contains(m)
                 && !code::REFUSEES.contains(m)
+                && !analytics::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -565,6 +573,8 @@ struct Etat {
     code: code::IndexCode,
 
     recherche: search::IndexRecherche,
+
+    analyse: analytics::IndexAnalyse,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -997,6 +1007,7 @@ impl ObrainGraphStore {
             commit::IndexCommits::reconstruire(&db, &mut rapport).with_context(contexte)?;
 
         let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
+        let analyse = analytics::IndexAnalyse::reconstruire(&db, &mut rapport);
         let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
             .with_context(contexte)?;
 
@@ -1036,6 +1047,8 @@ impl ObrainGraphStore {
             code,
 
             recherche,
+
+            analyse,
         };
         let store = Self {
             interne: Arc::new(Interne {

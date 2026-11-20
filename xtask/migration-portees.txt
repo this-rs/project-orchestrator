@@ -1,12 +1,8 @@
-# Cliquet de la migration Neo4j → obrain : traits de contrat PORTÉS À LA MAIN.
-# Une ligne = un trait que le générateur build/refus_obrain.rs voit implémenté à la
-# main sous src/obrain/ (la notion du compilateur, pas une recherche de texte).
-# Le test the_migration_ratchet_is_exactly_the_set_of_ported_traits exige que ce
-# fichier soit EXACTEMENT cet ensemble ; `cargo xtask migration-gate --base` refuse
-# qu'une ligne disparaisse depuis la base. Il ne fait que GROSSIR.
-# Mis à jour : 20/11/2026, sur la branche de consolidation (tête 7e1b92dd).
-# Pas encore porté (ni listé) : AnalyticsStore (PR #1250).
-# SearchStore : porté (PR #1251) ; barre de performance non tenue (GATES.md, G8).
+# Cliquet de la migration Neo4j → obrain : traits de contrat portés (le compilateur en fait foi,
+# via le test the_migration_ratchet_is_exactly_the_set_of_ported_traits).
+# Ne fait que grossir. Au 20/11/2026 : 22 / 22 portés ; AnalyticsStore est un port PARTIEL
+# (sous-lot A1, PR #1250) et SearchStore est porté sans atteindre la barre de performance (G8).
+AnalyticsStore
 AuthStore
 ChatStore
 CodeStore

@@ -244,7 +244,13 @@ pub(super) fn relire<T>(
 /// entities keyed otherwise, that key too. Built the same way by the writers that
 /// check it ([`cle_reservee`]).
 pub(super) fn cle_reservee(label: &str, parties: &[&str]) -> String {
-    format!("{label}:{}", parties.join("|"))
+    // Each part prefixed by its length: no separator a value could contain, so two
+    // different tuples never give the same key (`["a|b", "c"]` vs `["a", "b|c"]`).
+    let mut cle = format!("{label}:");
+    for p in parties {
+        cle.push_str(&format!("{}#{p}", p.len()));
+    }
+    cle
 }
 
 /// What a node that does not decode still says about itself, if it is readable:
@@ -259,6 +265,18 @@ fn cles_d_un_noeud(label: &str, get: Lecteur) -> Vec<String> {
         if let Some(u) = uuid(champ) {
             cles.push(cle_reservee(label, &[&u.to_string()]));
         }
+    }
+    // The analytics domain (`analytics.rs`) keys by a string `id`, a `user_id`, or the
+    // (class, provider, model) triple of an arm: reserved as they are written.
+    // Each kind of key is tagged, so a `user_id` never reserves the same key as an `id`.
+    if let Some(s) = brut("id").filter(|s| !s.is_empty()) {
+        cles.push(cle_reservee(label, &[&s]));
+    }
+    if let Some(s) = brut("user_id").filter(|s| !s.is_empty()) {
+        cles.push(cle_reservee(label, &["user_id", &s]));
+    }
+    if let (Some(c), Some(p), Some(m)) = (brut("class"), brut("provider_id"), brut("model")) {
+        cles.push(cle_reservee(label, &["bras", &c, &p, &m]));
     }
     if let Some(k) = brut("dedup_key").filter(|k| !k.is_empty()) {
         cles.push(cle_reservee(label, &["cle", &k]));

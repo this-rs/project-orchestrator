@@ -653,6 +653,20 @@ pub(super) struct IndexChat {
     noeud_racine_agent: Option<NodeId>,
 }
 
+impl IndexChat {
+    /// The `(scope, value)` of every setting of this key, in scope order.
+    pub(super) fn reglages_de_cle(&self, cle: &str) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .reglages
+            .iter()
+            .filter(|((_, k), _)| k == cle)
+            .map(|((scope, _), e)| (scope.clone(), e.valeur.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
 #[derive(Clone)]
 struct EntreeFrontiere {
     noeud: NodeId,
