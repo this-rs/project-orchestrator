@@ -5622,6 +5622,513 @@ pub mod conformance {
         }
         task_cleanup(store, &p, &plan).await;
     }
+
+    // ------------------------------------------------------------------
+    // Analytics, sub-lot A1: analysis profiles, topology rules, user
+    // profiles, routing arms and decisions, frustration, step parent.
+    // ------------------------------------------------------------------
+
+    fn a_profile(
+        name: &str,
+        project: Option<&str>,
+        builtin: bool,
+    ) -> project_orchestrator::graph::models::AnalysisProfile {
+        project_orchestrator::graph::models::AnalysisProfile {
+            id: format!("conformance-{}", Uuid::new_v4()),
+            project_id: project.map(str::to_string),
+            name: name.to_string(),
+            description: None,
+            edge_weights: [("IMPORTS".to_string(), 0.5), ("CALLS".to_string(), 2.0)]
+                .into_iter()
+                .collect(),
+            fusion_weights: Default::default(),
+            is_builtin: builtin,
+        }
+    }
+
+    /// Analysis profiles: the roundtrip of every field, the visibility of a
+    /// project's profiles (global ones plus its own), the order (built-in first,
+    /// then name, then id), the upsert by id, and the refusal to delete a built-in.
+    pub async fn check_analytics_profiles(store: &dyn GraphStore) {
+        let p = a_project("prof");
+        store.create_project(&p).await.unwrap();
+        let pid = p.id.to_string();
+        let global_b = a_profile("b-global", None, false);
+        let global_a = a_profile("a-global", None, false);
+        let builtin = a_profile("z-builtin", None, true);
+        let mut scoped = a_profile("c-scoped", Some(&pid), false);
+        scoped.description = Some("d".into());
+        let other = a_profile("other", Some(&Uuid::new_v4().to_string()), false);
+        for x in [&global_b, &global_a, &builtin, &scoped] {
+            store.create_analysis_profile(x).await.unwrap();
+        }
+        let got = store
+            .get_analysis_profile(&scoped.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&got).unwrap(),
+            serde_json::to_value(&scoped).unwrap()
+        );
+        assert!(store
+            .get_analysis_profile("absent")
+            .await
+            .unwrap()
+            .is_none());
+
+        let mine = |v: Vec<project_orchestrator::graph::models::AnalysisProfile>| {
+            v.into_iter()
+                .filter(|x| {
+                    x.id == global_a.id
+                        || x.id == global_b.id
+                        || x.id == builtin.id
+                        || x.id == scoped.id
+                        || x.id == other.id
+                })
+                .map(|x| x.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mine(store.list_analysis_profiles(Some(&pid)).await.unwrap()),
+            ["z-builtin", "a-global", "b-global", "c-scoped"]
+        );
+        assert_eq!(
+            mine(store.list_analysis_profiles(None).await.unwrap()),
+            ["z-builtin", "a-global", "b-global"]
+        );
+
+        // Upsert by id: the same id rewrites, never duplicates.
+        let mut renamed = global_a.clone();
+        renamed.name = "a-renamed".into();
+        renamed.edge_weights.insert("EXTENDS".into(), 3.0);
+        store.create_analysis_profile(&renamed).await.unwrap();
+        let got = store
+            .get_analysis_profile(&global_a.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&got).unwrap(),
+            serde_json::to_value(&renamed).unwrap()
+        );
+        assert_eq!(
+            mine(store.list_analysis_profiles(None).await.unwrap()),
+            ["z-builtin", "a-renamed", "b-global"]
+        );
+
+        let err = store
+            .delete_analysis_profile(&builtin.id)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("built-in"), "{err:#}");
+        assert!(store
+            .get_analysis_profile(&builtin.id)
+            .await
+            .unwrap()
+            .is_some());
+        store.delete_analysis_profile(&scoped.id).await.unwrap();
+        assert!(store
+            .get_analysis_profile(&scoped.id)
+            .await
+            .unwrap()
+            .is_none());
+        store.delete_analysis_profile("absent").await.unwrap();
+        for id in [&global_a.id, &global_b.id] {
+            store.delete_analysis_profile(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Topology rules: roundtrip, the per-project listing and its order
+    /// (rule type, source pattern, id), and deletion (absent is a no-op).
+    pub async fn check_analytics_topology_rules(store: &dyn GraphStore) {
+        use project_orchestrator::graph::models::{
+            TopologyRule, TopologyRuleType, TopologySeverity,
+        };
+        let project = format!("conformance-{}", Uuid::new_v4());
+        let rule = |kind, src: &str, target: Option<&str>, threshold: Option<u32>| TopologyRule {
+            id: Uuid::new_v4().to_string(),
+            project_id: project.clone(),
+            rule_type: kind,
+            source_pattern: src.to_string(),
+            target_pattern: target.map(str::to_string),
+            threshold,
+            severity: TopologySeverity::Warning,
+            description: format!("rule {src}"),
+        };
+        let r1 = rule(
+            TopologyRuleType::MustNotImport,
+            "src/b/**",
+            Some("src/api/**"),
+            None,
+        );
+        let r2 = rule(TopologyRuleType::MaxFanOut, "src/**", None, Some(7));
+        let r3 = rule(
+            TopologyRuleType::MustNotImport,
+            "src/a/**",
+            Some("src/db/**"),
+            None,
+        );
+        for r in [&r1, &r2, &r3] {
+            store.create_topology_rule(r).await.unwrap();
+        }
+        let listed = store.list_topology_rules(&project).await.unwrap();
+        // max_fan_out < must_not_import in string order; then the source pattern.
+        assert_eq!(
+            listed.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            [r2.id.clone(), r3.id.clone(), r1.id.clone()]
+        );
+        let back = listed.iter().find(|r| r.id == r2.id).unwrap();
+        assert_eq!(
+            (
+                back.rule_type.clone(),
+                back.threshold,
+                back.target_pattern.clone(),
+                back.severity.clone()
+            ),
+            (
+                TopologyRuleType::MaxFanOut,
+                Some(7),
+                None,
+                TopologySeverity::Warning
+            )
+        );
+        let back = listed.iter().find(|r| r.id == r1.id).unwrap();
+        assert_eq!(
+            (back.target_pattern.as_deref(), back.description.as_str()),
+            (Some("src/api/**"), "rule src/b/**")
+        );
+        assert!(store
+            .list_topology_rules("another-project")
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_topology_rule(&r2.id).await.unwrap();
+        store.delete_topology_rule("absent").await.unwrap();
+        assert_eq!(store.list_topology_rules(&project).await.unwrap().len(), 2);
+        for r in [&r1, &r3] {
+            store.delete_topology_rule(&r.id).await.unwrap();
+        }
+        assert!(store
+            .list_topology_rules(&project)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// User profiles: create-or-get is idempotent, an update is read back, and the
+    /// WORKS_ON relation counts its upserts and lists the latest activity first.
+    pub async fn check_analytics_user_profile(store: &dyn GraphStore) {
+        let user = format!("conformance-user-{}", Uuid::new_v4());
+        assert!(store.get_user_profile(&user).await.unwrap().is_none());
+        let created = store.create_or_get_user_profile(&user).await.unwrap();
+        assert_eq!(
+            (
+                created.user_id.as_str(),
+                created.verbosity,
+                created.language.as_str(),
+                created.interaction_count
+            ),
+            (user.as_str(), 0.5, "en", 0)
+        );
+        let again = store.create_or_get_user_profile(&user).await.unwrap();
+        assert_eq!(
+            again.id, created.id,
+            "the second call gets, it does not create"
+        );
+
+        let mut changed = created.clone();
+        changed.verbosity = 0.9;
+        changed.commit_style = 0.1;
+        changed.language = "fr".into();
+        changed.expertise_level = 0.7;
+        changed.interaction_count = 42;
+        store.update_user_profile(&changed).await.unwrap();
+        let got = store.get_user_profile(&user).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                got.id,
+                got.verbosity,
+                got.commit_style,
+                got.language.as_str(),
+                got.expertise_level,
+                got.interaction_count
+            ),
+            (created.id, 0.9, 0.1, "fr", 0.7, 42)
+        );
+        assert!(got.updated_at >= created.updated_at);
+        assert_eq!(got.created_at, created.created_at);
+
+        let (p1, p2) = (a_project("works1"), a_project("works2"));
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        assert!(store.get_works_on(&user).await.unwrap().is_empty());
+        store.upsert_works_on(&user, p1.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store.upsert_works_on(&user, p2.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store.upsert_works_on(&user, p1.id).await.unwrap();
+        let works = store.get_works_on(&user).await.unwrap();
+        assert_eq!(
+            works
+                .iter()
+                .map(|w| (w.project_id, w.frequency))
+                .collect::<Vec<_>>(),
+            [(p1.id, 2), (p2.id, 1)]
+        );
+        assert!(works.iter().all(|w| w.user_id == user));
+        assert!(works[0].last_active >= works[1].last_active);
+        for p in [&p1, &p2] {
+            store.delete_project(p.id, &p.name).await.ok();
+        }
+    }
+
+    fn a_decision(
+        slug: &str,
+        session: Option<Uuid>,
+        at: DateTime<Utc>,
+    ) -> project_orchestrator::chat::provider::cognitive::decision::CognitiveDecision {
+        use project_orchestrator::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+        use project_orchestrator::chat::provider::cognitive::mode::{
+            LearningStage, ProviderRoutingMode,
+        };
+        use project_orchestrator::chat::provider::cognitive::signature::{
+            TaskClass, TaskSignature,
+        };
+        CognitiveDecision {
+            snapshot: None,
+            arms_snapshot: Vec::new(),
+            id: Uuid::new_v4(),
+            at,
+            signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, Some(slug)),
+            chosen: Some(Pick::new("prov", "model-x")),
+            score: Some(0.5),
+            explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
+            reason: "conformance".into(),
+            alternatives: vec![],
+            applied: true,
+            mode: ProviderRoutingMode::Full,
+            stage: LearningStage::Auto,
+            session_id: session,
+            task_id: None,
+            run_id: None,
+            turn_index: None,
+            outcome: None,
+            used: None,
+        }
+    }
+
+    /// Routing arms and decisions: an observation moves the Beta posterior and the
+    /// running means as Neo4j's statement does, arms list by provider and model, and
+    /// decisions list newest first, filtered, paged, with their outcome written back.
+    pub async fn check_analytics_routing(store: &dyn GraphStore) {
+        use project_orchestrator::chat::provider::cognitive::decision::DecisionOutcome;
+        use project_orchestrator::chat::provider::cognitive::store::{
+            ArmKey, ArmObservation, DecisionFilter,
+        };
+        let class = format!("conf-class-{}", Uuid::new_v4());
+        let key = ArmKey::new(class.clone(), "prov", "m1");
+        assert!(store.get_routing_arm(&key).await.unwrap().is_none());
+        let obs = |reward: f64, cost: Option<f64>, latency: Option<u64>| ArmObservation {
+            reward,
+            success_threshold: 0.5,
+            decay: 1.0,
+            cost_usd: cost,
+            latency_ms: latency,
+        };
+        let a = store
+            .observe_routing_arm(&key, &obs(1.0, Some(0.25), Some(100)))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                a.alpha,
+                a.beta,
+                a.n,
+                a.cost_sum_usd,
+                a.cost_n,
+                a.latency_sum_ms,
+                a.latency_n
+            ),
+            (2.0, 1.0, 1, 0.25, 1, 100, 1)
+        );
+        let a = store
+            .observe_routing_arm(&key, &obs(0.25, None, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            (a.alpha, a.beta, a.n, a.cost_n, a.latency_n),
+            (2.25, 1.75, 2, 1, 1)
+        );
+        // A forgetting factor discounts the counts BEFORE the observation.
+        let mut o = obs(1.0, None, Some(50));
+        o.decay = 0.5;
+        let a = store.observe_routing_arm(&key, &o).await.unwrap();
+        assert_eq!((a.alpha, a.beta, a.n, a.latency_n), (2.125, 0.875, 3, 2));
+        let got = store.get_routing_arm(&key).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                got.key.clone(),
+                got.alpha,
+                got.beta,
+                got.n,
+                got.latency_sum_ms
+            ),
+            (key.clone(), 2.125, 0.875, 3, 150)
+        );
+        store
+            .observe_routing_arm(
+                &ArmKey::new(class.clone(), "aaa", "m9"),
+                &obs(0.0, None, None),
+            )
+            .await
+            .unwrap();
+        store
+            .observe_routing_arm(
+                &ArmKey::new(class.clone(), "prov", "m0"),
+                &obs(0.0, None, None),
+            )
+            .await
+            .unwrap();
+        store
+            .observe_routing_arm(
+                &ArmKey::new("other-class", "prov", "m1"),
+                &obs(0.0, None, None),
+            )
+            .await
+            .unwrap();
+        let listed = store.list_routing_arms(&class).await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|x| (x.key.provider_id.as_str(), x.key.model.as_str()))
+                .collect::<Vec<_>>(),
+            [("aaa", "m9"), ("prov", "m0"), ("prov", "m1")]
+        );
+
+        let slug = format!("conf-{}", Uuid::new_v4());
+        let session = Uuid::new_v4();
+        let d1 = a_decision(&slug, Some(session), at(10));
+        let d2 = a_decision(&slug, None, at(20));
+        let d3 = a_decision(&slug, Some(session), at(30));
+        for d in [&d2, &d1, &d3] {
+            store.put_routing_decision(d).await.unwrap();
+        }
+        assert_eq!(
+            store.get_routing_decision(d1.id).await.unwrap().unwrap(),
+            d1
+        );
+        assert!(store
+            .get_routing_decision(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        let filter = DecisionFilter {
+            project_slug: Some(slug.clone()),
+            ..Default::default()
+        };
+        let ids_of = |v: Vec<
+            project_orchestrator::chat::provider::cognitive::decision::CognitiveDecision,
+        >| { v.into_iter().map(|d| d.id).collect::<Vec<_>>() };
+        assert_eq!(
+            ids_of(store.list_routing_decisions(&filter).await.unwrap()),
+            [d3.id, d2.id, d1.id]
+        );
+        let mut f = filter.clone();
+        f.session_id = Some(session);
+        assert_eq!(
+            ids_of(store.list_routing_decisions(&f).await.unwrap()),
+            [d3.id, d1.id]
+        );
+        let mut f = filter.clone();
+        f.since = Some(at(20));
+        assert_eq!(
+            ids_of(store.list_routing_decisions(&f).await.unwrap()),
+            [d3.id, d2.id]
+        );
+        let mut f = filter.clone();
+        f.limit = Some(1);
+        f.offset = 1;
+        assert_eq!(
+            ids_of(store.list_routing_decisions(&f).await.unwrap()),
+            [d2.id]
+        );
+
+        let outcome = DecisionOutcome {
+            success: Some(true),
+            reward: Some(0.75),
+            duration_ms: Some(1234),
+            ..Default::default()
+        };
+        assert!(store
+            .set_routing_decision_outcome(d2.id, outcome.clone())
+            .await
+            .unwrap());
+        assert!(!store
+            .set_routing_decision_outcome(Uuid::new_v4(), outcome.clone())
+            .await
+            .unwrap());
+        let back = store.get_routing_decision(d2.id).await.unwrap().unwrap();
+        assert_eq!(back.outcome, Some(outcome));
+        let mut expected = d2.clone();
+        expected.outcome = back.outcome.clone();
+        assert_eq!(back, expected, "only the outcome changes");
+        // Replacing a decision by id keeps one.
+        let mut replaced = d1.clone();
+        replaced.reason = "replaced".into();
+        store.put_routing_decision(&replaced).await.unwrap();
+        assert_eq!(
+            store
+                .get_routing_decision(d1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reason,
+            "replaced"
+        );
+        assert_eq!(
+            store.list_routing_decisions(&filter).await.unwrap().len(),
+            3
+        );
+    }
+
+    /// Frustration is clamped (increment at 1, decrement at 0) and an unknown task
+    /// reads 0; a step names its parent task; the health check answers.
+    pub async fn check_analytics_frustration_and_step_parent(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "frustration").await;
+        let t = a_full_task("frustrating", 1, 1);
+        store.create_task(plan.id, &t).await.unwrap();
+        let s = a_step(0, "step", None);
+        store.create_step(t.id, &s).await.unwrap();
+        assert_eq!(store.get_frustration(t.id).await.unwrap(), 0.0);
+        assert_eq!(store.increment_frustration(t.id, 0.25).await.unwrap(), 0.25);
+        assert_eq!(store.increment_frustration(t.id, 0.5).await.unwrap(), 0.75);
+        assert_eq!(store.increment_frustration(t.id, 0.5).await.unwrap(), 1.0);
+        assert_eq!(store.get_frustration(t.id).await.unwrap(), 1.0);
+        assert_eq!(store.decrement_frustration(t.id, 0.25).await.unwrap(), 0.75);
+        assert_eq!(store.decrement_frustration(t.id, 5.0).await.unwrap(), 0.0);
+        assert_eq!(store.get_frustration(t.id).await.unwrap(), 0.0);
+        let unknown = Uuid::new_v4();
+        assert_eq!(store.get_frustration(unknown).await.unwrap(), 0.0);
+        assert_eq!(
+            store.increment_frustration(unknown, 0.5).await.unwrap(),
+            0.0
+        );
+
+        assert_eq!(
+            store.get_step_parent_task_id(s.id).await.unwrap(),
+            Some(t.id)
+        );
+        assert_eq!(
+            store.get_step_parent_task_id(Uuid::new_v4()).await.unwrap(),
+            None
+        );
+        assert!(store.health_check().await.unwrap());
+        task_cleanup(store, &p, &plan).await;
+    }
 }
 
 // ======================================================================
@@ -7485,3 +7992,26 @@ task_checks!(mock_task, MockFactory);
 task_checks!(neo4j_task, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 task_checks!(obrain_task, ObrainFactory);
+
+/// The analytics domain, sub-lot A1 (`AnalyticsStore`): profiles, rules, routing,
+/// frustration. Same checks, same fixtures, on every backend that ports them.
+macro_rules! analytics_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_analytics_profiles,
+                check_analytics_topology_rules,
+                check_analytics_user_profile,
+                check_analytics_routing,
+                check_analytics_frustration_and_step_parent,
+            ]
+        );
+    };
+}
+
+analytics_checks!(mock_analytics, MockFactory);
+analytics_checks!(neo4j_analytics, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+analytics_checks!(obrain_analytics, ObrainFactory);
