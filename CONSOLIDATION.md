@@ -134,6 +134,31 @@ Trois risques chiffrés : `AnalyticsStore` n'est pas un domaine (145 méthodes s
 
 Défaut de justesse trouvé en passant, côté PO et indépendant du backend : `update_staleness_scores` lit `duration.between(...).days` comme une ancienneté, or `.days` est le reste après les mois (sémantique Neo4j reprise par obrain) — faux au-delà d'un mois (tâche O-STALENESS-DAYS).
 
+## Portage d'`AnalyticsStore` : sous-lots (V5)
+
+Classement des 145 méthodes de `AnalyticsStore` (`src/neo4j/traits.rs`), fait le 20/11/2026 en lisant le Cypher de chaque méthode dans `src/neo4j/` (script de comptage, puis relecture) : lecture / écriture, labels touchés, et présence d'un agrégat dans un `WITH`, d'un `UNWIND`, d'un chemin de longueur variable, d'un `CALL`/`apoc`/`gds`. Le compte « dures » est un compte de présence dans le Cypher, pas un jugement de coût : il surestime (un `count()` simple y entre), jamais l'inverse.
+
+| Sous-lot | Contenu | Méthodes | Écr. | Lect. | Dures | Dépend de (domaines) | État |
+|---|---|---|---|---|---|---|---|
+| **A1** | Profils d'analyse, règles de topologie, profils utilisateur + `WORKS_ON`, bras et décisions de routage, frustration, parent d'étape, `health_check`, réglages LLM par clé, `run_data_migrations` | 26 | 13 | 13 | 0 | projet, tâches (index), chat (réglages) | **porté** (cette PR) |
+| A2 | Synapses de notes, énergie, cicatrices, consolidation, `init_note_energy`, synapses inter-entités, graphe de synapses (skills) | 24 | 13 | 11 | 8 | notes, décisions, projet | refusé, nommé |
+| A3 | Synapses fantômes (`shadow_*`, traces, récompense, clôtures de tâche) | 8 | 4 | 4 | 4 | notes, plan, exécutions d'agent | refusé, nommé |
+| A4 | Embeddings de fichiers/fonctions, recherche vectorielle, embeddings de notes | 5 | 3 | 2 | 4 | code (`File`/`Function` non portés), index vectoriel obrain 384-d | refusé, nommé |
+| A5 | Lecture du graphe de code : arêtes IMPORTS/CALLS/EXTENDS/IMPLEMENTS, ADN structurel, empreintes, signaux, symboles, hotspots, pagerank, proximité | 16 | 0 | 16 | 4 | code | refusé, nommé |
+| A6 | Écritures en lot sur le code : analytics de fichiers/fonctions/fabric, ADN, empreintes, liens prédits, churn, densité, risque, processus | 12 | 12 | 0 | 11 | code (`UNWIND` partout) | refusé, nommé |
+| A7 | Scores et rapports : churn, densité de connaissance, risque, homéostasie, dérive structurelle, métriques neurales, santé d'apprentissage, audit des lacunes, groupes isomorphes | 12 | 0 | 12 | 10 | code, commits, notes, décisions, skills, personas | refusé, nommé |
+| A8 | Cartes de contexte | 5 | 2 | 3 | 3 | code | refusé, nommé |
+| A9 | Données de graphes de visualisation (PM, chat, décisions) + contraintes d'un projet | 4 | 0 | 4 | 1 | plan, release, commits, chat, décisions | refusé, nommé |
+| A10 | Chemins : sous-graphe de pont, règles de topologie vérifiées, voisinage d'entité, catalogue de schéma, marche causale, chemin typé | 8 | 0 | 8 | 5 | code, tout le graphe (longueur variable) | refusé, nommé |
+| A11 | Agents et « soi » : `ensure_agent`, liens agent→note/épisode, `agent_knows`, fondation, croyances, assertions, personas (`auto_grow_file_knows`, seuils adaptatifs) | 19 | 10 | 9 | 4 | notes, personas, graphes de fonctionnalités, épisodes, code | refusé, nommé |
+| A12 | Maintenance : rapport et archivage des notes auto-observées, `rescope_protocol`, racines canoniques, passes profondes | 6 | 3 | 3 | 0 | projet, protocoles, notes | refusé, nommé |
+
+Total 145 = 26 + 119. A1 sert 25 méthodes ; `run_data_migrations` répond sa liste vide (les migrations ponctuelles sont celles de Neo4j, les données obrain arrivent par le migrateur). Les 119 autres sont écrites dans l'`impl AnalyticsStore for ObrainGraphStore` de `src/obrain/analytics.rs`, chacune rendant `NonPorte("AnalyticsStore::<méthode>")` ; le registre `refusees_analytics()` les liste et un test le compare au source.
+
+Ordre conseillé pour la suite : A12 (dépend peu), A2 puis A3 (domaine note déjà porté, l'agrégat se calcule en Rust sur l'index ; `src/graph/algorithms.rs` est déjà portable), puis A5/A6/A8 quand le domaine code (`File`, symboles) sera porté (aujourd'hui ses lectures refusent : `src/obrain/code.rs`), A7/A9/A10 en dernier (jointures de plusieurs domaines, chemins variables : aucune requête GQL sans l'avoir exécutée contre obrain, voir « Mesuré sur `main` d'obrain »).
+
+**Ce que A1 fait autrement que Neo4j (écarts nommés dans `src/obrain/analytics.rs`)** : une cible absente (projet d'un profil, utilisateur ou projet de `upsert_works_on`, utilisateur de `update_user_profile`) REFUSE au lieu d'écrire rien et de répondre `Ok` ; un id de règle déjà pris refuse (Neo4j crée un second nœud) ; un seuil absent reste absent (Neo4j écrit 0 et relit `Some(0)`) ; pas d'arête `HAS_PROFILE` ni `ROUTED_FOR` (la propriété `project_id` / `session_id` porte le lien ; ces arêtes feraient refuser la suppression des tâches et sessions voisines) ; décodage strict (nœud illisible = quarantaine nommée à l'ouverture, clé réservée) là où Neo4j journalise et prend une valeur par défaut ; `list_routing_decisions` est en O(décisions) sur une entrée légère en mémoire.
+
 ## Sécurité des données (incidents du 11/11)
 
 - **Les tests d'obrain ouvraient les bases réelles** sous `~/.obrain/db` en écriture (`cargo test -p obrain-engine` sur `main`). Tant que #110 n'est pas fusionnée : toute commande `cargo test` / `cargo bench` d'obrain se lance avec un `HOME` vide.
