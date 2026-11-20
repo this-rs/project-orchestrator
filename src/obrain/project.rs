@@ -638,6 +638,7 @@ const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
     ("fédération", &["McpServer", "McpTool"]),
     ("skills", &["Skill", "PublishedSkill"]),
     ("partage", &["SharingEvent", "Tombstone"]),
+    ("recherche", super::search::LABELS),
 ];
 
 /// What the nodes outside the addressed projects and plans are, by domain:
