@@ -269,7 +269,8 @@ pub struct StorageYamlConfig {
 }
 
 /// Startup storage-migration configuration. Each flag has an environment
-/// variable that wins over the YAML only when it parses ([`env_flag_over`]);
+/// variable that wins over the YAML; a set but unreadable value is a named boot
+/// error ([`strict_env_flag_over`]);
 /// see [`crate::storage::migrate`] for what each one guards.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -629,6 +630,22 @@ pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
 /// ([`parse_env_flag`]): an unknown value falls back to the YAML.
 pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
     env.and_then(parse_env_flag).or(yaml)
+}
+
+/// A flag whose environment variable `name` wins over the YAML, STRICTLY: set
+/// but unreadable (not one of the [`parse_env_flag`] spellings) is a named boot
+/// error instead of a silent fallback to the YAML. For flags whose silent loss
+/// is dangerous (the migration rollback).
+pub(crate) fn strict_env_flag_over(name: &str, yaml: Option<bool>) -> Result<Option<bool>> {
+    match std::env::var(name) {
+        Err(_) => Ok(yaml),
+        Ok(raw) => match parse_env_flag(&raw) {
+            Some(v) => Ok(Some(v)),
+            None => anyhow::bail!(
+                "invalid {name}={raw:?}: accepted values: true/false, 1/0, yes/no, on/off"
+            ),
+        },
+    }
 }
 
 /// Resolve the journal retention bound for the `journal` chat transport.
@@ -1156,6 +1173,28 @@ impl Config {
         // instead of silently dropping a bad `EVENTS_MAX_EVENTS`.
         let events_max_events = resolve_events_max_events(yaml.events.max_events)?;
 
+        // Startup migration flags (env var > YAML > defaults: no rollback, no
+        // disposable copy, no source). The env vars are STRICT: a set but
+        // unreadable value (`STORAGE_MIGRATION_ROLLBACK=ture`) fails the boot by
+        // name — a rollback silently ignored would switch the backend anyway.
+        let storage_migration = StorageMigrationConfig {
+            rollback: strict_env_flag_over(
+                "STORAGE_MIGRATION_ROLLBACK",
+                yaml.storage.migration.rollback,
+            )?
+            .unwrap_or(false),
+            disposable: strict_env_flag_over(
+                "STORAGE_MIGRATION_DISPOSABLE",
+                yaml.storage.migration.disposable,
+            )?
+            .unwrap_or(false),
+            from: std::env::var("STORAGE_MIGRATION_FROM")
+                .ok()
+                .or(yaml.storage.migration.from.clone())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        };
+
         Ok(Self {
             setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
@@ -1282,25 +1321,7 @@ impl Config {
                 .or(yaml.storage.obrain_path),
             // Startup migration flags (env var > YAML > defaults). Rollback and
             // disposable default to false; the per-type verification gate to true.
-            storage_migration: StorageMigrationConfig {
-                rollback: env_flag_over(
-                    std::env::var("STORAGE_MIGRATION_ROLLBACK").ok().as_deref(),
-                    yaml.storage.migration.rollback,
-                )
-                .unwrap_or(false),
-                disposable: env_flag_over(
-                    std::env::var("STORAGE_MIGRATION_DISPOSABLE")
-                        .ok()
-                        .as_deref(),
-                    yaml.storage.migration.disposable,
-                )
-                .unwrap_or(false),
-                from: std::env::var("STORAGE_MIGRATION_FROM")
-                    .ok()
-                    .or(yaml.storage.migration.from.clone())
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty()),
-            },
+            storage_migration,
             storage_obrain_create: match std::env::var("STORAGE_OBRAIN_CREATE") {
                 Ok(v) => v == "true" || v == "1",
                 Err(_) => yaml.storage.obrain_create.unwrap_or(false),
@@ -3937,6 +3958,23 @@ chat:
             config.storage_migration.from, None,
             "an empty env value is unset"
         );
+
+        // An unreadable flag is a named boot error, never a silent fallback to
+        // the YAML (here: rollback: true would be silently kept or lost).
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "ture");
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("STORAGE_MIGRATION_ROLLBACK") && err.contains("ture"),
+            "{err}"
+        );
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "oui");
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STORAGE_MIGRATION_DISPOSABLE"), "{err}");
 
         std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
         std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");

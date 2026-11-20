@@ -46,7 +46,7 @@ use crate::auth::middleware::require_auth;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
-    middleware::{from_fn, from_fn_with_state},
+    middleware::from_fn_with_state,
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -60,13 +60,18 @@ use tower_http::trace::TraceLayer;
 /// [`crate::storage::migrate`]). Read routes and non-mutating methods
 /// (GET/HEAD/OPTIONS) pass through untouched, so an instance mid-migration can
 /// still answer health and reads, but never modify the source or the target.
+///
+/// In production the router is built after the startup migration finished
+/// (`AppState::new` returns first), so this guard is a second line: it makes
+/// any route that ever coexists with a migration refuse by name.
 async fn read_only_guard(
+    axum::extract::State(gate): axum::extract::State<crate::storage::migrate::ReadOnlyGate>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    if crate::storage::migrate::is_read_only() && is_write_method(req.method()) {
+    if gate.is_read_only() && is_write_method(req.method()) {
         let status = axum::http::StatusCode::from_u16(crate::storage::migrate::READ_ONLY_STATUS)
             .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE);
         return (
@@ -102,6 +107,15 @@ fn is_write_method(method: &axum::http::Method) -> bool {
 /// In both cases, Axum's explicit routes (/api/*, /auth/*, /ws/*, /health,
 /// /hooks/*, /internal/*) always take priority — only unmatched paths hit the fallback.
 pub fn create_router(state: OrchestratorState) -> Router {
+    create_router_with_gate(state, crate::storage::migrate::process_gate().clone())
+}
+
+/// [`create_router`] observing an explicit migration gate (tests pass a
+/// private one, so raising it never reaches the other routers of the process).
+pub fn create_router_with_gate(
+    state: OrchestratorState,
+    gate: crate::storage::migrate::ReadOnlyGate,
+) -> Router {
     let cors = build_cors(&state);
 
     // Remote MCP is opt-in: the /mcp transport and OAuth 2.1 AS routes are only
@@ -165,7 +179,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .merge(bounded_public)
         .merge(websocket_routes())
         .merge(protected)
-        .layer(from_fn(read_only_guard))
+        .layer(from_fn_with_state(gate, read_only_guard))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state.clone());
@@ -2976,10 +2990,15 @@ mod tests {
 
     /// Build a test router with serve_frontend disabled
     async fn test_app_no_frontend() -> Router {
+        create_router(test_state_no_frontend().await)
+    }
+
+    /// The state of [`test_app_no_frontend`].
+    async fn test_state_no_frontend() -> OrchestratorState {
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
-        let state = Arc::new(handlers::ServerState {
+        Arc::new(handlers::ServerState {
             orchestrator,
             watcher,
             chat_manager: None,
@@ -3007,8 +3026,7 @@ mod tests {
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
             vault: crate::vault::VaultService::ephemeral(),
-        });
-        create_router(state)
+        })
     }
 
     /// Create a fake dist/ directory with index.html and an asset file
@@ -3225,54 +3243,71 @@ mod tests {
 
     // ── Migration read-only guard ────────────────────────────────────────
 
-    /// A minimal router with the migration guard, one read and one write route.
-    fn migration_guard_router() -> Router {
-        Router::new()
-            .route("/read", get(|| async { "ok" }))
-            .route("/write", post(|| async { "written" }))
-            .layer(from_fn(read_only_guard))
+    /// The REAL router (`create_router`'s body) on a private gate.
+    async fn guarded_app(gate: &crate::storage::migrate::ReadOnlyGate) -> Router {
+        create_router_with_gate(test_state_no_frontend().await, gate.clone())
+    }
+
+    /// Status and `code` of one request.
+    async fn status_and_code(app: Router, req: Request<Body>) -> (u16, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        (
+            status,
+            json["code"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    fn a_write() -> Request<Body> {
+        Request::post("/api/projects")
+            .header(
+                "authorization",
+                format!("Bearer {}", crate::test_helpers::test_bearer_token()),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"p","root_path":"/tmp/p"}"#))
+            .unwrap()
     }
 
     #[tokio::test]
     async fn the_migration_gate_refuses_writes_with_a_named_code_and_allows_reads() {
-        let _lock = crate::storage::migrate::GATE_TEST_LOCK.lock().await;
-        // One test touches the process-wide gate, so it cannot race with
-        // itself or any other test.
-        crate::storage::migrate::set_read_only(true);
+        let gate = crate::storage::migrate::ReadOnlyGate::new();
+        let scope = gate.enter();
 
-        // A write is refused with the named code.
-        let app = migration_guard_router();
-        let req = Request::post("/write").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // A write on the real router is refused with the named code.
         assert_eq!(
-            json["code"],
-            crate::storage::migrate::READ_ONLY_CODE,
-            "the refusal must carry the named code: {json}"
+            status_and_code(guarded_app(&gate).await, a_write()).await,
+            (503, crate::storage::migrate::READ_ONLY_CODE.to_string())
         );
-
         // A read still passes while read-only.
-        let app = migration_guard_router();
-        let req = Request::get("/read").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let (status, _) = status_and_code(
+            guarded_app(&gate).await,
+            Request::get("/health").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
 
         // Leaving the read-only state lets writes through again.
-        crate::storage::migrate::set_read_only(false);
-        let app = migration_guard_router();
-        let req = Request::post("/write").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        drop(scope);
+        let (status, code) = status_and_code(guarded_app(&gate).await, a_write()).await;
+        assert_ne!(
+            (status, code.as_str()),
+            (503, crate::storage::migrate::READ_ONLY_CODE),
+            "the gate is down"
+        );
     }
 
-    /// A migrator that, mid-copy, tries to WRITE through the guarded router and
-    /// records the answer: the production factory raised the gate, not the test.
-    struct WritesDuringCopy(std::sync::Mutex<Option<(u16, String)>>);
+    /// A migrator that, mid-copy, tries to WRITE through the real router on the
+    /// factory's gate and records the answer: the factory raised the gate, not
+    /// the test.
+    struct WritesDuringCopy {
+        gate: crate::storage::migrate::ReadOnlyGate,
+        seen: tokio::sync::Mutex<Option<(u16, String)>>,
+    }
     #[async_trait::async_trait]
     impl crate::storage::migrate::Migrator for WritesDuringCopy {
         async fn source_counts(&self) -> anyhow::Result<crate::storage::migrate::PerTypeCounts> {
@@ -3282,19 +3317,8 @@ mod tests {
             })
         }
         async fn copy(&self, dest: &std::path::Path) -> anyhow::Result<()> {
-            let resp = migration_guard_router()
-                .oneshot(Request::post("/write").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status().as_u16();
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            *self.0.lock().unwrap() = Some((
-                status,
-                json["code"].as_str().unwrap_or_default().to_string(),
-            ));
+            let answer = status_and_code(guarded_app(&self.gate).await, a_write()).await;
+            *self.seen.lock().await = Some(answer);
             std::fs::write(dest.join("ok"), "1")?;
             Ok(())
         }
@@ -3308,28 +3332,31 @@ mod tests {
 
     #[tokio::test]
     async fn the_startup_factory_itself_refuses_a_write_during_the_migration() {
-        let _lock = crate::storage::migrate::GATE_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.yaml");
         std::fs::write(&file, "setup_completed: true\n").unwrap();
         let mut config = crate::Config::from_yaml_and_env(Some(&file)).unwrap();
-        config.storage_backend = "memory".into();
-        config.storage_obrain_path = Some(dir.path().display().to_string());
+        config.storage_backend = crate::storage::OBRAIN_BACKEND.into();
+        config.storage_obrain_path = Some(dir.path().join("target").display().to_string());
         config.storage_migration = crate::StorageMigrationConfig {
             rollback: false,
             disposable: false,
             from: Some("default".into()),
         };
-        let m = WritesDuringCopy(Default::default());
-        crate::storage::StorageBackend::from_config_with(&config, &m)
-            .await
-            .unwrap();
-        let seen = m.0.lock().unwrap().clone().expect("copy ran");
+        let gate = crate::storage::migrate::ReadOnlyGate::new();
+        let m = WritesDuringCopy {
+            gate: gate.clone(),
+            seen: Default::default(),
+        };
+        // The scripted copy is not a real obrain base, so building the target
+        // fails afterwards; what matters is what a write saw DURING the copy.
+        let _ = crate::storage::StorageBackend::from_config_in(&config, &m, &gate).await;
+        let seen = m.seen.lock().await.clone().expect("copy ran");
         assert_eq!(
             seen,
             (503, crate::storage::migrate::READ_ONLY_CODE.to_string())
         );
-        // And the gate is lifted once the target is built.
-        assert!(!crate::storage::migrate::is_read_only());
+        // And the gate is lifted once the factory returned.
+        assert!(!gate.is_read_only());
     }
 }
