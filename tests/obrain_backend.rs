@@ -108,6 +108,45 @@ mod with_the_feature {
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// Migration gate G2 (docs/migration/GATES.md). The ratchet of ported traits
+    /// (`xtask/migration-portees.txt`) must be EXACTLY the set of traits the build
+    /// generator (`build/refus_obrain.rs`, parsed with `syn`) treats as implemented
+    /// by hand: the build's notion of "ported", not a text search (a port left in
+    /// a comment or a string is not one). The generator walks the files without
+    /// evaluating attributes, so an impl disabled by `#[cfg]` still counts as
+    /// ported — and then the build fails (the supertrait `GraphStore` is not
+    /// satisfied, or the generated refusal conflicts), which is the safe side.
+    /// An impl whose methods all refuse by hand still counts as ported.
+    /// - a listed trait whose port is gone fails (RÉGRESSION);
+    /// - a ported trait left out of the ratchet fails (NON CONSIGNÉ), so a new
+    ///   port is protected from the change that introduces it.
+    ///
+    /// Removing a port AND its ratchet line together is caught by
+    /// `cargo xtask migration-gate --base` (the ratchet cannot shrink).
+    #[test]
+    fn the_migration_ratchet_is_exactly_the_set_of_ported_traits() {
+        let ratchet: std::collections::BTreeSet<&str> =
+            include_str!("../xtask/migration-portees.txt")
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+        let ported: std::collections::BTreeSet<&str> = methodes_portees()
+            .iter()
+            .filter_map(|m| m.split_once("::").map(|(t, _)| t))
+            .collect();
+        let lost: Vec<_> = ratchet.difference(&ported).collect();
+        let unrecorded: Vec<_> = ported.difference(&ratchet).collect();
+        assert!(
+            lost.is_empty(),
+            "RÉGRESSION : listés dans xtask/migration-portees.txt mais plus portés : {lost:?}"
+        );
+        assert!(
+            unrecorded.is_empty(),
+            "NON CONSIGNÉ : portés mais absents de xtask/migration-portees.txt : {unrecorded:?}"
+        );
+    }
     use uuid::Uuid;
 
     fn a_project(name: &str) -> ProjectNode {
