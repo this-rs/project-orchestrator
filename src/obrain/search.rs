@@ -5,50 +5,69 @@
 //! # Storage
 //!
 //! A document is one node, labelled `RechercheCode`, `RechercheDecision` or
-//! `RechercheNote`, with three properties: `id`, `doc` (the whole document as
-//! JSON: the SINGLE source of truth) and `texte` (the searchable fields of the
-//! document, concatenated: what the text index of obrain tokenizes). `texte` is a
-//! pure function of `doc`, so open recomputes it and rewrites a node whose `texte`
-//! disagrees (an update cut between the two writes): the repair is counted in
-//! `RapportOuverture::recherches_reparees`.
+//! `RechercheNote`, with the properties `id`, `doc` (the whole document as JSON:
+//! the SINGLE source of truth), `texte` (the searchable fields of the document,
+//! concatenated: what the text index of obrain tokenizes) and `_lot` (the batch
+//! that created it, see "Atomicity"). `texte` is a pure function of `doc`, so open
+//! recomputes it and rewrites a node whose `texte` disagrees (an update cut between
+//! the two writes): the repair is counted in `RapportOuverture::recherches_reparees`.
 //!
 //! The searchable fields are Meilisearch's own (`configure_*_index`): code =
 //! `symbols`, `docstrings`, `signatures`, `path`, `imports`; decisions =
 //! `description`, `rationale`, `tags`; notes = `content`, `tags`, `scope_path`,
 //! `anchor_entities`.
 //!
-//! The text index (`create_text_index(label, "texte")`) is built on the first
-//! search of a kind (and again on the first search after a reopen) and then
-//! maintained by obrain on every write. A search never scans the corpus unless a
-//! filter rejects enough of the top-k to need more (below).
+//! # The text index: built at open, never trusted from disk
+//!
+//! obrain persists a text index and reloads it at the next open when a fingerprint
+//! of the store (WAL offset, live node count) matches; it re-persists it at close
+//! when an epoch says nothing was written since. Neither signal is proven, for this
+//! adapter's writes through the direct API, to change on every write that matters
+//! (a full flush resets the WAL offset; the direct API does not advance the epoch).
+//! So the adapter never serves a persisted index: at open, BEFORE any writer can
+//! run, it drops whatever obrain loaded and builds each index from the documents
+//! (`create_text_index`). From then on obrain maintains it on every write (its
+//! write hooks), and every write of this adapter holds the writer lock. If an index
+//! is missing at search time anyway, it is built under the WRITER lock, so no write
+//! can slip between the scan and the hooks.
 //!
 //! # Filters: AFTER the search, by over-fetching, never wrong
 //!
 //! obrain's `text_search(label, property, query, k)` takes no filter. A filter
 //! (project, language, path prefix, note type, status, importance, task) is applied
-//! to the hits afterwards. To keep the answer exact, the search asks for
-//! `max(32, 4 × limit)` hits, filters them, and multiplies `k` by 4 until either
-//! `limit` documents survive, or the index returned fewer than it was asked for
-//! (every document that matches the query has been seen), or `k` reached the number
-//! of documents of the kind. What is returned is therefore exactly the first
-//! `limit` documents of the BM25 ranking that pass the filter — a selective filter
-//! costs more rounds, never a missing hit. The filters read a small in-memory copy
-//! of the filterable fields of each document (`Cles`), not the document.
+//! to the hits afterwards. The search asks for `max(32, 4 × limit)` hits and
+//! multiplies `k` by 4 until `limit` documents pass the filter or the index returns
+//! fewer hits than asked (every document matching the query has been seen). The
+//! number of DOCUMENTS of the kind is not a bound: the index also holds nodes that
+//! are not served (a batch in progress, a quarantined node), which would otherwise
+//! use up the budget and leave a silent empty answer.
+//!
+//! The filter is checked twice: on the in-memory copy of the filterable fields
+//! (cheap, before reading the node) and on the document READ, so a document being
+//! rewritten is never returned with fields that contradict the filter.
+//!
+//! # Score and order
+//!
+//! `SearchHit::score` is in `[0, 1]` and the hits are returned in decreasing score:
+//! `score = (1 − δ) × coverage + δ × b/(1 + b)` with `coverage` the fraction of the
+//! query's terms the document carries, `b` its raw BM25 score and `δ = 10⁻³`. The
+//! coverage decides (as Meilisearch's "words" rule ranks documents matching more of
+//! the query first); BM25 breaks ties. The score is ABSOLUTE for one query in one
+//! index (BM25 is computed on the same index statistics whatever the filter), so
+//! lists of several projects merged by score (`api/code_handlers.rs`) keep one
+//! order, and a duplicate of the query scores ≥ 0.999 (`chat/feedback.rs`
+//! thresholds at 0.85 on the first hit). The order is computed over the documents
+//! of the window fetched above (at least `max(32, 4 × limit)` BM25 hits that pass
+//! the filter, or all of them): a document with full coverage but a BM25 rank past
+//! that window is not considered. Named, not hidden.
 //!
 //! # Differences with Meilisearch, all named
 //!
 //! - **Matching.** BM25 over whole tokens (lowercased, split on non-alphanumerics,
 //!   English stop words and tokens shorter than 2 bytes dropped), any query token
-//!   suffices (OR). Meilisearch also matches by prefix, tolerates typos and prefers
-//!   documents that match every word. A query that Meilisearch answers through a
-//!   typo or a prefix is answered with fewer hits here.
-//! - **Ranking.** One BM25 score over the concatenated fields; Meilisearch ranks by
-//!   attribute order (`symbols` before `docstrings`…) and proximity.
-//! - **`SearchHit::score`.** In `[0, 1]` like Meilisearch's ranking score, but
-//!   it is the FRACTION OF THE QUERY'S TERMS found in the document, not Meilisearch's
-//!   score; the order of the hits is BM25's, so the score is not monotone in it.
-//!   Callers that threshold on the score (`chat/feedback.rs`, 0.85) therefore ask
-//!   "almost every term of the probe is in that note", which is what a duplicate is.
+//!   suffices (OR). Meilisearch also matches by prefix and tolerates typos.
+//! - **Ranking.** See "Score and order"; Meilisearch also ranks by attribute order
+//!   and proximity. The score is not Meilisearch's ranking score.
 //! - **Empty query.** A query with no alphanumeric character (`""`, `"*"`) is
 //!   Meilisearch's placeholder search: documents that pass the filters, here by
 //!   increasing `id`, with score 1.0.
@@ -61,7 +80,8 @@
 //!   `path`, as the mock does).
 //! - **`delete_orphan_code_documents`**: `project_id` empty OR `project_slug` empty
 //!   (the Meilisearch filter; the mock only tests `project_id`).
-//! - **`search_decisions_in_projects(&[])`** matches no document (`IN []`).
+//! - **`search_decisions_in_projects(&[])`** matches no document (`IN []`), and
+//!   answers without reading the index.
 //! - **`is_indexing`** is always false: a write is searchable when it returns.
 //! - Dates: no date is decoded here. A document is stored and returned verbatim as
 //!   JSON (`DecisionDocument::timestamp` is the string the caller wrote,
@@ -75,40 +95,58 @@
 //! one-character words) is refused by name (`SearchStore::search_*`), not answered
 //! empty: Meilisearch matches those words, this index cannot.
 //!
+//! # Quarantine
+//!
+//! A node of a search label whose `doc` cannot be read, or whose id is already
+//! taken, is quarantined at open: never served. It is NOT left in the way: the
+//! deletions remove it (by id when its `id` is readable; by project, task, orphan
+//! or "all" according to what of its JSON can still be read — a node whose JSON is
+//! unreadable has no readable project, so it is an orphan and goes with
+//! `delete_all_code`), and indexing its id again replaces it. The search index is
+//! derived data: the caller re-supplies the document.
+//!
 //! # Durability and atomicity
 //!
 //! One writer section and ONE fsync per call, through the same `Ecriture` as every
-//! domain. A new document follows the draft-marker protocol of `decision.rs` (the
-//! marker is the first property, removed last; open deletes a draft). A batch
-//! marks ALL its new nodes and unmarks them together at the end: a crash leaves
-//! none of its new documents, never a prefix. The documents it REPLACES are
-//! written in place, one by one: a crash may leave some replaced and some not
-//! (indexing is idempotent; the sync that calls it runs again). A bulk deletion
+//! domain. A call that creates documents first creates ONE lot node
+//! (`RechercheLot`, with an `id`), then each new document carrying `_lot = <that
+//! id>`, and commits by DELETING the lot node: one engine write. At open, every lot
+//! node still there is an uncommitted batch: its documents are deleted with it (in
+//! `brouillons_supprimes`). A crash therefore leaves all of a batch's new documents
+//! or none, never a prefix. The documents a batch REPLACES are rewritten in place
+//! before the commit point: a crash may leave some replaced and some not (indexing
+//! is idempotent; the sync that calls it runs again). A bulk deletion
 //! (`delete_*_for_project`, `delete_all_code`, `delete_orphan_code_documents`)
 //! deletes node by node and may stop half-way on a crash; running it again
 //! finishes it.
 //!
-//! # Cost (measured: nothing yet; see the PR)
+//! # Cost
 //!
-//! `get_*_stats`, `update_note_status`: O(1) (hash lookups). Every deletion
-//! (`delete_code`, `delete_decision`, `delete_note`, the `delete_*_for_*` family,
-//! `delete_all_code`) SCANS the documents of its kind, O(documents of the kind),
-//! because the filterable copies are kept by id and not by project or task.
-//! A search answers the first build of the text index of a kind with one scan of
-//! that kind (`create_text_index`), after each open and after the first search of
-//! the process: the cost of the search path grows with the corpus until the index
-//! is kept open across requests. Open is O(documents): the index is rebuilt by one
-//! scan per label, like every other domain. None of this is measured at 1 M or
-//! 5 M nodes; consolidation's performance bar is NOT claimed here.
+//! Lookups by id (`delete_code`, `delete_decision`, `delete_note`,
+//! `update_note_status`, the replacement check of an indexing): O(log N) on the
+//! in-memory map, plus O(Q) over the quarantined nodes of the kind (empty on a
+//! healthy base). `get_*_stats`: O(1). `search_decisions_in_projects(&[])`: O(1).
+//! A search: O(k) hits for the window, one node read per candidate.
+//!
+//! Proportional to the documents of the kind, and MEASURED (see the PR):
+//! - open: one scan per label to rebuild the in-memory map, and one build of each
+//!   text index (see above);
+//! - the placeholder search WITH a selective filter (it walks the ids in order
+//!   until `limit` pass; without a filter it stops after `limit`);
+//! - `delete_*_for_project`, `delete_decisions_for_task`,
+//!   `delete_orphan_code_documents`, `delete_all_code`: a pass over the in-memory
+//!   copies (no index by project or task).
 //!
 //! `ProjectStore::delete_project` refuses while the base holds any node outside the
 //! projects and plans (`project.rs`): these documents are such nodes, listed under
-//! « recherche » in its refusal.
+//! « recherche » in its refusal. `Orchestrator::delete_project` therefore deletes
+//! the code documents AFTER the graph deletion succeeded, never before.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use obrain_common::types::{NodeId, Value};
 use obrain_core::index::text::{SimpleTokenizer, Tokenizer};
@@ -122,16 +160,27 @@ use crate::meilisearch::indexes::{
 use crate::meilisearch::MeiliClient;
 use crate::meilisearch::SearchStore;
 
+/// Legacy draft marker (a node carrying it is a draft at open).
 const BROUILLON: &str = "_brouillon";
+const LOT: &str = "_lot";
 const DOC: &str = "doc";
 const TEXTE: &str = "texte";
 const ID: &str = "id";
+const LABEL_LOT: &str = "RechercheLot";
 
 /// The labels this domain writes (`LABELS_PAR_DOMAINE` of `project.rs`).
-pub(super) const LABELS: &[&str] = &["RechercheCode", "RechercheDecision", "RechercheNote"];
+pub(super) const LABELS: &[&str] = &[
+    "RechercheCode",
+    "RechercheDecision",
+    "RechercheNote",
+    LABEL_LOT,
+];
 
 /// The statuses a note search covers when the caller gives none.
 const STATUTS_PAR_DEFAUT: &[&str] = &["active", "needs_review"];
+
+/// The weight of BM25 in the score (see the module doc).
+const DELTA: f64 = 1e-3;
 
 /// The three corpora.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,12 +190,43 @@ enum Genre {
     Note,
 }
 
+const GENRES: [Genre; 3] = [Genre::Code, Genre::Decision, Genre::Note];
+
 impl Genre {
     fn label(self) -> &'static str {
         match self {
             Genre::Code => LABELS[0],
             Genre::Decision => LABELS[1],
             Genre::Note => LABELS[2],
+        }
+    }
+
+    /// The filterable fields of a document of this kind, from its JSON as a
+    /// `Value`: what can still be read of a node whose document does not decode.
+    fn cles_tolerantes(self, v: &serde_json::Value) -> Cles {
+        let champ = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        match self {
+            Genre::Code => Cles {
+                slug: champ("project_slug"),
+                projet_id: champ("project_id"),
+                a: champ("language"),
+                b: champ("path"),
+                c: None,
+            },
+            Genre::Decision => Cles {
+                slug: champ("project_slug"),
+                projet_id: champ("project_id"),
+                a: champ("task_id"),
+                b: None,
+                c: None,
+            },
+            Genre::Note => Cles {
+                slug: champ("project_slug"),
+                projet_id: champ("project_id"),
+                a: champ("note_type"),
+                b: champ("status"),
+                c: champ("importance"),
+            },
         }
     }
 }
@@ -264,14 +344,22 @@ struct Entree {
     cles: Cles,
 }
 
-/// The documents of one kind: by id, and by node (to name a hit).
+/// A node of a search label that open could not serve.
+struct Quarantaine {
+    noeud: NodeId,
+    /// Its `id` property, when readable.
+    id: Option<String>,
+    /// What of its JSON could be read, when it is JSON at all.
+    cles: Option<Cles>,
+}
+
+/// The documents of one kind: by id (ordered, for the placeholder search), and by
+/// node (to name a hit); and the quarantined nodes.
 #[derive(Default)]
 struct Corpus {
-    docs: HashMap<String, Entree>,
+    docs: BTreeMap<String, Entree>,
     par_noeud: HashMap<NodeId, String>,
-    /// Ids on disk but unreadable or doubled at open (quarantined): a write of
-    /// such an id refuses instead of landing next to the node left there.
-    reserves: HashSet<String>,
+    quarantaine: Vec<Quarantaine>,
 }
 
 impl Corpus {
@@ -287,6 +375,18 @@ impl Corpus {
         if let Some(e) = self.docs.remove(id) {
             self.par_noeud.remove(&e.noeud);
         }
+    }
+
+    fn retirer_quarantaine(&mut self, noeuds: &HashSet<NodeId>) {
+        self.quarantaine.retain(|q| !noeuds.contains(&q.noeud));
+    }
+
+    /// The quarantined nodes carrying this id.
+    fn quarantaine_de<'a>(&'a self, id: &'a str) -> impl Iterator<Item = NodeId> + 'a {
+        self.quarantaine
+            .iter()
+            .filter(move |q| q.id.as_deref() == Some(id))
+            .map(|q| q.noeud)
     }
 }
 
@@ -315,18 +415,43 @@ impl IndexRecherche {
         }
     }
 
-    pub(super) fn reconstruire(db: &ObrainDB, rapport: &mut RapportOuverture) -> Self {
+    /// Rebuild the maps from the base, finish or undo what a crash left, and build
+    /// the text indexes from the documents (module doc). Runs at open, before any
+    /// writer.
+    pub(super) fn reconstruire(db: &ObrainDB, rapport: &mut RapportOuverture) -> Result<Self> {
+        let store = db.store();
+        // Every lot node still there is a batch that never reached its commit point.
+        let mut lots_ouverts: HashSet<String> = HashSet::new();
+        let noeuds_lots = store.nodes_by_label(LABEL_LOT);
+        for noeud in &noeuds_lots {
+            if let Some(id) = db.get_node(*noeud).and_then(|n| {
+                n.get_property(ID)
+                    .and_then(|v| v.as_str().map(str::to_string))
+            }) {
+                lots_ouverts.insert(id);
+            }
+        }
         let mut index = Self::default();
-        reconstruire_genre::<CodeDocument>(db, rapport, &mut index.code);
-        reconstruire_genre::<DecisionDocument>(db, rapport, &mut index.decisions);
-        reconstruire_genre::<NoteDocument>(db, rapport, &mut index.notes);
-        index
+        reconstruire_genre::<CodeDocument>(db, rapport, &lots_ouverts, &mut index.code);
+        reconstruire_genre::<DecisionDocument>(db, rapport, &lots_ouverts, &mut index.decisions);
+        reconstruire_genre::<NoteDocument>(db, rapport, &lots_ouverts, &mut index.notes);
+        for noeud in noeuds_lots {
+            db.delete_node(noeud);
+        }
+        for g in GENRES {
+            // Whatever obrain reloaded from disk is not trusted (module doc).
+            db.drop_text_index(g.label(), TEXTE);
+            db.create_text_index(g.label(), TEXTE)
+                .map_err(|e| anyhow!("index texte de {} : {e}", g.label()))?;
+        }
+        Ok(index)
     }
 }
 
 fn reconstruire_genre<D: Document>(
     db: &ObrainDB,
     rapport: &mut RapportOuverture,
+    lots_ouverts: &HashSet<String>,
     corpus: &mut Corpus,
 ) {
     let label = D::GENRE.label();
@@ -343,30 +468,42 @@ fn reconstruire_genre<D: Document>(
                 .filter(|v| !matches!(v, Value::Null))
                 .cloned()
         };
-        let texte_ecrit = get(TEXTE).and_then(|v| v.as_str().map(str::to_string));
-        let doc_json = get(DOC).and_then(|v| v.as_str().map(str::to_string));
-        // A creation that never reached its commit point, or an empty node.
-        if get(BROUILLON).is_some() || (n.properties.is_empty() && store.out_degree(noeud) == 0) {
+        let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
+        let de_lot_ouvert = chaine(LOT).is_some_and(|l| lots_ouverts.contains(&l));
+        // A document of an uncommitted batch, a legacy draft, or an empty node.
+        if de_lot_ouvert
+            || get(BROUILLON).is_some()
+            || (n.properties.is_empty() && store.out_degree(noeud) == 0)
+        {
             db.delete_node(noeud);
             rapport.brouillons_supprimes += 1;
             continue;
         }
-        let id_ecrit = get(ID).and_then(|v| v.as_str().map(str::to_string));
+        let texte_ecrit = chaine(TEXTE);
+        let doc_json = chaine(DOC);
+        let id_ecrit = chaine(ID);
         let lu = doc_json
+            .as_deref()
             .ok_or_else(|| anyhow!("propriété `doc` absente"))
             .and_then(|j| {
-                serde_json::from_str::<D>(&j).map_err(|e| anyhow!("`doc` illisible : {e}"))
+                serde_json::from_str::<D>(j).map_err(|e| anyhow!("`doc` illisible : {e}"))
             });
         let doc = match lu {
             Ok(d) if id_ecrit.as_deref() == Some(d.id()) => d,
             autre => {
-                if let Some(id) = id_ecrit {
-                    corpus.reserves.insert(id);
-                }
                 let raison = match autre {
                     Ok(_) => "`id` différent de celui du document".to_string(),
                     Err(e) => e.to_string(),
                 };
+                let cles = doc_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                    .map(|v| D::GENRE.cles_tolerantes(&v));
+                corpus.quarantaine.push(Quarantaine {
+                    noeud,
+                    id: id_ecrit,
+                    cles,
+                });
                 rapport
                     .en_quarantaine
                     .push(format!("nœud {label} {noeud:?} : {raison}"));
@@ -375,7 +512,11 @@ fn reconstruire_genre<D: Document>(
         };
         let id = doc.id().to_string();
         if corpus.docs.contains_key(&id) {
-            corpus.reserves.insert(id.clone());
+            corpus.quarantaine.push(Quarantaine {
+                noeud,
+                id: Some(id.clone()),
+                cles: Some(doc.cles()),
+            });
             rapport
                 .en_quarantaine
                 .push(format!("nœud {label} {noeud:?} : id {id} déjà pris"));
@@ -405,7 +546,8 @@ fn refus<T>(methode: &'static str, raison: &'static str) -> Result<T> {
 
 type Filtre = Box<dyn Fn(&Cles) -> bool + Send + 'static>;
 
-/// The search store of the obrain backend.
+/// The search store of the obrain backend: the same base, writer and durability as
+/// the graph store it comes from ([`ObrainGraphStore::recherche`]).
 pub struct ObrainSearchStore {
     interne: Arc<Interne>,
 }
@@ -419,6 +561,14 @@ impl ObrainGraphStore {
     }
 }
 
+/// What an indexing call writes for one document.
+struct Prepare {
+    id: String,
+    json: String,
+    texte: String,
+    cles: Cles,
+}
+
 impl ObrainSearchStore {
     /// The graph store over the same base, to reuse its single write path.
     fn graphe(&self) -> ObrainGraphStore {
@@ -427,97 +577,115 @@ impl ObrainSearchStore {
         }
     }
 
-    /// Index (insert or replace by id) `docs`: one writer section, one fsync.
+    /// Index (insert or replace by id) `docs`: one writer section, one fsync, the
+    /// new documents committed together (module doc, "Atomicity").
     async fn indexer<D: Document>(&self, docs: &[D]) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
         }
         // The last document of an id wins, as in a Meilisearch batch.
         let mut ordre: Vec<String> = Vec::new();
-        let mut derniers: HashMap<String, (String, String, Cles)> = HashMap::new();
+        let mut derniers: HashMap<String, Prepare> = HashMap::new();
         for d in docs {
             let id = d.id().to_string();
             if id.is_empty() {
                 bail!("document sans `id` : rien n'est indexé");
             }
-            let json = serde_json::to_string(d)?;
-            if derniers
-                .insert(id.clone(), (json, d.texte(), d.cles()))
-                .is_none()
-            {
+            let p = Prepare {
+                id: id.clone(),
+                json: serde_json::to_string(d)?,
+                texte: d.texte(),
+                cles: d.cles(),
+            };
+            if derniers.insert(id.clone(), p).is_none() {
                 ordre.push(id);
             }
         }
-        let prepares: Vec<(String, String, String, Cles)> = ordre
+        let prepares: Vec<Prepare> = ordre
             .into_iter()
-            .map(|id| {
-                let (json, texte, cles) = derniers.remove(&id).expect("id vu");
-                (id, json, texte, cles)
-            })
+            .map(|id| derniers.remove(&id).expect("id vu"))
             .collect();
         let g = D::GENRE;
         self.graphe()
             .ecrire(
                 move || prepares,
                 move |prepares, w: &mut Ecriture<'_>| {
-                    let mut existants: Vec<(NodeId, usize)> = Vec::new();
-                    {
+                    // Under the writer lock: what exists, what is quarantined.
+                    let (existants, a_remplacer): (Vec<Option<NodeId>>, Vec<NodeId>) = {
                         let etat = w.index()?;
                         let corpus = etat.recherche.corpus(g);
-                        for (k, (id, ..)) in prepares.iter().enumerate() {
-                            if corpus.reserves.contains(id) {
-                                bail!(
-                                    "indexation du document {id} refusée : un nœud {} de cet id \
-                                     est sur disque, illisible ou en double à l'ouverture \
-                                     (quarantaine). Il n'est ni repris ni écrasé",
-                                    g.label()
-                                );
-                            }
-                            if let Some(e) = corpus.docs.get(id) {
-                                existants.push((e.noeud, k));
-                            }
-                        }
+                        let existants = prepares
+                            .iter()
+                            .map(|p| corpus.docs.get(&p.id).map(|e| e.noeud))
+                            .collect();
+                        let a_remplacer = prepares
+                            .iter()
+                            .flat_map(|p| corpus.quarantaine_de(&p.id).collect::<Vec<_>>())
+                            .collect();
+                        (existants, a_remplacer)
+                    };
+                    let vivants: Vec<NodeId> = existants.iter().flatten().copied().collect();
+                    w.verifier_vivants(&vivants, "indexation")?;
+                    // A quarantined node of the same id is replaced: deleted first.
+                    if !a_remplacer.is_empty() {
+                        w.supprimer_noeuds(&a_remplacer, "indexation (remplacement)")?;
                     }
-                    let noeuds: Vec<NodeId> = existants.iter().map(|(n, _)| *n).collect();
-                    w.verifier_vivants(&noeuds, "indexation")?;
-                    let mut nouveaux: Vec<NodeId> = Vec::new();
+                    let nouveaux = existants.iter().any(Option::is_none);
+                    let lot = if nouveaux {
+                        let lot = w.db.create_node(&[LABEL_LOT]);
+                        let id_lot = uuid::Uuid::new_v4().to_string();
+                        w.poser(lot, ID, Value::from(id_lot.clone()));
+                        Some((lot, id_lot))
+                    } else {
+                        None
+                    };
                     let mut cibles: Vec<NodeId> = Vec::with_capacity(prepares.len());
-                    let par_rang: HashMap<usize, NodeId> =
-                        existants.iter().map(|(n, k)| (*k, *n)).collect();
-                    for (k, (id, json, texte, _)) in prepares.iter().enumerate() {
-                        match par_rang.get(&k) {
+                    for (p, existant) in prepares.iter().zip(&existants) {
+                        w.etape()?;
+                        match existant {
                             Some(noeud) => {
                                 // `doc` first, `texte` second: open recomputes `texte`
                                 // from `doc`, so a cut between the two is repaired.
+                                w.poser(*noeud, DOC, Value::from(p.json.clone()));
                                 w.etape()?;
-                                w.poser(*noeud, DOC, Value::from(json.clone()));
-                                w.etape()?;
-                                w.poser(*noeud, TEXTE, Value::from(texte.clone()));
+                                w.poser(*noeud, TEXTE, Value::from(p.texte.clone()));
                                 cibles.push(*noeud);
                             }
                             None => {
+                                let (_, id_lot) = lot.as_ref().expect("lot créé");
                                 let noeud = w.db.create_node(&[g.label()]);
-                                w.etape()?;
-                                w.poser(noeud, BROUILLON, Value::from(true));
-                                w.poser(noeud, ID, Value::from(id.clone()));
-                                w.poser(noeud, DOC, Value::from(json.clone()));
-                                w.poser(noeud, TEXTE, Value::from(texte.clone()));
-                                nouveaux.push(noeud);
+                                w.poser(noeud, LOT, Value::from(id_lot.clone()));
+                                w.poser(noeud, ID, Value::from(p.id.clone()));
+                                w.poser(noeud, DOC, Value::from(p.json.clone()));
+                                w.poser(noeud, TEXTE, Value::from(p.texte.clone()));
                                 cibles.push(noeud);
                             }
                         }
                     }
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(super::Interruption::AvantLeRetraitDuMarqueur)?;
-                    for noeud in &nouveaux {
+                    if let Some((lot, _)) = lot {
+                        // THE commit point of every new document of this call.
                         w.etape()?;
-                        w.db.remove_node_property(*noeud, BROUILLON);
+                        if !w.db.delete_node(lot) {
+                            bail!(
+                                "obrain a refusé la suppression du lot {lot:?} : rien n'est validé"
+                            );
+                        }
                     }
                     w.rendre_durable()?;
                     let mut etat = w.index_mut()?;
                     let corpus = etat.recherche.corpus_mut(g);
-                    for ((id, _, _, cles), noeud) in prepares.into_iter().zip(cibles) {
-                        corpus.inscrire(id, Entree { noeud, cles });
+                    let remplaces: HashSet<NodeId> = a_remplacer.into_iter().collect();
+                    corpus.retirer_quarantaine(&remplaces);
+                    for (p, noeud) in prepares.into_iter().zip(cibles) {
+                        corpus.inscrire(
+                            p.id,
+                            Entree {
+                                noeud,
+                                cles: p.cles,
+                            },
+                        );
                     }
                     Ok(())
                 },
@@ -525,28 +693,68 @@ impl ObrainSearchStore {
             .await
     }
 
-    /// Delete the documents of kind `g` whose id and filterable fields satisfy
-    /// `choisit`. Absent ids and empty selections are the no-op of Meilisearch.
+    /// Delete the document of this id, and any quarantined node carrying it.
+    /// Absent: the no-op of Meilisearch. O(log N + Q).
+    async fn supprimer_id(&self, g: Genre, quoi: &'static str, id: String) -> Result<()> {
+        self.graphe()
+            .ecrire(
+                || (),
+                move |(), w: &mut Ecriture<'_>| {
+                    let (doc, quarantaine): (Option<NodeId>, Vec<NodeId>) = {
+                        let etat = w.index()?;
+                        let corpus = etat.recherche.corpus(g);
+                        (
+                            corpus.docs.get(&id).map(|e| e.noeud),
+                            corpus.quarantaine_de(&id).collect(),
+                        )
+                    };
+                    let noeuds: Vec<NodeId> = doc.into_iter().chain(quarantaine).collect();
+                    if noeuds.is_empty() {
+                        return Ok(());
+                    }
+                    w.supprimer_noeuds(&noeuds, quoi)?;
+                    w.rendre_durable()?;
+                    let mut etat = w.index_mut()?;
+                    let corpus = etat.recherche.corpus_mut(g);
+                    corpus.retirer(&id);
+                    corpus.retirer_quarantaine(&noeuds.into_iter().collect());
+                    Ok(())
+                },
+            )
+            .await
+    }
+
+    /// Delete the documents of kind `g` whose filterable fields satisfy `choisit`,
+    /// and the quarantined nodes whose readable fields (`None`: no readable JSON)
+    /// satisfy it too.
     async fn supprimer_si(
         &self,
         g: Genre,
         quoi: &'static str,
-        choisit: impl Fn(&str, &Cles) -> bool + Send + 'static,
+        choisit: impl Fn(Option<&Cles>) -> bool + Send + 'static,
     ) -> Result<()> {
         self.graphe()
             .ecrire(
                 || (),
                 move |(), w: &mut Ecriture<'_>| {
-                    let (ids, noeuds): (Vec<String>, Vec<NodeId>) = {
+                    let (ids, mut noeuds, quarantaine): (Vec<String>, Vec<NodeId>, Vec<NodeId>) = {
                         let etat = w.index()?;
-                        etat.recherche
-                            .corpus(g)
+                        let corpus = etat.recherche.corpus(g);
+                        let (ids, noeuds) = corpus
                             .docs
                             .iter()
-                            .filter(|(id, e)| choisit(id, &e.cles))
+                            .filter(|(_, e)| choisit(Some(&e.cles)))
                             .map(|(id, e)| (id.clone(), e.noeud))
-                            .unzip()
+                            .unzip();
+                        let quarantaine = corpus
+                            .quarantaine
+                            .iter()
+                            .filter(|q| choisit(q.cles.as_ref()))
+                            .map(|q| q.noeud)
+                            .collect();
+                        (ids, noeuds, quarantaine)
                     };
+                    noeuds.extend(quarantaine.iter().copied());
                     if noeuds.is_empty() {
                         return Ok(());
                     }
@@ -557,13 +765,41 @@ impl ObrainSearchStore {
                     for id in ids {
                         corpus.retirer(&id);
                     }
+                    corpus.retirer_quarantaine(&quarantaine.into_iter().collect());
                     Ok(())
                 },
             )
             .await
     }
 
-    /// The top `limite` documents of kind `D` for `requete` that pass `filtre`.
+    /// The text index of kind `g`, built under the WRITER lock if it is missing:
+    /// no write can run between the scan and obrain's write hooks (module doc).
+    /// Called BEFORE taking the read lock of the indexes (a writer holds the writer
+    /// lock while it waits for the write lock of the indexes).
+    fn assurer_index_texte(interne: &Interne, g: Genre) -> Result<()> {
+        if interne.db.has_text_index(g.label(), TEXTE) {
+            return Ok(());
+        }
+        let _ecrivain = interne
+            .ecrivain
+            .lock()
+            .map_err(|_| anyhow!("verrou d'écriture obrain empoisonné"))?;
+        if interne.ferme.load(Ordering::Acquire) {
+            bail!(
+                "la base obrain {} est fermée : l'opération est refusée",
+                interne.chemin.display()
+            );
+        }
+        if !interne.db.has_text_index(g.label(), TEXTE) {
+            interne
+                .db
+                .create_text_index(g.label(), TEXTE)
+                .map_err(|e| anyhow!("index texte de {} : {e}", g.label()))?;
+        }
+        Ok(())
+    }
+
+    /// The best `limite` documents of kind `D` for `requete` that pass `filtre`.
     async fn chercher<D: Document>(
         &self,
         methode: &'static str,
@@ -572,29 +808,54 @@ impl ObrainSearchStore {
         filtre: Filtre,
     ) -> Result<Vec<SearchHit<D>>> {
         let requete = requete.to_string();
-        // On the blocking pool: the first search of a kind builds the text index.
         let store = self.graphe();
-        let verrou = self.construction_partagee();
+        // On the blocking pool: the search reads nodes and runs the BM25 scoring.
         tokio::task::spawn_blocking(move || {
+            store.garde()?;
+            Self::assurer_index_texte(&store.interne, D::GENRE)?;
             store.lire(|db, etat| {
-                chercher_dans::<D>(
-                    db,
-                    &etat.recherche,
-                    methode,
-                    &requete,
-                    limite,
-                    &*filtre,
-                    &verrou,
-                )
+                chercher_dans::<D>(db, &etat.recherche, methode, &requete, limite, &*filtre)
             })
         })
         .await
-        .map_err(|e| anyhow!("tâche bloquante obrain interrompue : {e}"))?
+        .context("tâche bloquante obrain interrompue")?
     }
 
-    fn construction_partagee(&self) -> Arc<Mutex<()>> {
-        Arc::clone(&self.interne.construction_texte)
+    fn stats(&self, g: Genre) -> Result<IndexStats> {
+        let total = self
+            .graphe()
+            .lire(|_, etat| Ok(etat.recherche.corpus(g).docs.len()))?;
+        Ok(IndexStats {
+            total_documents: total,
+            is_indexing: false,
+        })
     }
+
+    /// Test hook: how many nodes of `label` the engine holds (served, quarantined
+    /// or of a batch in progress).
+    #[cfg(any(test, feature = "mock-store"))]
+    #[doc(hidden)]
+    pub fn noeuds_du_label(&self, label: &str) -> usize {
+        self.interne.db.store().nodes_by_label(label).len()
+    }
+
+    /// Test hook: how many nodes the RAW text index of `label` returns for `requete`
+    /// (served or not). Tells "deleted from the index" from "filtered out".
+    #[cfg(any(test, feature = "mock-store"))]
+    #[doc(hidden)]
+    pub fn bm25_brut(&self, label: &str, requete: &str, k: usize) -> Result<usize> {
+        self.interne
+            .db
+            .text_search(label, TEXTE, requete, k)
+            .map(|h| h.len())
+            .map_err(|e| anyhow!("recherche texte de {label} : {e}"))
+    }
+}
+
+/// The score of a hit (module doc, "Score and order").
+fn score(couverture: f64, bm25: f64) -> f64 {
+    let b = bm25.max(0.0);
+    (1.0 - DELTA) * couverture + DELTA * (b / (1.0 + b))
 }
 
 fn chercher_dans<D: Document>(
@@ -604,7 +865,6 @@ fn chercher_dans<D: Document>(
     requete: &str,
     limite: usize,
     filtre: &(dyn Fn(&Cles) -> bool + Send),
-    verrou: &Mutex<()>,
 ) -> Result<Vec<SearchHit<D>>> {
     let g = D::GENRE;
     let corpus = index.corpus(g);
@@ -615,15 +875,16 @@ fn chercher_dans<D: Document>(
         t.dedup();
         t
     };
+    // A query the index could not answer is refused whatever the corpus holds.
+    if termes.is_empty() && requete.chars().any(char::is_alphanumeric) {
+        return refus(methode, REFUS_REQUETE);
+    }
     if limite == 0 || corpus.docs.is_empty() {
-        // Nothing can match (no document, or nothing asked): still refuse a query
-        // the index could not have answered, so the answer does not depend on the corpus.
-        if termes.is_empty() && requete.chars().any(char::is_alphanumeric) {
-            return refus(methode, REFUS_REQUETE);
-        }
         return Ok(Vec::new());
     }
 
+    // The document of a hit, if it is served AND passes the filter on the version
+    // read (module doc, "Filters").
     let lire_doc = |noeud: NodeId| -> Result<Option<D>> {
         let Some(n) = db.get_node(noeud) else {
             // Deleted between the index and the read: not there any more.
@@ -633,29 +894,22 @@ fn chercher_dans<D: Document>(
             .get_property(DOC)
             .and_then(|v| v.as_str().map(str::to_string))
             .ok_or_else(|| anyhow!("nœud {} {noeud:?} sans `doc`", g.label()))?;
-        Ok(Some(serde_json::from_str::<D>(&json).map_err(|e| {
-            anyhow!("nœud {} {noeud:?} : `doc` illisible : {e}", g.label())
-        })?))
+        let d = serde_json::from_str::<D>(&json)
+            .map_err(|e| anyhow!("nœud {} {noeud:?} : `doc` illisible : {e}", g.label()))?;
+        Ok(filtre(&d.cles()).then_some(d))
     };
 
     // The placeholder search: no term to match, no alphanumeric character either.
     if termes.is_empty() {
-        if requete.chars().any(char::is_alphanumeric) {
-            return refus(methode, REFUS_REQUETE);
-        }
-        let mut ids: Vec<(&String, NodeId)> = corpus
-            .docs
-            .iter()
-            .filter(|(_, e)| filtre(&e.cles))
-            .map(|(id, e)| (id, e.noeud))
-            .collect();
-        ids.sort();
         let mut out = Vec::new();
-        for (_, noeud) in ids {
+        for e in corpus.docs.values() {
             if out.len() == limite {
                 break;
             }
-            if let Some(document) = lire_doc(noeud)? {
+            if !filtre(&e.cles) {
+                continue;
+            }
+            if let Some(document) = lire_doc(e.noeud)? {
                 out.push(SearchHit {
                     document,
                     score: 1.0,
@@ -665,27 +919,16 @@ fn chercher_dans<D: Document>(
         return Ok(out);
     }
 
-    {
-        let _g = verrou
-            .lock()
-            .map_err(|_| anyhow!("verrou de construction de l'index texte empoisonné"))?;
-        if !db.has_text_index(g.label(), TEXTE) {
-            db.create_text_index(g.label(), TEXTE)
-                .map_err(|e| anyhow!("index texte de {} : {e}", g.label()))?;
-        }
-    }
-
-    let total = corpus.docs.len();
-    let mut k = limite.saturating_mul(4).max(32).min(total);
+    let mut k = limite.saturating_mul(4).max(32);
     loop {
         let hits = db
             .text_search(g.label(), TEXTE, requete, k)
             .map_err(|e| anyhow!("recherche texte de {} : {e}", g.label()))?;
         let epuise = hits.len() < k;
-        let mut out: Vec<SearchHit<D>> = Vec::new();
-        for (noeud, _bm25) in &hits {
+        let mut candidats: Vec<SearchHit<D>> = Vec::new();
+        for (noeud, bm25) in &hits {
             let Some(id) = corpus.par_noeud.get(noeud) else {
-                continue;
+                continue; // not served: a batch in progress, a quarantined node
             };
             if !corpus.docs.get(id).is_some_and(|e| filtre(&e.cles)) {
                 continue;
@@ -696,18 +939,18 @@ fn chercher_dans<D: Document>(
             let presents: HashSet<String> =
                 tokenizer.tokenize(&document.texte()).into_iter().collect();
             let trouves = termes.iter().filter(|t| presents.contains(*t)).count();
-            out.push(SearchHit {
-                score: trouves as f64 / termes.len() as f64,
+            candidats.push(SearchHit {
+                score: score(trouves as f64 / termes.len() as f64, *bm25),
                 document,
             });
-            if out.len() == limite {
-                break;
-            }
         }
-        if out.len() == limite || epuise || k >= total {
-            return Ok(out);
+        if candidats.len() >= limite || epuise {
+            // Stable: equal scores keep the BM25 order.
+            candidats.sort_by(|a, b| b.score.total_cmp(&a.score));
+            candidats.truncate(limite);
+            return Ok(candidats);
         }
-        k = k.saturating_mul(4).min(total);
+        k = k.saturating_mul(4);
     }
 }
 
@@ -812,9 +1055,12 @@ impl SearchStore for ObrainSearchStore {
     }
 
     async fn delete_code(&self, path: &str) -> Result<()> {
-        let id = MeiliClient::path_to_id(path);
-        self.supprimer_si(Genre::Code, "SearchStore::delete_code", move |i, _| i == id)
-            .await
+        self.supprimer_id(
+            Genre::Code,
+            "SearchStore::delete_code",
+            MeiliClient::path_to_id(path),
+        )
+        .await
     }
 
     async fn delete_code_for_project(&self, project_slug: &str) -> Result<()> {
@@ -822,22 +1068,23 @@ impl SearchStore for ObrainSearchStore {
         self.supprimer_si(
             Genre::Code,
             "SearchStore::delete_code_for_project",
-            move |_, c| egal(&c.slug, &slug),
+            move |c| c.is_some_and(|c| egal(&c.slug, &slug)),
         )
         .await
     }
 
     async fn delete_orphan_code_documents(&self) -> Result<()> {
+        // A node whose JSON is unreadable has no readable project: an orphan.
         self.supprimer_si(
             Genre::Code,
             "SearchStore::delete_orphan_code_documents",
-            |_, c| vide(&c.projet_id) || vide(&c.slug),
+            |c| c.is_none_or(|c| vide(&c.projet_id) || vide(&c.slug)),
         )
         .await
     }
 
     async fn delete_all_code(&self) -> Result<()> {
-        self.supprimer_si(Genre::Code, "SearchStore::delete_all_code", |_, _| true)
+        self.supprimer_si(Genre::Code, "SearchStore::delete_all_code", |_| true)
             .await
     }
 
@@ -879,6 +1126,10 @@ impl SearchStore for ObrainSearchStore {
         limit: usize,
         project_slugs: &[String],
     ) -> Result<Vec<DecisionDocument>> {
+        // `project_slug IN []` matches nothing: no need to read the index.
+        if project_slugs.is_empty() {
+            return Ok(Vec::new());
+        }
         let slugs = project_slugs.to_vec();
         Ok(sans_score(
             self.chercher::<DecisionDocument>(
@@ -892,11 +1143,10 @@ impl SearchStore for ObrainSearchStore {
     }
 
     async fn delete_decision(&self, id: &str) -> Result<()> {
-        let id = id.to_string();
-        self.supprimer_si(
+        self.supprimer_id(
             Genre::Decision,
             "SearchStore::delete_decision",
-            move |i, _| i == id,
+            id.to_string(),
         )
         .await
     }
@@ -906,7 +1156,7 @@ impl SearchStore for ObrainSearchStore {
         self.supprimer_si(
             Genre::Decision,
             "SearchStore::delete_decisions_for_project",
-            move |_, c| egal(&c.slug, &slug),
+            move |c| c.is_some_and(|c| egal(&c.slug, &slug)),
         )
         .await
     }
@@ -916,7 +1166,7 @@ impl SearchStore for ObrainSearchStore {
         self.supprimer_si(
             Genre::Decision,
             "SearchStore::delete_decisions_for_task",
-            move |_, c| egal(&c.a, &tache),
+            move |c| c.is_some_and(|c| egal(&c.a, &tache)),
         )
         .await
     }
@@ -977,8 +1227,7 @@ impl SearchStore for ObrainSearchStore {
     }
 
     async fn delete_note(&self, id: &str) -> Result<()> {
-        let id = id.to_string();
-        self.supprimer_si(Genre::Note, "SearchStore::delete_note", move |i, _| i == id)
+        self.supprimer_id(Genre::Note, "SearchStore::delete_note", id.to_string())
             .await
     }
 
@@ -987,7 +1236,7 @@ impl SearchStore for ObrainSearchStore {
         self.supprimer_si(
             Genre::Note,
             "SearchStore::delete_notes_for_project",
-            move |_, c| egal(&c.slug, &slug),
+            move |c| c.is_some_and(|c| egal(&c.slug, &slug)),
         )
         .await
     }
@@ -1002,7 +1251,8 @@ impl SearchStore for ObrainSearchStore {
                         let etat = w.index()?;
                         match etat.recherche.notes.docs.get(&id) {
                             Some(e) => e.noeud,
-                            // Absent: the no-op of Meilisearch (`get_document` fails, nothing indexed).
+                            // Absent: the no-op of Meilisearch (`get_document` fails,
+                            // nothing indexed).
                             None => return Ok(()),
                         }
                     };
@@ -1042,14 +1292,117 @@ impl SearchStore for ObrainSearchStore {
     }
 }
 
-impl ObrainSearchStore {
-    fn stats(&self, g: Genre) -> Result<IndexStats> {
-        let total = self
-            .graphe()
-            .lire(|_, etat| Ok(etat.recherche.corpus(g).docs.len()))?;
-        Ok(IndexStats {
-            total_documents: total,
-            is_indexing: false,
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neo4j::models::{ProjectNode, ProjectProfile};
+    use crate::neo4j::traits::ProjectStore;
+    use crate::orchestrator::Orchestrator;
+
+    fn note(id: &str, content: &str) -> NoteDocument {
+        NoteDocument {
+            id: id.into(),
+            project_id: "pid".into(),
+            project_slug: "p".into(),
+            note_type: "gotcha".into(),
+            status: "active".into(),
+            importance: "high".into(),
+            scope_type: "project".into(),
+            scope_path: String::new(),
+            content: content.into(),
+            tags: vec![],
+            anchor_entities: vec![],
+            created_at: 0,
+            created_by: "t".into(),
+            staleness_score: 0.0,
+            author_kind: "agent".into(),
+            human_confirmed: false,
+            memory_horizon: "operational".into(),
+        }
+    }
+
+    /// The whole chain of `Orchestrator::delete_project` on obrain: the graph
+    /// deletion refuses (a search document is a node outside the projects), so the
+    /// code index of the project must be left whole. REGRESSION: the code documents
+    /// were deleted BEFORE the graph deletion, which then refused — the project
+    /// stayed, its code index was gone.
+    #[tokio::test]
+    async fn a_refused_project_deletion_keeps_the_project_s_code_index() {
+        let graphe = ObrainGraphStore::open_temporary().unwrap();
+        let recherche = Arc::new(graphe.recherche());
+        let id = uuid::Uuid::new_v4();
+        let slug = format!("p-{id}");
+        graphe
+            .create_project(&ProjectNode {
+                id,
+                name: "p".into(),
+                slug: slug.clone(),
+                root_path: String::new(),
+                description: Some("d".into()),
+                created_at: chrono::Utc::now(),
+                last_synced: None,
+                analytics_computed_at: None,
+                last_co_change_computed_at: None,
+                default_note_energy: None,
+                scaffolding_override: None,
+                sharing_policy: None,
+                watch_enabled: false,
+                profile: ProjectProfile::Software,
+            })
+            .await
+            .unwrap();
+        recherche
+            .index_code(&CodeDocument {
+                id: MeiliClient::path_to_id("src/a.rs"),
+                path: "src/a.rs".into(),
+                language: "rust".into(),
+                symbols: vec!["zork".into()],
+                docstrings: String::new(),
+                signatures: vec![],
+                imports: vec![],
+                project_id: id.to_string(),
+                project_slug: slug.clone(),
+            })
+            .await
+            .unwrap();
+
+        let mut state = crate::test_helpers::mock_app_state();
+        state.neo4j = Arc::new(graphe);
+        state.meili = recherche.clone();
+        let orchestrateur = Orchestrator::new(state).await.unwrap();
+
+        let err = orchestrateur.delete_project(id).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ProjectStore::delete_project (cascade)"),
+            "the graph deletion refuses: {err:#}"
+        );
+        assert_eq!(
+            recherche
+                .search_code_in_project("zork", 10, None, Some(&slug))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the project is still there, so is its code index"
+        );
+    }
+
+    /// The text index built at open is not served from obrain's persisted copy: a
+    /// document written after the copy was persisted is found after the reopen.
+    #[tokio::test]
+    async fn the_text_index_is_built_at_open_from_the_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("b");
+        let g = ObrainGraphStore::open(&base, super::super::Creation::Permise).unwrap();
+        let s = g.recherche();
+        s.index_note(&note("n1", "wombat")).await.unwrap();
+        assert_eq!(s.search_notes("wombat", 5).await.unwrap().len(), 1);
+        s.index_note(&note("n2", "wombat quokka")).await.unwrap();
+        g.close().await.unwrap();
+        drop((s, g));
+        let g = ObrainGraphStore::open(&base, super::super::Creation::Interdite).unwrap();
+        let s = g.recherche();
+        assert_eq!(s.bm25_brut("RechercheNote", "wombat", 10).unwrap(), 2);
+        assert_eq!(s.search_notes("quokka", 5).await.unwrap().len(), 1);
     }
 }

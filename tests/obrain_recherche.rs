@@ -375,8 +375,14 @@ async fn the_text_index_follows_writes_after_its_first_build() {
         .unwrap();
     assert!(s.search_notes("quokka", 5).await.unwrap().is_empty());
     assert_eq!(s.search_notes("numbat", 5).await.unwrap().len(), 1);
+    // The RAW index, not only the served answer: the replaced text is gone from it.
+    assert_eq!(s.bm25_brut("RechercheNote", "quokka", 10).unwrap(), 0);
     s.delete_note("n1").await.unwrap();
     assert!(s.search_notes("wombat", 5).await.unwrap().is_empty());
+    // A deleted document leaves the engine AND its text index: a search that only
+    // filtered it out would pass the assertion above and fail this one.
+    assert_eq!(s.bm25_brut("RechercheNote", "wombat", 10).unwrap(), 0);
+    assert_eq!(s.noeuds_du_label("RechercheNote"), 1);
     assert_eq!(s.get_notes_stats().await.unwrap().total_documents, 1);
 }
 
@@ -553,7 +559,7 @@ async fn a_query_the_index_cannot_answer_is_refused_and_the_placeholder_is_serve
     assert!(s.search_notes("", 0).await.unwrap().is_empty());
 }
 
-/// `score` is the fraction of the query's terms the document carries, in [0, 1]:
+/// `score` is driven by the fraction of the query's terms the document carries:
 /// 1.0 for a duplicate (what `chat/feedback.rs` thresholds at 0.85), less for a
 /// partial match.
 #[tokio::test]
@@ -583,9 +589,15 @@ async fn the_score_is_the_fraction_of_query_terms_found() {
         .await
         .unwrap();
     assert_eq!(hits[0].document.id, "dup");
-    assert_eq!(hits[0].score, 1.0);
+    // Full coverage: (1 − δ) + δ·b/(1+b), so in [0.999, 1).
+    assert!(
+        hits[0].score >= 0.999 && hits[0].score < 1.0,
+        "{}",
+        hits[0].score
+    );
     let part = hits.iter().find(|h| h.document.id == "part").unwrap();
-    assert!((part.score - 0.2).abs() < 1e-9, "{}", part.score);
+    // One term of five: within δ = 10⁻³ of 0.2.
+    assert!((part.score - 0.2).abs() <= 1e-3, "{}", part.score);
 }
 
 /// A document without an id is refused with nothing written; a re-indexed id is
@@ -651,4 +663,297 @@ async fn delete_project_refusal_names_the_search_documents() {
         err.contains("recherche (RechercheNote ×1)"),
         "the refusal names the search documents: {err}"
     );
+}
+
+// ===========================================================================
+// Review of #1251
+// ===========================================================================
+
+/// (1) Writes that run WHILE the text index is first built are all in it. The index
+/// is built at open, before any writer; a build at search time takes the writer
+/// lock. REGRESSION: a lazy build under the read lock missed the writes that landed
+/// between its scan and its registration, for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_concurrent_with_the_first_search_are_all_indexed() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = std::sync::Arc::new(g.recherche());
+    let lot: Vec<NoteDocument> = (0..20_000)
+        .map(|i| note(&format!("a{i:05}"), "wombat", "p", "active"))
+        .collect();
+    s.index_notes_batch(&lot).await.unwrap();
+    let ecrivain = {
+        let s = s.clone();
+        tokio::spawn(async move {
+            for i in 0..200 {
+                s.index_note(&note(&format!("b{i:03}"), "wombat", "p", "active"))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    // The first search, racing the writer.
+    let _ = s.search_notes("wombat", 1).await.unwrap();
+    ecrivain.await.unwrap();
+    assert_eq!(
+        s.bm25_brut("RechercheNote", "wombat", 100_000).unwrap(),
+        20_200,
+        "every document written, before or during the first search, is in the index"
+    );
+}
+
+/// (2) Nodes the index holds but that are not served (a batch cut before its
+/// commit, still in the engine until the next open) and that outrank every served
+/// document must not exhaust the search. REGRESSION: the budget was capped at the
+/// number of SERVED documents, so the answer came back empty.
+#[tokio::test]
+async fn unserved_nodes_ranked_first_do_not_empty_the_answer() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = g.recherche();
+    for i in 0..3 {
+        s.index_note(&note(
+            &format!("ok{i}"),
+            "zork among a long sentence of many other unrelated filler words here",
+            "p",
+            "active",
+        ))
+        .await
+        .unwrap();
+    }
+    g.interrompre_au_prochain(Interruption::AvantLeRetraitDuMarqueur);
+    let brouillons: Vec<NoteDocument> = (0..40)
+        .map(|i| note(&format!("draft{i}"), "zork zork zork", "p", "active"))
+        .collect();
+    assert!(s.index_notes_batch(&brouillons).await.is_err());
+    assert_eq!(s.bm25_brut("RechercheNote", "zork", 100).unwrap(), 43);
+    let hits = s.search_notes("zork", 3).await.unwrap();
+    assert_eq!(ids(&hits, |d| &d.id), ["ok0", "ok1", "ok2"]);
+}
+
+/// (4) A batch cut at ANY step leaves all of its new documents or none, never a
+/// prefix. REGRESSION: each document was committed by its own marker removal, so
+/// a cut between two of them left the first ones.
+#[tokio::test]
+async fn a_batch_cut_at_any_step_leaves_all_or_none_of_its_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 1..=6 {
+        let base = dir.path().join(format!("b{n}"));
+        let g = open(&base).await;
+        let s = g.recherche();
+        s.index_note(&note("witness", "wombat", "p", "active"))
+            .await
+            .unwrap();
+        g.interrompre_au_prochain(Interruption::AvantEtape(n));
+        let _ = s
+            .index_notes_batch(&[
+                note("b1", "wombat", "p", "active"),
+                note("b2", "wombat", "p", "active"),
+                note("b3", "wombat", "p", "active"),
+            ])
+            .await;
+        g.close().await.unwrap();
+        drop((s, g));
+        let g = open(&base).await;
+        let s = g.recherche();
+        let total = s.get_notes_stats().await.unwrap().total_documents;
+        assert!(
+            total == 1 || total == 4,
+            "cut before step {n}: {total} documents, a prefix of the batch survived"
+        );
+        assert_eq!(s.noeuds_du_label("RechercheLot"), 0, "step {n}");
+        g.close().await.unwrap();
+    }
+}
+
+/// (6) A document being rewritten (its `doc` written, the rest not yet) is never
+/// returned with fields that contradict the filter. REGRESSION: the filter read the
+/// published copy (project `alpha`) and returned the document read (project `beta`).
+#[tokio::test]
+async fn a_document_mid_rewrite_never_contradicts_the_filter() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = g.recherche();
+    s.index_note(&note("n1", "wombat", "alpha", "active"))
+        .await
+        .unwrap();
+    // Steps of a replacement: 1 before the document, 2 between `doc` and `texte`.
+    g.interrompre_au_prochain(Interruption::AvantEtape(2));
+    assert!(s
+        .index_note(&note("n1", "wombat", "beta", "active"))
+        .await
+        .is_err());
+    for slug in ["alpha", "beta"] {
+        let hits = s
+            .search_notes_with_filters("wombat", 5, Some(slug), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|d| d.project_slug == slug),
+            "filter {slug}, returned {:?}",
+            hits.iter().map(|d| &d.project_slug).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// (7) Hits come in decreasing score; a duplicate of the query comes first even
+/// when another document outranks it in BM25 (by repeating one rare term), with a
+/// score above the 0.85 of `chat/feedback.rs`. REGRESSION: hits were in BM25 order
+/// with a score that was not monotone in it, so the first hit was not the duplicate.
+#[tokio::test]
+async fn the_score_orders_the_hits_and_puts_the_duplicate_first() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = g.recherche();
+    let mut docs = vec![
+        note("spam", "alpha alpha alpha alpha alpha alpha", "p", "active"),
+        note(
+            "dup",
+            &format!(
+                "alpha beta gamma delta epsilon {}",
+                "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(6)
+            ),
+            "p",
+            "active",
+        ),
+    ];
+    for i in 0..30 {
+        docs.push(note(
+            &format!("f{i:02}"),
+            "beta gamma delta epsilon",
+            "p",
+            "active",
+        ));
+    }
+    s.index_notes_batch(&docs).await.unwrap();
+    let hits = s
+        .search_notes_with_scores("alpha beta gamma delta epsilon", 10, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits[0].document.id,
+        "dup",
+        "{:?}",
+        hits.iter()
+            .map(|h| (&h.document.id, h.score))
+            .collect::<Vec<_>>()
+    );
+    assert!(hits[0].score > 0.85, "{}", hits[0].score);
+    assert!(
+        hits.windows(2).all(|w| w[0].score >= w[1].score),
+        "decreasing score: {:?}",
+        hits.iter().map(|h| h.score).collect::<Vec<_>>()
+    );
+}
+
+/// (7) Lists of several projects merged by score (`api/code_handlers.rs`) give the
+/// order of the single search over all projects.
+#[tokio::test]
+async fn per_project_lists_merged_by_score_give_the_global_order() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = g.recherche();
+    let mut docs = Vec::new();
+    for (i, texte) in [
+        "zork",
+        "zork zork quux",
+        "zork plugh",
+        "zork zork zork",
+        "quux zork xyzzy plugh",
+        "zork xyzzy",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let slug = if i % 2 == 0 { "alpha" } else { "beta" };
+        docs.push(CodeDocument {
+            docstrings: (*texte).into(),
+            ..code(&format!("{slug}/{i}.rs"), slug, "rust", &[])
+        });
+    }
+    s.index_code_batch(&docs).await.unwrap();
+    let q = "zork quux plugh";
+    let global: Vec<String> = s
+        .search_code_with_scores(q, 10, None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.document.path)
+        .collect();
+    let mut fusion = Vec::new();
+    for slug in ["alpha", "beta"] {
+        fusion.extend(
+            s.search_code_with_scores(q, 10, None, Some(slug), None)
+                .await
+                .unwrap(),
+        );
+    }
+    fusion.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let fusion: Vec<String> = fusion.into_iter().map(|h| h.document.path).collect();
+    assert_eq!(fusion, global);
+}
+
+/// (8) Quarantined nodes go with the deletions that cover what can be read of them,
+/// and indexing their id again replaces them. REGRESSION: they were never deleted
+/// and refused the re-indexing of their id.
+#[tokio::test]
+async fn quarantined_nodes_are_deleted_and_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("b");
+    let g = open(&base).await;
+    g.close().await.unwrap();
+    drop(g);
+    write_raw(&base, |db| {
+        let poser = |label: &str, id: &str, doc: &str| {
+            let n = db.create_node(&[label]);
+            db.set_node_property(n, "id", Value::from(id.to_string()));
+            db.set_node_property(n, "doc", Value::from(doc.to_string()));
+        };
+        // Readable JSON, not a document: its project can be read.
+        poser(
+            "RechercheCode",
+            "q1",
+            r#"{"project_slug":"alpha","project_id":"x"}"#,
+        );
+        // Not JSON at all: no readable project, an orphan.
+        poser("RechercheCode", "q2", "not json");
+        // A note whose id will be indexed again.
+        poser("RechercheNote", "qn", "not json either");
+    })
+    .await;
+    let g = open(&base).await;
+    assert_eq!(g.rapport_d_ouverture().en_quarantaine.len(), 3);
+    let s = g.recherche();
+    assert_eq!(s.noeuds_du_label("RechercheCode"), 2);
+    s.delete_code_for_project("alpha").await.unwrap();
+    assert_eq!(
+        s.noeuds_du_label("RechercheCode"),
+        1,
+        "q1 went with its project"
+    );
+    s.delete_orphan_code_documents().await.unwrap();
+    assert_eq!(s.noeuds_du_label("RechercheCode"), 0, "q2 is an orphan");
+    s.index_note(&note("qn", "wombat", "p", "active"))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.noeuds_du_label("RechercheNote"),
+        1,
+        "replaced, not doubled"
+    );
+    assert_eq!(s.search_notes("wombat", 5).await.unwrap()[0].id, "qn");
+    g.close().await.unwrap();
+    drop((s, g));
+    let g = open(&base).await;
+    assert!(g.rapport_d_ouverture().en_quarantaine.is_empty());
+}
+
+/// (5) `search_decisions_in_projects(&[])` matches nothing, without a query check.
+#[tokio::test]
+async fn no_project_means_no_decision() {
+    let g = ObrainGraphStore::open_temporary().unwrap();
+    let s = g.recherche();
+    s.index_decision(&decision("d1", "quux", Some("p"), None))
+        .await
+        .unwrap();
+    assert!(s
+        .search_decisions_in_projects("quux", 10, &[])
+        .await
+        .unwrap()
+        .is_empty());
 }

@@ -514,8 +514,6 @@ struct Interne {
     ecrivain: Mutex<()>,
     /// The `Uuid → NodeId` indexes. Never held across disk or fsync.
     etat: RwLock<Etat>,
-    /// Serializes the first build of a text index (`search.rs`).
-    construction_texte: Arc<Mutex<()>>,
     ferme: AtomicBool,
     /// The last durability step failed: what is on disk is unknown.
     indetermine: AtomicBool,
@@ -1007,7 +1005,8 @@ impl ObrainGraphStore {
         let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
         let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
 
-        let recherche = search::IndexRecherche::reconstruire(&db, &mut rapport);
+        let recherche =
+            search::IndexRecherche::reconstruire(&db, &mut rapport).with_context(contexte)?;
 
         let etat = Etat {
             projets,
@@ -1044,7 +1043,6 @@ impl ObrainGraphStore {
                 chemin,
                 ecrivain: Mutex::new(()),
                 etat: RwLock::new(etat),
-                construction_texte: Arc::new(Mutex::new(())),
                 ferme: AtomicBool::new(false),
                 indetermine: AtomicBool::new(false),
                 ecritures: AtomicU64::new(0),
