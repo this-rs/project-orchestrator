@@ -417,7 +417,7 @@ impl MigrationLock {
 }
 
 /// Whether `dest` holds anything (an absent directory holds nothing).
-fn holds_anything(dest: &Path) -> anyhow::Result<bool> {
+pub(crate) fn holds_anything(dest: &Path) -> anyhow::Result<bool> {
     match std::fs::read_dir(dest) {
         Ok(mut entries) => Ok(entries.next().is_some()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

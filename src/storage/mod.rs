@@ -173,19 +173,26 @@ impl StorageBackend {
             // No migration configured. The rollback still re-selects the
             // source (it never touches its data).
             if mig.rollback && requested != BackendKind::Default {
-                // Only a MIGRATED obrain target can lose writes here: the rollback
-                // trace is written by the migration, which needs `from`. Refuse
-                // that case; a never-migrated target has nothing to lose.
-                let migrated = requested == BackendKind::Obrain
-                    && config.storage_obrain_path.as_deref().is_some_and(|p| {
-                        std::path::Path::new(p).join(migrate::DONE_MARKER).is_file()
-                    });
-                if migrated {
+                // Only an obrain target that already HOLDS data can lose writes
+                // here: a migrated one (its marker) or one written directly. The
+                // rollback leaves no trace without `from`, so refuse that case.
+                // An empty or absent target has nothing to lose.
+                let holds_data = requested == BackendKind::Obrain
+                    && config
+                        .storage_obrain_path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| {
+                            migrate::holds_anything(std::path::Path::new(&crate::expand_tilde(p)))
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(false);
+                if holds_data {
                     bail!(
-                        "storage.migration.rollback: the obrain target was migrated, and without \
+                        "storage.migration.rollback: the obrain target holds data, and without \
                          storage.migration.from = '{DEFAULT_BACKEND}' the rollback leaves no trace: \
-                         writes made on obrain since the migration would vanish silently. Set from \
-                         to roll back"
+                         writes made on obrain would vanish silently. Set from to roll back"
                     );
                 }
                 tracing::error!(
@@ -699,11 +706,19 @@ mod tests {
         let mut config = migrating_config(OBRAIN_BACKEND, dir.path());
         config.storage_migration.from = None;
         config.storage_migration.rollback = true;
-        // Never migrated: nothing can be lost, the rollback serves the source.
+        // Empty target: nothing can be lost, the rollback serves the source.
         let chosen = StorageBackend::resolve_kind(&config, &migrate::NoMigrator, &gate)
             .await
             .unwrap();
         assert_eq!(chosen.kind, BackendKind::Default);
+        // Written directly (no marker, data present): same loss, so it refuses.
+        std::fs::write(target.join("data"), b"x").unwrap();
+        assert!(
+            StorageBackend::resolve_kind(&config, &migrate::NoMigrator, &gate)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(target.join("data")).unwrap();
         // Migrated: the rollback would leave no trace, so it refuses.
         std::fs::write(target.join(migrate::DONE_MARKER), b"{}").unwrap();
         let err = StorageBackend::resolve_kind(&config, &migrate::NoMigrator, &gate)
