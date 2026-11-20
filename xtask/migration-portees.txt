@@ -1,0 +1,28 @@
+# Cliquet de la migration Neo4j → obrain : traits de contrat PORTÉS À LA MAIN.
+# Une ligne = un trait que le générateur build/refus_obrain.rs voit implémenté à la
+# main sous src/obrain/ (la notion du compilateur, pas une recherche de texte).
+# Le test the_migration_ratchet_is_exactly_the_set_of_ported_traits exige que ce
+# fichier soit EXACTEMENT cet ensemble ; `cargo xtask migration-gate --base` refuse
+# qu'une ligne disparaisse depuis la base. Il ne fait que GROSSIR.
+# Mis à jour : 20/11/2026, sur la branche de consolidation (tête 7e1b92dd).
+# Pas encore portés (ni listés) : AnalyticsStore (PR #1250), SearchStore (PR #1251).
+AuthStore
+ChatStore
+CodeStore
+CommitStore
+DecisionStore
+FeatureGraphStore
+FederationStore
+GraphStore
+NoteStore
+PersonaStore
+PlanRunStore
+PlanStore
+ProjectStore
+ProtocolRunStore
+ProtocolStore
+ReleaseStore
+SharingStore
+SkillStore
+TriggerStore
+WorkspaceStore

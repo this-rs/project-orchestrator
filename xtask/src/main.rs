@@ -11,6 +11,7 @@
 mod containment;
 mod git;
 mod in_service;
+mod migration_gate;
 mod parity;
 mod path_pins;
 mod pins;
@@ -29,6 +30,7 @@ usage: cargo xtask <subcommand> [options]
   pins              did main of each git-pinned repo reach Cargo.toml? (AM-2)
   storage-boundary  where do the storage drivers leak out of their adapters?
   ts-dto           are the TypeScript DTOs still what the backend serde types say?
+  migration-gate   did a ported store trait lose its port, and is the default still neo4j?
 
 `cargo xtask <subcommand> --help` lists the options of a subcommand.";
 
@@ -42,6 +44,7 @@ fn main() {
         Some("pins") => pins::run(&args[1..]),
         Some("storage-boundary") => storage_boundary::run(&args[1..]),
         Some("ts-dto") => ts_dto::run(&args[1..]),
+        Some("migration-gate") => migration_gate::run(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             0
