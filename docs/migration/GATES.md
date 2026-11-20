@@ -27,10 +27,10 @@ aucune fusion avec un check rouge.
 | # | Porte | Ce qu'elle prouve | Où elle tourne | État réel (20/11/2026) |
 |---|---|---|---|---|
 | G1 | containment | la branche contient `origin/main` | CI, Lint & Format | vert sur la consolidation après la descente #1253 |
-| G2 | cliquet des traits portés | un trait de contrat porté ne perd pas son port ; le cliquet ne rétrécit pas | CI, Lint & Format (`migration-gate --strict --base`) | **20 / 22** portés ; restent `AnalyticsStore` (#1250), `SearchStore` (#1251) |
-| G3 | défaut neo4j | le backend par défaut reste Neo4j, par définition, câblage et déploiement | CI, Lint & Format (même commande) + test unitaire | **conforme** |
-| G4 | conformité des stores | chaque store répond pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI** (service Neo4j, `HARNESS_NEO4J_REQUIRED=1`). Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) à tous les modules `obrain_` (86 tests, verts en local, ~10 s) |
-| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | CI, Obrain backend | couvert par les assertions `not_ported` ; G2 suit les traits, pas les méthodes |
+| G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **20 / 22** portés ; restent `AnalyticsStore` (#1250), `SearchStore` (#1251) |
+| G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
+| G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) aux 18 modules `obrain_` (86 tests). **Trou** : les 28 contrôles transverses (`all_checks!`) ne tournent que sur Neo4j et le mock |
+| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | **non automatisé** | **non fait** ; le migrateur réel est hors dépôt (attendu avant la bascule) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
@@ -46,59 +46,71 @@ ne contient pas `origin/main` ; cela se règle par une descente de `main` dans l
 consolidation, jamais l'inverse.
 
 ### G2 — cliquet des traits portés
-Commande : `cargo xtask migration-gate --strict [--base <rev>]`.
+« Porté » est la notion **du compilateur** : le générateur `build/refus_obrain.rs` lit
+`src/obrain/` avec `syn` et ne génère pas de refus pour un trait implémenté à la main ; il
+publie la liste dans `project_orchestrator::obrain::methodes_portees()`. Une recherche de
+texte serait en désaccord avec lui (module désactivé par `#[cfg]`, macro, chaîne) : la porte
+n'en fait donc aucune.
 
-- **Contrat** : `pub trait` de `src/neo4j/traits.rs` et `src/meilisearch/traits.rs` (22 traits).
-- **Porté** : un `impl <Trait> for Obrain…` existe sous `src/obrain/`, **lu récursivement**.
-  Les commentaires et les chaînes sont retirés avant la recherche : un `impl` laissé en
-  commentaire ou dans une chaîne n'est pas un port. La mise en page est libre (`impl`
-  sur plusieurs lignes, génériques, préfixes `crate::obrain::`, `super::`, `self::`).
-  Seuls les traits du contrat comptent (`impl Debug for ObrainGraphStore` n'est pas un port).
-- **Cliquet** `xtask/migration-portees.txt`. En `--strict`, refusé :
-  - un trait listé qui n'est plus porté (`RÉGRESSION`) ;
-  - un trait porté qui n'est pas listé (`NON CONSIGNÉ`) : un nouveau port est protégé dès sa PR ;
-  - avec `--base`, une ligne retirée du cliquet depuis la base (`CLIQUET RÉDUIT`). En CI, la
-    base est la cible de la PR (ou le commit précédent sur un push) : supprimer un port
-    **et** sa ligne dans la même PR est refusé.
+Deux contrôles complémentaires :
+1. Le test `the_migration_ratchet_is_exactly_the_set_of_ported_traits`
+   (`tests/obrain_backend.rs`, job Obrain backend) exige que `xtask/migration-portees.txt`
+   soit **exactement** l'ensemble des traits portés :
+   - un trait listé qui n'est plus porté échoue (`RÉGRESSION`) ;
+   - un trait porté absent du cliquet échoue (`NON CONSIGNÉ`) : un nouveau port est protégé
+     dès la PR qui l'introduit.
+2. `cargo xtask migration-gate --strict --base <rev>` (job Lint & Format) refuse une ligne
+   retirée du cliquet depuis la base (`CLIQUET RÉDUIT`). Sans ce second contrôle, retirer un
+   port **et** sa ligne dans la même PR passerait le test (les deux ensembles rétrécissent
+   ensemble). En CI, la base est la cible de la PR, ou le commit précédent sur un push.
 
-Preuves rejouées sur une copie indépendante du dépôt (20/11/2026) :
+Preuves rejouées (20/11/2026) :
 
 | Scénario | Résultat |
 |---|---|
-| état réel | 20 / 22, exit 0 |
-| port retiré et ligne du cliquet retirée | `CLIQUET RÉDUIT ProjectStore`, exit 1 |
-| port retiré, laissé en commentaire | `RÉGRESSION ProjectStore`, exit 1 |
-| ligne retirée du cliquet sans `--base` | `NON CONSIGNÉ`, exit 1 |
-| fichier déplacé en sous-dossier, `impl` sur deux lignes | aucun refus, exit 0 |
+| état réel | test vert ; porte : 20 traits, exit 0 |
+| ligne `ProjectStore` retirée du cliquet | test : `NON CONSIGNÉ ["ProjectStore"]` ; porte avec base : `CLIQUET RÉDUIT`, exit 1 |
+| `AnalyticsStore` listé sans être porté | test : `RÉGRESSION ["AnalyticsStore"]` |
 
-**Limites connues** (non détectées) : un `impl` dont toutes les méthodes refusent compte
-comme porté (voir G5) ; un trait importé sous un alias (`use … as PS; impl PS for …`) n'est
-pas reconnu, ce qui produit une régression signalée à tort, jamais une régression masquée.
+**Limite connue** : la porte exécute le code de la PR. Une PR qui réécrit la porte elle-même
+(changer le chemin du cliquet, par exemple) peut la neutraliser. Ce risque se règle par la
+relecture des changements de `xtask/` et du cliquet, et par la protection de la branche.
 
 ### G3 — défaut neo4j
-Même commande. Refusé quand :
+Même commande que G2 (second contrôle). C'est un **détecteur** sur la source, pas une preuve
+de comportement. Refusé quand :
 - `DEFAULT_BACKEND` n'est pas défini **exactement une fois** avec la valeur `"default"`
   (une seconde définition sous `#[cfg]`, ou cachée dans une chaîne, est refusée) ;
-- `src/lib.rs` ne retombe plus sur `DEFAULT_BACKEND` quand rien n'est configuré ;
-- un fichier de déploiement suivi par git (`*.yml`, `*.yaml`, `*.env`, `Dockerfile*`,
-  `docker-compose*`, hors `docs/`, `tests/`, `examples/`, `.github/`) fixe
-  `STORAGE_BACKEND` ou `backend:` à obrain.
+- la fabrique de stockage ne construit plus le backend Neo4j pour `BackendKind::Default` ;
+- `src/lib.rs` ne retombe plus, **dans le code**, sur `DEFAULT_BACKEND` quand rien n'est
+  configuré (une copie dans une chaîne ne compte pas) ;
+- un fichier de déploiement suivi par git fixe `STORAGE_BACKEND` ou `backend:` à obrain :
+  `*.yml`, `*.yaml`, `*.env`, `*.service`, `*.sh`, `*.toml`, `Dockerfile*`,
+  `docker-compose*`, leurs variantes `.example`, y compris `.github/workflows/` et une liste
+  d'environnement Kubernetes (`- name: STORAGE_BACKEND` / `value: obrain`). Sont exclus :
+  `docs/`, `tests/`, `examples/`, `tools/`, `benches/`, `xtask/`, `src/`, `build/`.
 
-Que `DEFAULT_BACKEND` sélectionne bien le backend Neo4j est prouvé par le test unitaire
-`default_backend_is_selected_for_the_default_value` (module `storage`, job Unit Tests).
+Preuves rejouées sur une copie indépendante : bras `Default` recâblé sur obrain, câblage
+remplacé avec une copie gardée dans une chaîne, service systemd, `config.yaml.example`,
+liste d'environnement k8s : tous refusés, exit 1. L'arbre réel ne produit aucun faux positif.
 
-Preuves rejouées sur copie : config recâblée sur `OBRAIN_BACKEND` → refusé ; deuxième
-définition sous `cfg` → refusé ; `deploy/prod.env` avec `STORAGE_BACKEND=obrain` → refusé ;
-tous en exit 1.
+**Angles morts** (non détectés) : un repli sur obrain placé avant le défaut dans
+`src/lib.rs` ; une copie du câblage dans du code mort ; une valeur de déploiement atteinte
+par indirection (`ARG B=obrain` puis `ENV STORAGE_BACKEND=$B`). Ce que la constante
+sélectionne est couvert par le test `default_backend_is_selected_for_the_default_value`,
+qui vérifie la correspondance valeur → variant, et non que le variant construit Neo4j.
 
 ### G4 — conformité des stores
-`tests/store_conformance.rs` exécute chaque contrôle sur Neo4j, le mock et obrain. Les
+`tests/store_conformance.rs` exécute les contrôles par domaine (`*_checks!`) sur Neo4j, le
+mock et obrain ; les 28 contrôles transverses de `all_checks!` ne tournent que sur Neo4j et le
+mock (aucune jambe obrain), et `note_checks` n'a pas de jambe mock. Les
 divergences connues sont listées dans `EXPECTED_DIVERGENCES` ; le test échoue si une
 divergence listée est corrigée (« now conforms »), ce qui force à retirer l'entrée.
 - Jambe Neo4j : job **Integration Tests**, avec un service Neo4j et `HARNESS_NEO4J_REQUIRED=1`
   (un Neo4j absent est un échec, pas un saut).
 - Jambe obrain : job **Obrain backend**. Le filtre CI ne retenait que `obrain_project::`
-  (10 tests, 241 filtrés) ; il retient désormais tous les modules `obrain_` (86 tests).
+  (10 tests, 241 filtrés) ; il retient désormais les 18 modules `obrain_` (86 tests), et
+  aucun test `mock_` ni `neo4j_`.
 - En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
 
 ## Portes manuelles ou non faites

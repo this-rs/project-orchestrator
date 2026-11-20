@@ -1,69 +1,74 @@
-//! `cargo xtask migration-gate` — the ratchet that keeps the Neo4j → obrain
-//! migration from regressing while it is still in progress.
+//! `cargo xtask migration-gate` — the part of the Neo4j → obrain migration gate
+//! that needs `git`, not the compiler. See `docs/migration/GATES.md`.
 //!
-//! Checked from the source tree, without a database:
+//! Which store traits are "ported" is decided by the build generator
+//! (`build/refus_obrain.rs`, parsed with `syn`), and the test
+//! `the_migration_ratchet_is_exactly_the_set_of_ported_traits`
+//! (`tests/obrain_backend.rs`, job « Obrain backend ») checks that the ratchet
+//! `xtask/migration-portees.txt` is exactly that set. A text search here would
+//! disagree with the compiler, so this subcommand does not try to.
 //!
-//! 1. **Ported traits never go back (G2).** A store trait is "ported" when a
-//!    hand-written `impl <Trait> for Obrain…` exists anywhere under
-//!    `src/obrain/` (recursively). Comments and string literals are removed
-//!    before the search, so an impl left in a comment or a string is not a
-//!    port. Only the traits of the contract (`pub trait` of
-//!    `src/neo4j/traits.rs` and `src/meilisearch/traits.rs`) count.
-//!    `xtask/migration-portees.txt` lists the ported traits; in `--strict`:
-//!    - a listed trait that is no longer ported is a REGRESSION;
-//!    - a ported trait that is not listed must be recorded in the same change;
-//!    - with `--base <rev>`, a line removed from the list since `<rev>` is
-//!      refused: the list can only grow, and that is enforced, not just written.
+//! What it checks:
 //!
-//! 2. **The default backend stays Neo4j (G3).** Directive of 20/11/2026: « on
-//!    ne branche pas en prod tant qu'on n'a pas migré vers obrain et this-rs ».
-//!    Refused when: `DEFAULT_BACKEND` is not defined exactly once with the
-//!    value `"default"`; the configuration does not fall back to it
-//!    (`src/lib.rs`); a tracked deployment file sets `STORAGE_BACKEND` (or a
-//!    YAML `backend:`) to obrain. That the default constant maps to the Neo4j
-//!    backend is proved by the unit test
-//!    `default_backend_is_selected_for_the_default_value` (`src/storage`).
+//! 1. **The ratchet never shrinks (G2).** With `--base <rev>`, a trait listed in
+//!    the ratchet at `<rev>` and missing now is refused (`CLIQUET RÉDUIT`).
+//!    Removing a port AND its ratchet line in the same change passes the test
+//!    above (both sides shrink together) and is caught here.
 //!
-//! What is NOT checked here: behaviour (`tests/store_conformance.rs`),
-//! performance, parity on a copy. See `docs/migration/GATES.md`.
+//! 2. **The default backend stays Neo4j (G3)**, a tripwire on the source, not a
+//!    behavioural proof. Directive of 20/11/2026: « on ne branche pas en prod
+//!    tant qu'on n'a pas migré vers obrain et this-rs ». Refused when:
+//!    - `DEFAULT_BACKEND` is not defined exactly once, with the value `"default"`;
+//!    - the storage factory no longer builds the Neo4j backend for
+//!      `BackendKind::Default`;
+//!    - the configuration (`src/lib.rs`) no longer falls back to
+//!      `DEFAULT_BACKEND` in code (a copy in a string does not count);
+//!    - a tracked deployment file sets `STORAGE_BACKEND` (or a YAML `backend:`)
+//!      to obrain.
+//!
+//!    Known blind spots, listed in GATES.md: a fallback to obrain placed before
+//!    the default in `src/lib.rs`, a copy of the wiring in dead code, and a
+//!    deployment value reached through an indirection (`ARG` then `ENV $VAR`).
 //!
 //! Exit codes: 0 nothing to report, or informational mode; 1 a finding
 //! (`--strict`); 2 could not verify (not a repository, an unreadable file, an
-//! unknown `--base`).
+//! unknown `--base`, the ratchet missing at a base that has it).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::git::Repo;
 
 const HELP: &str = "\
 usage: cargo xtask migration-gate [--strict] [--base <rev>] [--repo <chemin>]
 
-  --strict   exit 1 on any finding: a ported trait lost its port, a ported trait
-             is not recorded, the ratchet shrank since --base, or the default
-             backend is no longer Neo4j
+  --strict   exit 1 on any finding: the ratchet shrank since --base, or the
+             default backend is no longer Neo4j
   --base     compare the ratchet with the one at this revision (the target
              branch of a pull request). Empty or all-zero = no comparison.
   --repo     start the repository discovery from this path (default: .)
 
+Which traits are ported is checked by the test
+the_migration_ratchet_is_exactly_the_set_of_ported_traits (tests/obrain_backend.rs).
+
 exit 0 nothing to report (or informational mode), 1 a finding (--strict),
 2 could not verify.";
 
-const CONTRACT_FILES: &[&str] = &["src/neo4j/traits.rs", "src/meilisearch/traits.rs"];
-const OBRAIN_DIR: &str = "src/obrain";
 const RATCHET_FILE: &str = "xtask/migration-portees.txt";
 /// The storage module (a file before the storage split, a directory after).
 const STORAGE_FILES: &[&str] = &["src/storage/mod.rs", "src/storage.rs"];
 const CONFIG_FILE: &str = "src/lib.rs";
 /// How the configuration falls back to the default backend.
 const DEFAULT_WIRING: &str = "unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())";
+/// How the storage factory builds the backend for the default kind.
+const DEFAULT_ARM: &str = "BackendKind::Default => Self::default_backend(";
 
 fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
 /// Remove comments (line, nested block) and, when `strings` is false, the
-/// contents of string literals (regular, byte, raw). Removed text becomes
+/// contents of string literals (regular, byte, raw, C). Removed text becomes
 /// spaces; newlines are kept. Char literals are skipped so that `'"'` does not
 /// open a string.
 pub fn strip_code(content: &str, strings: bool) -> String {
@@ -74,7 +79,6 @@ pub fn strip_code(content: &str, strings: bool) -> String {
     while i < c.len() {
         let ch = c[i];
         let next = c.get(i + 1).copied();
-        // Line comment.
         if ch == '/' && next == Some('/') {
             while i < c.len() && c[i] != '\n' {
                 out.push(' ');
@@ -82,7 +86,6 @@ pub fn strip_code(content: &str, strings: bool) -> String {
             }
             continue;
         }
-        // Block comment, nested.
         if ch == '/' && next == Some('*') {
             let mut depth = 0usize;
             while i < c.len() {
@@ -104,9 +107,11 @@ pub fn strip_code(content: &str, strings: bool) -> String {
             }
             continue;
         }
-        // Raw string: r"…", r#"…"#, br"…" — `r` not inside an identifier.
+        // Raw string r"…", r#"…"#, and its byte / C forms br"…", cr"…": the `r`
+        // must not be inside an identifier, except a single `b` or `c` prefix.
+        let prefix_ok = |k: usize| k < 2 || !is_ident(c[k - 2]);
         let prev_ident =
-            i > 0 && is_ident(c[i - 1]) && !(c[i - 1] == 'b' && (i < 2 || !is_ident(c[i - 2])));
+            i > 0 && is_ident(c[i - 1]) && !((c[i - 1] == 'b' || c[i - 1] == 'c') && prefix_ok(i));
         if ch == 'r' && !prev_ident {
             let mut j = i + 1;
             while c.get(j) == Some(&'#') {
@@ -114,13 +119,9 @@ pub fn strip_code(content: &str, strings: bool) -> String {
             }
             if c.get(j) == Some(&'"') {
                 let hashes = j - i - 1;
-                // Opening r##" is kept as is.
                 out.extend(&c[i..=j]);
                 i = j + 1;
-                loop {
-                    if i >= c.len() {
-                        break;
-                    }
+                while i < c.len() {
                     if c[i] == '"' && (0..hashes).all(|h| c.get(i + 1 + h) == Some(&'#')) {
                         out.push('"');
                         for _ in 0..hashes {
@@ -135,7 +136,6 @@ pub fn strip_code(content: &str, strings: bool) -> String {
                 continue;
             }
         }
-        // Regular (or byte) string.
         if ch == '"' {
             out.push('"');
             i += 1;
@@ -188,83 +188,6 @@ fn flatten(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Every `pub trait X` declared in a contract file (comments ignored).
-pub fn contract_traits(content: &str) -> BTreeSet<String> {
-    let flat = flatten(&strip_code(content, false));
-    let mut out = BTreeSet::new();
-    let mut rest = flat.as_str();
-    while let Some(p) = rest.find("pub trait ") {
-        let after = &rest[p + "pub trait ".len()..];
-        let name: String = after.chars().take_while(|c| is_ident(*c)).collect();
-        if !name.is_empty() {
-            out.insert(name);
-        }
-        rest = after;
-    }
-    out
-}
-
-/// Traits that have an `impl <Trait> for Obrain…` (any line layout, comments
-/// and strings ignored). The parser is generic: `evaluate` keeps only the
-/// contract traits.
-pub fn ported_traits(content: &str) -> BTreeSet<String> {
-    let flat = flatten(&strip_code(content, false));
-    let s = flat;
-    let mut out = BTreeSet::new();
-    let mut idx = 0;
-    while let Some(off) = s[idx..].find("impl") {
-        let p = idx + off;
-        idx = p + 4;
-        let before_ok = p == 0 || !s[..p].chars().last().is_some_and(is_ident);
-        let after = &s[p + 4..];
-        if !before_ok || !(after.starts_with(' ') || after.starts_with('<')) {
-            continue;
-        }
-        // The header runs to the opening brace (or `;` for a declaration).
-        let end = after.find(['{', ';']).unwrap_or(after.len());
-        let header = &after[..end];
-        // Skip `<…>` generics right after `impl`.
-        let header = header.strip_prefix('<').map_or(header, |r| {
-            let mut depth = 1usize;
-            let cut = r
-                .char_indices()
-                .find_map(|(i, c)| {
-                    match c {
-                        '<' => depth += 1,
-                        '>' => depth -= 1,
-                        _ => {}
-                    }
-                    (depth == 0).then_some(i + 1)
-                })
-                .unwrap_or(r.len());
-            &r[cut..]
-        });
-        let Some((trait_part, target)) = header.trim().split_once(" for ") else {
-            continue;
-        };
-        let mut target = target.trim();
-        for prefix in ["crate::obrain::", "super::", "self::", "crate::"] {
-            target = target.strip_prefix(prefix).unwrap_or(target);
-        }
-        if !target.starts_with("Obrain") {
-            continue;
-        }
-        let name = trait_part
-            .split('<')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .trim();
-        if !name.is_empty() && name.chars().all(is_ident) {
-            out.insert(name.to_string());
-        }
-    }
-    out
-}
-
 /// The ratchet file: one trait per line, `#` starts a comment.
 pub fn ratchet(content: &str) -> BTreeSet<String> {
     content
@@ -275,51 +198,20 @@ pub fn ratchet(content: &str) -> BTreeSet<String> {
         .collect()
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
-pub struct Report {
-    /// Listed in the ratchet but no longer ported.
-    pub regressions: Vec<String>,
-    /// In the contract, not ported, not listed: work still to do.
-    pub unported: Vec<String>,
-    /// Ported, not listed: must be recorded in the same change.
-    pub newly_ported: Vec<String>,
-    /// Listed at `--base`, removed from the ratchet since.
-    pub shrunk: Vec<String>,
-}
-
-/// Compare the contract, the ported set, the ratchet and (optionally) the
-/// ratchet at the base revision.
-pub fn evaluate(
-    contract: &BTreeSet<String>,
-    ported: &BTreeSet<String>,
-    ratchet: &BTreeSet<String>,
-    base_ratchet: Option<&BTreeSet<String>>,
-) -> Report {
-    // Only contract traits are ports: `impl Debug for ObrainGraphStore` is not.
-    let ported: BTreeSet<String> = ported.intersection(contract).cloned().collect();
-    Report {
-        regressions: ratchet.difference(&ported).cloned().collect(),
-        unported: contract
-            .difference(&ported)
-            .filter(|t| !ratchet.contains(*t))
-            .cloned()
-            .collect(),
-        newly_ported: ported.difference(ratchet).cloned().collect(),
-        shrunk: base_ratchet
-            .map(|b| b.difference(ratchet).cloned().collect())
-            .unwrap_or_default(),
-    }
+/// Traits listed in the base ratchet and missing from the current one.
+pub fn shrunk(base: &BTreeSet<String>, current: &BTreeSet<String>) -> Vec<String> {
+    base.difference(current).cloned().collect()
 }
 
 /// Findings on the default backend; empty = conforme.
 pub fn default_findings(storage: &str, config: &str) -> Vec<String> {
     let mut f = Vec::new();
-    // Comments removed, strings kept: a definition hidden in a string still
-    // counts as a second definition, which is refused (fail-closed).
-    let s = flatten(&strip_code(storage, true));
-    let defs: Vec<&str> = s
-        .match_indices("const DEFAULT_BACKEND")
-        .map(|(i, _)| &s[i..])
+    // The definition: comments removed, strings KEPT, so a definition hidden
+    // in a string counts as a second one and is refused (fail-closed).
+    let with_strings = flatten(&strip_code(storage, true));
+    let defs: Vec<&str> = with_strings
+        .match_indices("const DEFAULT_BACKEND:")
+        .map(|(i, _)| &with_strings[i..])
         .collect();
     match defs.as_slice() {
         [] => f.push("DEFAULT_BACKEND n'est plus défini".to_string()),
@@ -340,7 +232,16 @@ pub fn default_findings(storage: &str, config: &str) -> Vec<String> {
             many.len()
         )),
     }
-    let cfg = flatten(&strip_code(config, true));
+    // The factory arm and the configuration wiring: strings REMOVED, so a copy
+    // kept in a string does not stand for the real code.
+    let code = flatten(&strip_code(storage, false));
+    if !code.contains(&flatten(DEFAULT_ARM)) {
+        f.push(
+            "la fabrique de stockage ne construit plus le backend Neo4j pour BackendKind::Default"
+                .to_string(),
+        );
+    }
+    let cfg = flatten(&strip_code(config, false));
     if !cfg.contains(&flatten(DEFAULT_WIRING)) {
         f.push(format!(
             "{CONFIG_FILE} ne retombe plus sur DEFAULT_BACKEND quand rien n'est configuré"
@@ -349,57 +250,69 @@ pub fn default_findings(storage: &str, config: &str) -> Vec<String> {
     f
 }
 
-/// Lines of a deployment file that select obrain as the storage backend.
+/// Does this lowercase line set a YAML `backend:` key? The key must start the
+/// line or follow a space, `{` or `,` — so `obrain_backend:` and a CI job named
+/// `obrain-backend:` are not a backend setting.
+fn sets_backend_key(l: &str) -> bool {
+    l.match_indices("backend:").any(|(i, _)| {
+        l[..i]
+            .chars()
+            .last()
+            .is_none_or(|c| c.is_whitespace() || c == '{' || c == ',')
+    })
+}
+
+/// Lines of a deployment file that select obrain as the storage backend,
+/// including a Kubernetes-style `- name: STORAGE_BACKEND` / `value: obrain` pair.
 pub fn deploy_findings(path: &str, content: &str) -> Vec<String> {
-    content
+    let lines: Vec<String> = content
         .lines()
-        .enumerate()
-        .filter_map(|(n, l)| {
-            let l = l.split('#').next().unwrap_or("").trim().to_lowercase();
-            let env = l.contains("storage_backend") && l.contains("obrain");
-            let yaml = l.starts_with("backend:") && l.contains("obrain");
-            (env || yaml).then(|| format!("{path}:{} sélectionne obrain", n + 1))
-        })
-        .collect()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    for (n, l) in lines.iter().enumerate() {
+        let env = l.contains("storage_backend") && l.contains("obrain");
+        let yaml = sets_backend_key(l) && l.contains("obrain");
+        let pair = l.contains("storage_backend")
+            && !l.contains("obrain")
+            && lines[n + 1..]
+                .iter()
+                .find(|x| !x.is_empty())
+                .is_some_and(|x| x.starts_with("value:") && x.contains("obrain"));
+        if env || yaml || pair {
+            out.push(format!("{path}:{} sélectionne obrain", n + 1));
+        }
+    }
+    out
 }
 
 /// Is this tracked file a deployment configuration to scan?
 fn is_deploy_file(path: &str) -> bool {
+    // Rust sources, tests, docs, benches and the tooling are not deployment.
     let skip = [
         "docs/",
         "tests/",
         "examples/",
-        ".github/",
         "xtask/",
         "src/",
         "build/",
+        "tools/",
+        "benches/",
     ];
-    if skip.iter().any(|p| path.starts_with(p)) || path.ends_with(".md") {
+    if skip.iter().any(|p| path.starts_with(p)) || path.ends_with(".md") || path.ends_with(".rs") {
         return false;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
+    let name = name.strip_suffix(".example").unwrap_or(name);
     name.ends_with(".yml")
         || name.ends_with(".yaml")
         || name.ends_with(".env")
         || name.starts_with(".env")
+        || name.ends_with(".service")
+        || name.ends_with(".sh")
+        || name.ends_with(".toml")
         || name.starts_with("Dockerfile")
         || name.starts_with("docker-compose")
-}
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("{} illisible : {e}", dir.display()))?;
-    for e in entries {
-        let p = e
-            .map_err(|e| format!("{} illisible : {e}", dir.display()))?
-            .path();
-        if p.is_dir() {
-            rs_files(&p, out)?;
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -456,49 +369,40 @@ pub fn run(args: &[String]) -> i32 {
         std::fs::read_to_string(root.join(rel)).map_err(|e| format!("{rel} illisible : {e}"))
     };
 
-    let mut contract = BTreeSet::new();
-    for f in CONTRACT_FILES {
-        match read(f) {
-            Ok(c) => contract.extend(contract_traits(&c)),
-            Err(e) => return unverifiable(e),
-        }
-    }
-
-    let mut files = Vec::new();
-    if let Err(e) = rs_files(&root.join(OBRAIN_DIR), &mut files) {
-        return unverifiable(e);
-    }
-    let mut ported = BTreeSet::new();
-    for p in &files {
-        match std::fs::read_to_string(p) {
-            Ok(c) => ported.extend(ported_traits(&c)),
-            Err(e) => return unverifiable(format!("{} illisible : {e}", p.display())),
-        }
-    }
-
-    let ratchet_set = match read(RATCHET_FILE) {
+    let current = match read(RATCHET_FILE) {
         Ok(t) => ratchet(&t),
         Err(e) => return unverifiable(e),
     };
 
-    let base_set = match o.base.as_deref() {
+    let base = match o.base.as_deref() {
         None => None,
         Some(rev) if base_is_absent(rev) => None,
         Some(rev) => {
             if repo.resolve(rev).is_none() {
                 return unverifiable(format!("révision de base « {rev} » inconnue"));
             }
-            // Absent at the base (the ratchet is new there): nothing to compare.
-            let spec = format!("{rev}:{RATCHET_FILE}");
-            Some(
-                repo.git(&["show", &spec])
-                    .map(|t| ratchet(&t))
-                    .unwrap_or_default(),
-            )
+            // Is the ratchet tracked at the base? Absent there (the gate is new)
+            // means nothing to compare; present but unreadable is not verifiable.
+            let tracked = repo
+                .git(&["ls-tree", "--name-only", rev, "--", RATCHET_FILE])
+                .map(|out| out.lines().any(|l| l.trim() == RATCHET_FILE));
+            match tracked {
+                Err(e) => return unverifiable(format!("git ls-tree {rev} : {e}")),
+                Ok(false) => Some(BTreeSet::new()),
+                Ok(true) => {
+                    let spec = format!("{rev}:{RATCHET_FILE}");
+                    match repo.git(&["show", &spec]) {
+                        Ok(t) => Some(ratchet(&t)),
+                        Err(e) => return unverifiable(format!("git show {spec} : {e}")),
+                    }
+                }
+            }
         }
     };
-
-    let report = evaluate(&contract, &ported, &ratchet_set, base_set.as_ref());
+    let removed = base
+        .as_ref()
+        .map(|b| shrunk(b, &current))
+        .unwrap_or_default();
 
     let Some(storage) = STORAGE_FILES.iter().find_map(|f| read(f).ok()) else {
         return unverifiable("module de stockage illisible".to_string());
@@ -519,45 +423,26 @@ pub fn run(args: &[String]) -> i32 {
         Err(e) => return unverifiable(format!("git ls-files : {e}")),
     }
 
-    let ported_contract = ported.intersection(&contract).count();
     println!(
-        "migration-gate : {} trait(s) de contrat, {} porté(s) à la main, {} dans le cliquet{}",
-        contract.len(),
-        ported_contract,
-        ratchet_set.len(),
-        match &base_set {
+        "migration-gate : {} trait(s) dans le cliquet{}",
+        current.len(),
+        match &base {
             Some(b) => format!(", {} dans le cliquet de base", b.len()),
-            None => String::new(),
+            None => " (pas de base : pas de comparaison)".to_string(),
         }
     );
-    for t in &report.regressions {
-        println!("  RÉGRESSION       {t} : listé dans {RATCHET_FILE} mais plus porté");
-    }
-    for t in &report.shrunk {
+    for t in &removed {
         println!("  CLIQUET RÉDUIT   {t} : retiré de {RATCHET_FILE} depuis la base");
     }
-    for t in &report.newly_ported {
-        println!(
-            "  NON CONSIGNÉ     {t} : porté, à ajouter dans {RATCHET_FILE} dans le même changement"
-        );
-    }
-    for t in &report.unported {
-        println!("  à porter         {t}");
-    }
     if defaults.is_empty() {
-        println!(
-            "  backend par défaut : neo4j (« default »), câblé dans la configuration — conforme"
-        );
+        println!("  backend par défaut : neo4j (« default »), câblé — conforme");
     } else {
         for d in &defaults {
             println!("  BACKEND PAR DÉFAUT : {d} — refusé");
         }
     }
 
-    let failed = !report.regressions.is_empty()
-        || !report.shrunk.is_empty()
-        || !report.newly_ported.is_empty()
-        || !defaults.is_empty();
+    let failed = !removed.is_empty() || !defaults.is_empty();
     if failed && o.strict {
         1
     } else {
@@ -574,11 +459,17 @@ mod tests {
     }
 
     const WIRED: &str = "x.unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())";
+    const ARM: &str = "match k { BackendKind::Default => Self::default_backend(config).await, }";
+
+    fn storage(def: &str) -> String {
+        format!("{def}\n{ARM}")
+    }
 
     #[test]
     fn comments_and_strings_are_removed_but_lines_kept() {
         let src = "a // impl X for ObrainA {\nb /* impl Y /* nested */ for ObrainB { */ c\n\
                    let s = \"impl Z for ObrainC {\"; let r = r#\"impl W for ObrainD {\"#;\n\
+                   let k = cr#\"impl V for ObrainE {\"#;\n\
                    let q = '\"'; let e = '\\''; let l: &'a str = x;";
         let out = strip_code(src, false);
         assert_eq!(out.lines().count(), src.lines().count());
@@ -592,86 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn contract_traits_are_the_pub_traits_of_the_contract_files() {
-        let src = "pub trait ProjectStore: Send {\n    fn x();\n}\n\
-                   pub(crate) trait Hidden {}\n  pub trait NoteStore<T> {}\n// pub trait Ghost {}\n";
-        assert_eq!(contract_traits(src), set(&["NoteStore", "ProjectStore"]));
-    }
-
-    #[test]
-    fn a_hand_impl_for_an_obrain_type_is_a_port_in_any_layout() {
-        let src = "impl ProjectStore for ObrainGraphStore {\n\
-                   impl crate::neo4j::traits::PlanStore\n    for crate::obrain::ObrainGraphStore\n{\n\
-                   impl<T> NoteStore<T> for super::ObrainGraphStore {\n\
-                   impl ChatStore for self::ObrainGraphStore {\n\
-                   impl ProjectStore for crate::neo4j::client::Neo4jStore {\n\
-                   impl Debug for ObrainGraphStore {\n";
-        assert_eq!(
-            ported_traits(src),
-            set(&[
-                "ChatStore",
-                "Debug",
-                "NoteStore",
-                "PlanStore",
-                "ProjectStore"
-            ])
-        );
-    }
-
-    #[test]
-    fn an_impl_in_a_comment_or_a_string_is_not_a_port() {
-        let src = "/* impl ProjectStore for ObrainGraphStore { */\n\
-                   // impl PlanStore for ObrainGraphStore {\n\
-                   const S: &str = \"impl NoteStore for ObrainGraphStore {\";\n\
-                   const R: &str = r#\"impl ChatStore for ObrainGraphStore {\"#;\n";
-        assert!(ported_traits(src).is_empty(), "{:?}", ported_traits(src));
-    }
-
-    #[test]
-    fn a_listed_trait_that_lost_its_port_is_a_regression() {
-        let r = evaluate(
-            &set(&["PlanStore", "NoteStore", "SearchStore"]),
-            &set(&["NoteStore"]),
-            &set(&["PlanStore", "NoteStore"]),
-            None,
-        );
-        assert_eq!(r.regressions, vec!["PlanStore".to_string()]);
-        assert_eq!(r.unported, vec!["SearchStore".to_string()]);
-        assert!(r.newly_ported.is_empty() && r.shrunk.is_empty());
-    }
-
-    #[test]
-    fn a_ported_trait_not_recorded_is_a_finding() {
-        let r = evaluate(&set(&["A"]), &set(&["A"]), &set(&[]), None);
-        assert!(r.regressions.is_empty());
-        assert_eq!(r.newly_ported, vec!["A".to_string()]);
-    }
-
-    #[test]
-    fn removing_a_port_and_its_ratchet_line_together_is_caught_by_the_base() {
-        // The trick the review found: delete the port AND the line.
-        let r = evaluate(
-            &set(&["ProjectStore", "NoteStore"]),
-            &set(&["NoteStore"]),
-            &set(&["NoteStore"]),
-            Some(&set(&["ProjectStore", "NoteStore"])),
-        );
-        assert!(r.regressions.is_empty());
-        assert_eq!(r.shrunk, vec!["ProjectStore".to_string()]);
-    }
-
-    #[test]
-    fn a_non_contract_impl_is_not_a_port() {
-        let r = evaluate(
-            &set(&["NoteStore"]),
-            &set(&["Debug", "NoteStore"]),
-            &set(&["NoteStore"]),
-            None,
-        );
-        assert_eq!(r, Report::default());
-    }
-
-    #[test]
     fn the_ratchet_ignores_comments_and_blank_lines() {
         assert_eq!(
             ratchet("# en-tête\n\nNoteStore  # porté\nPlanStore\n"),
@@ -680,23 +491,51 @@ mod tests {
     }
 
     #[test]
-    fn the_default_backend_is_checked_by_its_definition_and_its_wiring() {
-        let ok = "pub const DEFAULT_BACKEND: &str = \"default\"; // neo4j";
-        assert!(default_findings(ok, WIRED).is_empty());
-        let wrapped = "pub const DEFAULT_BACKEND: &str =\n    \"default\";";
-        assert!(default_findings(wrapped, WIRED).is_empty());
+    fn a_line_removed_since_the_base_is_reported() {
+        let base = set(&["ProjectStore", "NoteStore"]);
         assert_eq!(
-            default_findings("pub const DEFAULT_BACKEND: &str = \"obrain\";", WIRED).len(),
-            1
+            shrunk(&base, &set(&["NoteStore"])),
+            vec!["ProjectStore".to_string()]
         );
-        let twice = "#[cfg(not(x))] pub const DEFAULT_BACKEND: &str = \"default\";\n\
-                     #[cfg(x)] pub const DEFAULT_BACKEND: &str = \"obrain\";";
-        assert_eq!(default_findings(twice, WIRED).len(), 1);
-        let hidden = "pub const DEFAULT_BACKEND: &str = \"obrain\";\n\
-                      const OLD: &str = r#\"pub const DEFAULT_BACKEND: &str = \"default\";\"#;";
-        assert!(!default_findings(hidden, WIRED).is_empty());
-        let rewired = "x.unwrap_or_else(|| crate::storage::OBRAIN_BACKEND.to_string())";
-        assert_eq!(default_findings(ok, rewired).len(), 1);
+        assert!(shrunk(&base, &set(&["NoteStore", "ProjectStore", "PlanStore"])).is_empty());
+    }
+
+    #[test]
+    fn the_default_backend_is_checked_by_definition_factory_and_wiring() {
+        let ok = storage("pub const DEFAULT_BACKEND: &str = \"default\"; // neo4j");
+        assert!(
+            default_findings(&ok, WIRED).is_empty(),
+            "{:?}",
+            default_findings(&ok, WIRED)
+        );
+        let wrapped = storage("pub const DEFAULT_BACKEND: &str =\n    \"default\";");
+        assert!(default_findings(&wrapped, WIRED).is_empty());
+        let obrain = storage("pub const DEFAULT_BACKEND: &str = \"obrain\";");
+        assert_eq!(default_findings(&obrain, WIRED).len(), 1);
+        let twice = storage(
+            "#[cfg(not(x))] pub const DEFAULT_BACKEND: &str = \"default\";\n\
+             #[cfg(x)] pub const DEFAULT_BACKEND: &str = \"obrain\";",
+        );
+        assert_eq!(default_findings(&twice, WIRED).len(), 1);
+        let hidden = storage(
+            "pub const DEFAULT_BACKEND: &str = \"obrain\";\n\
+             const OLD: &str = r#\"pub const DEFAULT_BACKEND: &str = \"default\";\"#;",
+        );
+        assert!(!default_findings(&hidden, WIRED).is_empty());
+        // The factory arm rewired to obrain.
+        let rearmed = "pub const DEFAULT_BACKEND: &str = \"default\";\n\
+                       BackendKind::Default => Self::obrain_backend(config).await,";
+        assert_eq!(default_findings(rearmed, WIRED).len(), 1);
+        // The wiring replaced, with a copy left in a string.
+        let rewired = "x.unwrap_or_else(|| crate::storage::OBRAIN_BACKEND.to_string()); \
+                       let _s = \"unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())\";";
+        assert_eq!(default_findings(&ok, rewired).len(), 1);
+        // A label that merely starts with the name is not a second definition.
+        let label = storage(
+            "pub const DEFAULT_BACKEND: &str = \"default\";\n\
+             pub const DEFAULT_BACKEND_LABEL: &str = \"Neo4j\";",
+        );
+        assert!(default_findings(&label, WIRED).is_empty());
         assert!(!default_findings("", WIRED).is_empty());
     }
 
@@ -710,34 +549,36 @@ mod tests {
             deploy_findings("c.yaml", "storage:\n  backend: obrain\n").len(),
             1
         );
+        assert_eq!(
+            deploy_findings("c.yaml", "storage: { backend: obrain }\n").len(),
+            1
+        );
+        assert_eq!(
+            deploy_findings(
+                "k.yaml",
+                "env:\n  - name: STORAGE_BACKEND\n    value: obrain\n"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            deploy_findings("x.service", "Environment=STORAGE_BACKEND=obrain\n").len(),
+            1
+        );
         assert!(deploy_findings("c.yaml", "  # backend: obrain\nbackend: default\n").is_empty());
+        assert!(deploy_findings("c.yaml", "obrain_backend: yes\n").is_empty());
+        assert!(deploy_findings(
+            "ci.yml",
+            "jobs:\n  obrain-backend:\n    name: Obrain backend\n"
+        )
+        .is_empty());
         assert!(is_deploy_file("docker-compose.yml") && is_deploy_file("deploy/prod.env"));
-        assert!(!is_deploy_file(".github/workflows/ci.yml") && !is_deploy_file("docs/x.yaml"));
-    }
-
-    #[test]
-    fn the_obrain_tree_is_scanned_recursively() {
-        let dir = std::env::temp_dir().join(format!("migration-gate-{}", std::process::id()));
-        let sub = dir.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(
-            sub.join("p.rs"),
-            "impl ProjectStore for ObrainGraphStore {}",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("notes.txt"),
-            "impl NoteStore for ObrainGraphStore {}",
-        )
-        .unwrap();
-        let mut files = Vec::new();
-        rs_files(&dir, &mut files).unwrap();
-        let ported: BTreeSet<String> = files
-            .iter()
-            .flat_map(|p| ported_traits(&std::fs::read_to_string(p).unwrap()))
-            .collect();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(ported, set(&["ProjectStore"]));
+        assert!(is_deploy_file("config.yaml.example") && is_deploy_file("install.sh"));
+        assert!(is_deploy_file(
+            "packaging/debian/project-orchestrator.service"
+        ));
+        assert!(is_deploy_file(".github/workflows/release.yml"));
+        assert!(!is_deploy_file("docs/x.yaml") && !is_deploy_file("tools/bench/bench.env"));
     }
 
     #[test]
