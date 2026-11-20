@@ -1015,6 +1015,106 @@ pub mod conformance {
         store.delete_project(p.id, &p.name).await.unwrap();
     }
 
+    /// The project filter of `find_project_files_by_path_suffix` comes before the
+    /// limit: files of seven other projects with the same suffix, sorting first,
+    /// do not hide the wanted project's own (issue #1189), and another project
+    /// does not see them.
+    pub async fn check_project_scoped_suffix_lookup_filters_before_limit(store: &dyn GraphStore) {
+        let tag = Uuid::new_v4();
+        let suffix = format!("/{tag}/src/lib.rs");
+        let wanted = a_project("suffix-wanted");
+        store.create_project(&wanted).await.unwrap();
+        let mut projects = vec![wanted.clone()];
+        for i in 0..7 {
+            let other = a_project(&format!("suffix-other{i}"));
+            store.create_project(&other).await.unwrap();
+            store
+                .upsert_file(&a_file(
+                    &format!("conformance/a{i}{suffix}"),
+                    Some(other.id),
+                    "h",
+                ))
+                .await
+                .unwrap();
+            projects.push(other);
+        }
+        let wanted_path = format!("conformance/z-wanted{suffix}");
+        store
+            .upsert_file(&a_file(&wanted_path, Some(wanted.id), "h"))
+            .await
+            .unwrap();
+
+        let found = store
+            .find_project_files_by_path_suffix(wanted.id, &suffix, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![wanted_path.clone()],
+            "filtered before the limit"
+        );
+
+        let seen_by_another = store
+            .find_project_files_by_path_suffix(projects[1].id, &suffix, 2)
+            .await
+            .unwrap();
+        assert_eq!(seen_by_another, vec![format!("conformance/a0{suffix}")]);
+
+        // Membership is the `CONTAINS` relation: the wanted project contains its
+        // file, another project does not.
+        assert!(store
+            .project_contains_file(wanted.id, &wanted_path)
+            .await
+            .unwrap());
+        assert!(!store
+            .project_contains_file(projects[1].id, &wanted_path)
+            .await
+            .unwrap());
+
+        for p in &projects {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
+    /// Membership is the CONTAINS relation, not the project property, and the
+    /// suffix lookup over all projects is ordered by path before its limit (so the
+    /// answer is the same on every store). Issue #1189, review of 890609e6.
+    pub async fn check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path(
+        store: &dyn GraphStore,
+    ) {
+        let tag = Uuid::new_v4();
+        let suffix = format!("/{tag}/src/lib.rs");
+        let a = a_project("member-a");
+        let b = a_project("member-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+        let z_path = format!("conformance/z-{tag}{suffix}");
+        let a_path = format!("conformance/a-{tag}{suffix}");
+        store
+            .upsert_file(&a_file(&z_path, Some(a.id), "h"))
+            .await
+            .unwrap();
+        store
+            .upsert_file(&a_file(&a_path, Some(b.id), "h"))
+            .await
+            .unwrap();
+
+        // Each file is contained by the project it was written with, and by no other.
+        assert!(store.project_contains_file(a.id, &z_path).await.unwrap());
+        assert!(!store.project_contains_file(b.id, &z_path).await.unwrap());
+        assert!(store.project_contains_file(b.id, &a_path).await.unwrap());
+        assert!(!store.project_contains_file(a.id, &a_path).await.unwrap());
+
+        // Over all projects, the first page is the first paths in path order, not
+        // whichever the store happens to return first.
+        let first = store.find_files_by_path_suffix(&suffix, 1).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, a_path, "ordered by path before the limit");
+
+        store.delete_project(a.id, &a.name).await.unwrap();
+        store.delete_project(b.id, &b.name).await.unwrap();
+    }
+
     // ------------------------------------------------------------------
     // 7. Sorting of a filtered list.
     // ------------------------------------------------------------------
@@ -6474,6 +6574,8 @@ macro_rules! all_checks {
                 check_cascade_delete_project,
                 check_task_delete_reports_its_cascade,
                 check_empty_prompt_cache_reads_as_none,
+                check_project_scoped_suffix_lookup_filters_before_limit,
+                check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path,
                 check_sorting,
                 check_sorting_tie_break_paging,
                 check_pagination,

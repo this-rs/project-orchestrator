@@ -250,7 +250,8 @@ struct PredictedFile {
 
 /// Key, in the settings store, of the list of notes a person pinned.
 pub const PINNED_NOTES_KEY: &str = "knowledge.pinned_notes";
-/// At most this many pinned notes reach a turn (configured, global, then project).
+/// At most this many pinned notes reach a turn — configured, then declared (global,
+/// then project), then the structural read fills what is left.
 pub const MAX_PINNED_NOTES: usize = 10;
 /// Budget of reading the pinned notes of a turn (the settings, then the notes): past it
 /// the turn goes on without them, and the ranked knowledge is not lost with them.
@@ -262,6 +263,15 @@ const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 /// is a note whose tail nobody reads. The panel that lets a person declare the core reads
 /// the SAME constant, so what it promises and what the prompt carries cannot drift.
 pub const PINNED_NOTE_CHARS: usize = 300;
+
+/// Characters the foundation section really gets in a turn: half of the base knowledge
+/// budget. The foundation is NOT adjusted by [`scaffolding_config`] — a lower level
+/// injects less *ranked* context, not less foundation — so this is level-independent.
+/// The `/api/knowledge/self-core` endpoint publishes this SAME number, so what the
+/// screen promises and what the prompt carries cannot drift.
+pub fn foundation_budget_chars() -> usize {
+    KnowledgeInjectionConfig::default().max_content_chars / 2
+}
 
 /// What the structural read of the self said about itself, for the prompt.
 ///
@@ -698,10 +708,12 @@ impl KnowledgeInjectionStage {
     /// conversation without a project still receives its foundation.
     ///
     /// The pins are those of the configuration, then the GLOBAL ones and those of the
-    /// session's project as people set them ([`load_pinned_notes`]), deduplicated, at
-    /// most [`MAX_PINNED_NOTES`], minus the notes the message already references
-    /// (`excluded`). Read under [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so
-    /// the ranked retrieval does not inject them a second time.
+    /// session's project as people set them ([`load_pinned_notes`]) — the declared order,
+    /// so a human's declaration is never truncated by the machine's edges — and the
+    /// structural read fills the slots left. Deduplicated, at most [`MAX_PINNED_NOTES`],
+    /// minus the notes the message already references (`excluded`). Read under
+    /// [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so the ranked retrieval does not
+    /// inject them a second time.
     ///
     /// The section opens with the account of the self ([`SelfRead::line`]): how many of
     /// its notes were read out of how many it knows, or why it could not be resolved. In
@@ -713,7 +725,6 @@ impl KnowledgeInjectionStage {
         reader: Option<Uuid>,
         restricted: bool,
         project: Option<&str>,
-        max_content_chars: usize,
         excluded: &std::collections::HashSet<String>,
         session: Option<Uuid>,
     ) -> std::collections::HashSet<String> {
@@ -737,8 +748,26 @@ impl KnowledgeInjectionStage {
                     .map(|p| p.id),
                 None => None,
             };
+            // The declared pins come FIRST — a person's declaration outranks the
+            // machine's edges and must never be truncated away by them. The global pins,
+            // then the project's (a session without a project: global only). They stay
+            // alongside the structural read so a subject that lost its edges would not
+            // lose its foundation in silence.
+            let mut scopes = vec![None];
+            if let Some(slug) = project_owned.as_deref() {
+                scopes.push(Some(slug));
+            }
+            for scope in scopes {
+                match load_pinned_notes(graph.as_ref(), scope).await {
+                    Ok(stored) => ids.extend(stored),
+                    Err(e) => {
+                        warn!(scope = ?scope, error = %e, "unreadable pinned notes, skipped")
+                    }
+                }
+            }
             // « l'ancrage ne peut pas mentir » : un soi non résolu ne sert RIEN de
-            // structurel, et le dit. Pas de repli sur un autre périmètre.
+            // structurel, et le dit. Pas de repli sur un autre périmètre. The structural
+            // read fills the slots the declarations left free.
             let (structural, self_read) = match graph.agent_identity_namespace().await {
                 Ok(self_id) => match graph
                     .agent_knows(self_id, scope_project, MAX_PINNED_NOTES)
@@ -776,21 +805,6 @@ impl KnowledgeInjectionStage {
                 }
             };
             ids.extend(structural);
-            // The global pins, then the project's (a session without a project: global only).
-            // Kept alongside the edges until the structural read is proven equivalent:
-            // a subject that lost its edges would otherwise lose its foundation in silence.
-            let mut scopes = vec![None];
-            if let Some(slug) = project_owned.as_deref() {
-                scopes.push(Some(slug));
-            }
-            for scope in scopes {
-                match load_pinned_notes(graph.as_ref(), scope).await {
-                    Ok(stored) => ids.extend(stored),
-                    Err(e) => {
-                        warn!(scope = ?scope, error = %e, "unreadable pinned notes, skipped")
-                    }
-                }
-            }
             let mut seen = std::collections::HashSet::new();
             ids.retain(|id| seen.insert(*id));
             ids.truncate(MAX_PINNED_NOTES);
@@ -848,8 +862,9 @@ impl KnowledgeInjectionStage {
         };
 
         // Half the knowledge budget at most: the pins come first, they must not leave
-        // nothing to the ranked notes the message asked for.
-        let budget = max_content_chars / 2;
+        // nothing to the ranked notes the message asked for. Level-independent: the
+        // foundation is not adjusted by the scaffolding level.
+        let budget = foundation_budget_chars();
         let entries: Vec<String> = kept
             .iter()
             .map(|note| foundation_entry(&note.note_type, &note.importance, &note.content))
@@ -1957,7 +1972,6 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                 project_id,
                 input.restricted_content,
                 requested_slug.as_deref(),
-                self.config.max_content_chars,
                 &input.excluded_note_ids,
                 Some(input.session_id),
             )
@@ -4891,6 +4905,71 @@ mod pinned_settings_tests {
         turn.excluded_note_ids.insert(pinned.to_string());
         let output = stage.execute(&turn).await.unwrap();
         assert_eq!(count(&output, "ALREADY-THERE"), 0);
+    }
+
+    /// A person's declaration outranks the machine's edges. When the self already knows
+    /// [`MAX_PINNED_NOTES`] notes, the declared pin must still reach the prompt — the
+    /// structural read fills the slots LEFT, it does not take the declared one.
+    #[tokio::test]
+    async fn a_declared_pin_outranks_the_structural_read_when_the_self_is_full() {
+        use crate::graph::rules::{AccountableProvenance, KnowledgeScope};
+
+        let graph = Arc::new(MockGraphStore::new());
+        // The project must EXIST in the graph: the structural read resolves its slug to
+        // an id, and an unknown slug reads no project edge at all (the test would pass
+        // without ever filling the self).
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "alpha".to_string();
+        let alpha = project.id;
+        graph.create_project(&project).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        // Fill the self with MAX_PINNED_NOTES project notes: before the reorder these
+        // would have consumed every slot and truncated the declared pin away.
+        for i in 0..MAX_PINNED_NOTES {
+            let structural = note(&graph, Some(alpha), &format!("STRUCTURAL-{i}")).await;
+            let provenance = AccountableProvenance::new("test", format!("seed {i}")).unwrap();
+            graph
+                .link_agent_knows(
+                    self_id,
+                    structural,
+                    KnowledgeScope::Project,
+                    Some(alpha),
+                    &provenance,
+                )
+                .await
+                .unwrap();
+        }
+        let declared = note(&graph, None, "DECLARED-OUTRANKS").await;
+        // The declaration is written as a SETTING only. `store_pinned_notes` would also
+        // mirror it as a `KNOWS` edge of the self (rule AGENT_KNOWS_CORE), and the pin would
+        // then reach the prompt through the structural read in either order. The mirror is
+        // best effort (a graph that hesitates leaves the setting alone): this is that case.
+        graph
+            .put_llm_setting(
+                &pinned_notes_scope(None),
+                PINNED_NOTES_KEY,
+                &serde_json::to_string(&[declared]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let stage = stage(graph.clone(), Vec::new());
+
+        let output = stage
+            .execute(&input("unrelated", Some(("alpha", alpha))))
+            .await
+            .unwrap();
+        // Counted in the FOUNDATION section only: the ranked retrieval can also carry a
+        // global note, and would hide a pin truncated away from the foundation.
+        let in_foundation: usize = output
+            .sections
+            .iter()
+            .filter(|s| s.title == "Foundational Notes")
+            .map(|s| s.content.matches("DECLARED-OUTRANKS").count())
+            .sum();
+        assert_eq!(
+            in_foundation, 1,
+            "the declared pin is not truncated by the structural read"
+        );
     }
 
     #[tokio::test]

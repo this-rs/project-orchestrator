@@ -28,6 +28,8 @@ pub mod ingress_handlers;
 #[cfg(test)]
 mod journal_ws_tests;
 #[cfg(test)]
+mod keepalive_ws_tests;
+#[cfg(test)]
 pub(crate) mod list_routes_tests;
 pub mod mcp_federation_handlers;
 pub mod network_tools_handlers;

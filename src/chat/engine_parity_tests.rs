@@ -5684,7 +5684,11 @@ async fn run_acp_column() -> Measures {
     )
     .await;
 
-    // Switch to ACP.
+    // Switch to ACP. The new turn starts in a task of its own and the fake answers at once:
+    // its `Result` can be broadcast before the subscription below, and a `broadcast` channel
+    // does not replay (#1243). `await_turn_result` reads the STORE first, past `results`
+    // (the `Result`s of the turns before the switch), so a `Result` stored before the
+    // subscription is still this turn's answer; the subscription only keeps the wait alive.
     manager
         .switch_session_provider(&sid, "parity-acp", None, "relay check", None)
         .await
@@ -5693,7 +5697,7 @@ async fn run_acp_column() -> Measures {
     // Re-subscribe after the switch: the ACP session may use a fresh broadcast sender.
     let mut rx = manager.subscribe(&sid).await.unwrap();
 
-    // Wait for ACP answer.
+    // Wait for the ACP answer.
     await_turn_result(
         &mut rx,
         "run_acp_column/acp",
@@ -5886,7 +5890,11 @@ async fn run_codex_column() -> Measures {
     )
     .await;
 
-    // Switch to Codex.
+    // Switch to Codex. The new turn starts in a task of its own and the fake answers at once:
+    // its `Result` can be broadcast before the subscription below, and a `broadcast` channel
+    // does not replay (#1243). `await_turn_result` reads the STORE first, past `results`
+    // (the `Result`s of the turns before the switch), so a `Result` stored before the
+    // subscription is still this turn's answer; the subscription only keeps the wait alive.
     manager
         .switch_session_provider(&sid, "parity-codex", None, "relay check", None)
         .await
@@ -5895,7 +5903,7 @@ async fn run_codex_column() -> Measures {
     // Re-subscribe after the switch: the Codex session may use a fresh broadcast sender.
     let mut rx = manager.subscribe(&sid).await.unwrap();
 
-    // Wait for Codex answer.
+    // Wait for the Codex answer.
     await_turn_result(
         &mut rx,
         "run_codex_column/codex",

@@ -1484,6 +1484,17 @@ curl -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/tasks/{task_id}
 ```
 
+### GET /api/tasks/{task_id}/plan -- Protected
+
+The plan a task belongs to: `{ "task_id", "plan_id" }`. `404` when the task
+is unknown or belongs to no plan. The MCP `task(action: "enrich")` uses it to
+default its `plan_id`.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/plan
+```
+
 ### PATCH /api/tasks/{task_id} -- Protected
 
 Update a task.
