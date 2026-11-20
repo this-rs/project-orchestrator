@@ -250,6 +250,9 @@ impl Names {
     }
 }
 
+/// One node batch read: first slot, properties, losses, fingerprint by label.
+type NodeBatch = (u32, Vec<Props>, Losses, BTreeMap<String, Print>);
+
 struct RelRead {
     id: i64,
     src: i64,
@@ -403,36 +406,32 @@ async fn copy_into(
         .collect();
     let prop_query = format!("{NODES_BY_RANGE} RETURN id(n) AS i, properties(n) AS p");
     let (ids2, lk2, ln2) = (node_ids.clone(), node_label.clone(), label_names.clone());
-    let process = Arc::new(
-        move |k: usize,
-              rows: Vec<Row>|
-              -> Result<(u32, Vec<Props>, Losses, BTreeMap<String, Print>)> {
-            let first = k * batch;
-            let size = batch.min(ids2.len() - first);
-            let mut packet: Vec<Props> = vec![Props::new(); size];
-            let mut losses = Losses::default();
-            for row in &rows {
-                let id: i64 = row.get("i")?;
-                let rank = ids2.binary_search(&id).map_err(|_| {
-                    anyhow::anyhow!("node {id} was not read in phase A (did the source change?)")
-                })?;
-                anyhow::ensure!(
-                    (first..first + size).contains(&rank),
-                    "node {id} answered outside its batch"
-                );
-                packet[rank - first] = props_of(row, &mut losses)?;
-            }
-            let mut prints: BTreeMap<String, Print> = BTreeMap::new();
-            for (i, props) in packet.iter().enumerate() {
-                let name = &ln2[lk2[first + i] as usize];
-                prints
-                    .entry(name.clone())
-                    .or_default()
-                    .add(node_print(name, props));
-            }
-            Ok((first as u32 + 1, packet, losses, prints))
-        },
-    );
+    let process = Arc::new(move |k: usize, rows: Vec<Row>| -> Result<NodeBatch> {
+        let first = k * batch;
+        let size = batch.min(ids2.len() - first);
+        let mut packet: Vec<Props> = vec![Props::new(); size];
+        let mut losses = Losses::default();
+        for row in &rows {
+            let id: i64 = row.get("i")?;
+            let rank = ids2.binary_search(&id).map_err(|_| {
+                anyhow::anyhow!("node {id} was not read in phase A (did the source change?)")
+            })?;
+            anyhow::ensure!(
+                (first..first + size).contains(&rank),
+                "node {id} answered outside its batch"
+            );
+            packet[rank - first] = props_of(row, &mut losses)?;
+        }
+        let mut prints: BTreeMap<String, Print> = BTreeMap::new();
+        for (i, props) in packet.iter().enumerate() {
+            let name = &ln2[lk2[first + i] as usize];
+            prints
+                .entry(name.clone())
+                .or_default()
+                .add(node_print(name, props));
+        }
+        Ok((first as u32 + 1, packet, losses, prints))
+    });
     if nb > 0 {
         let mut rx = read_ranges(graph, prop_query, batches, parallel, process);
         while let Some(r) = rx.recv().await {
