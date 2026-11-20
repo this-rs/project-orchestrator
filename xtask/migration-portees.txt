@@ -5,7 +5,8 @@
 # fichier soit EXACTEMENT cet ensemble ; `cargo xtask migration-gate --base` refuse
 # qu'une ligne disparaisse depuis la base. Il ne fait que GROSSIR.
 # Mis à jour : 20/11/2026, sur la branche de consolidation (tête 7e1b92dd).
-# Pas encore portés (ni listés) : AnalyticsStore (PR #1250), SearchStore (PR #1251).
+# Pas encore porté (ni listé) : AnalyticsStore (PR #1250).
+# SearchStore : porté (PR #1251) ; barre de performance non tenue (GATES.md, G8).
 AuthStore
 ChatStore
 CodeStore
@@ -22,6 +23,7 @@ ProjectStore
 ProtocolRunStore
 ProtocolStore
 ReleaseStore
+SearchStore
 SharingStore
 SkillStore
 TriggerStore
