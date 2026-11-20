@@ -103,6 +103,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod analytics;
 mod auth;
 mod chat;
 mod code;
@@ -121,6 +122,7 @@ mod project;
 mod protocol;
 mod protocolrun;
 mod release;
+mod search;
 mod sharing;
 mod skill;
 mod step;
@@ -327,6 +329,12 @@ pub fn refusees_code() -> &'static [&'static str] {
     code::REFUSEES
 }
 
+/// The methods of `AnalyticsStore` refused on every call, as
+/// `AnalyticsStore::<method>` (`analytics.rs`): every sub-lot but the first.
+pub fn refusees_analytics() -> &'static [&'static str] {
+    analytics::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -374,6 +382,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !skill::REFUSEES.contains(m)
                 && !sharing::REFUSEES.contains(m)
                 && !code::REFUSEES.contains(m)
+                && !analytics::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -496,6 +505,9 @@ pub struct RapportOuverture {
     /// Plans whose `unlink_plan_from_project` was interrupted after its marker:
     /// finished at open (`constraint.rs`).
     pub deliaisons_achevees: usize,
+    /// Search documents (`search.rs`) whose searchable text disagreed with their
+    /// document (an update cut between the two writes): recomputed from the document.
+    pub recherches_reparees: usize,
 }
 
 /// The graph store on obrain.
@@ -559,6 +571,10 @@ struct Etat {
     partage: sharing::IndexPartage,
 
     code: code::IndexCode,
+
+    recherche: search::IndexRecherche,
+
+    analyse: analytics::IndexAnalyse,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -1000,6 +1016,7 @@ impl ObrainGraphStore {
             commit::IndexCommits::reconstruire(&db, &mut rapport).with_context(contexte)?;
 
         let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
+        let analyse = analytics::IndexAnalyse::reconstruire(&db, &mut rapport);
         let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
             .with_context(contexte)?;
 
@@ -1007,6 +1024,9 @@ impl ObrainGraphStore {
         // feature graphs.
         let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
         let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
+
+        let recherche =
+            search::IndexRecherche::reconstruire(&db, &mut rapport).with_context(contexte)?;
 
         let etat = Etat {
             projets,
@@ -1034,6 +1054,10 @@ impl ObrainGraphStore {
             partage,
 
             code,
+
+            recherche,
+
+            analyse,
         };
         let store = Self {
             interne: Arc::new(Interne {
@@ -1214,10 +1238,7 @@ impl GraphStore for ObrainGraphStore {
     }
 }
 
-/// The search store of the obrain backend: nothing is ported, every method of
-/// `SearchStore` is refused by name (generated).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ObrainSearchStore;
+pub use search::ObrainSearchStore;
 
 /// The trajectory store of the obrain backend: nothing is ported.
 ///

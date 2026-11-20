@@ -339,13 +339,11 @@ impl StorageBackend {
     /// exclusive lock on the directory — PO is the single writer of the base.
     ///
     /// Only the ported domains answer (see `src/obrain/`); the rest of the
-    /// graph contract, the whole search store and the trajectory store refuse
+    /// graph contract and the trajectory store refuse
     /// by name. The startup line says how much that is.
     #[cfg(feature = "obrain-backend")]
     async fn obrain_backend(config: &Config, scratch: Option<tempfile::TempDir>) -> Result<Self> {
-        use crate::obrain::{
-            Creation, ObrainGraphStore, ObrainSearchStore, ObrainTrajectoryStore, RapportOuverture,
-        };
+        use crate::obrain::{Creation, ObrainGraphStore, ObrainTrajectoryStore, RapportOuverture};
 
         let Some(path) = config
             .storage_obrain_path
@@ -393,12 +391,13 @@ impl StorageBackend {
              domains answers the error « non porté sur le backend obrain » (not a production mode)"
         );
 
+        let search: Arc<dyn SearchStore> = Arc::new(store.recherche());
         let graph: Arc<dyn GraphStore> = Arc::new(store);
         let capabilities = graph.capabilities();
 
         Ok(Self {
             graph,
-            search: Arc::new(ObrainSearchStore),
+            search,
             trajectories: Arc::new(ObrainTrajectoryStore),
             capabilities,
         })
