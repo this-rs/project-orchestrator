@@ -23,7 +23,8 @@
 //! # Atomicity
 //!
 //! A creation is a draft until its last property (`_brouillon`, `trigger::creer`).
-//! A multi-property update (an arm's seven counters, a profile's six fields) is not
+//! A multi-property update (an arm's seven counters, a profile's six fields, the
+//! rewrite of a decision by id) is not
 //! atomic in the engine: it is made so by the update marker `_maj` of
 //! `protocolrun.rs` (the whole new state on the node first, then the properties,
 //! the marker removed last; opening finishes a cut update from it and counts it in
@@ -34,13 +35,15 @@
 //!
 //! # Differences with the Neo4j adapter, all named
 //!
-//! - **Absent targets refuse.** Neo4j's `MATCH … MERGE` creates nothing and answers
-//!   `Ok` when the project of `create_analysis_profile`, or the user or project of
-//!   `upsert_works_on`, is absent, and `update_user_profile` of an unknown user
-//!   writes nothing. Here those refuse with an error: a profile or a relation lost
-//!   in silence is not an answer.
-//! - **A taken id refuses.** `create_topology_rule` is a `CREATE` in Neo4j (a second
-//!   node for a repeated id); here a repeated id refuses.
+//! - **Absent targets refuse, except for `upsert_works_on`.** Neo4j's `MATCH … MERGE`
+//!   creates nothing and answers `Ok` when the project of `create_analysis_profile`
+//!   is absent, and `update_user_profile` of an unknown user writes nothing. Here
+//!   those two refuse with an error. `upsert_works_on` of an absent user or project
+//!   keeps Neo4j's no-op (logged): its one production caller, the profile
+//!   aggregator, upserts every project of a flush with `?`, and a refusal would drop
+//!   the relations of the projects after it.
+//! - (Not a difference: a repeated `TopologyRule.id` refuses, as Neo4j's uniqueness
+//!   constraint `topology_rule_id` makes its `CREATE` fail.)
 //! - **`threshold` keeps its absence.** Neo4j writes `0` for a rule without
 //!   threshold and reads `Some(0)` back; here an absent threshold stays absent.
 //! - **No `HAS_PROFILE` edge, no `ROUTED_FOR` edge.** The membership of a profile is
@@ -49,15 +52,26 @@
 //!   them would attach foreign edges to tasks and sessions (which refuse deletion
 //!   when they carry an edge of a domain they do not know).
 //! - **Strict decoding.** Neo4j logs and defaults an unreadable JSON, a missing
-//!   `created_at`, an unreadable decision; here the node is quarantined by name at
-//!   open (its key reserved) and a write that would take its key refuses.
+//!   `created_at`; here the node is quarantined by name at open (its key reserved)
+//!   and a write that would take its key refuses. A list that could miss a
+//!   quarantined node refuses, as in the other ported domains: the profiles visible
+//!   to a project, the rules of a project, the arms of a class; the `WORKS_ON` of a
+//!   user with a quarantined edge (read and upsert: rewriting it would lose its
+//!   frequency).
+//! - **Decisions follow Neo4j's skip.** A decision whose document does not decode is
+//!   quarantined by name at open (Neo4j skips it at each read and logs) and is not
+//!   in `list_routing_decisions`: Neo4j's own contract for that list is "an
+//!   unreadable document is skipped", and its callers (demotion, report, routes) need
+//!   the rest of the log. `get_routing_decision` of it refuses.
 //! - **`list_routing_decisions` is O(decisions)** over a light in-memory entry
 //!   (id, instant, project, session); only the page is decoded from its JSON.
 //! - **`get_frustration` / `increment_frustration` / `decrement_frustration` of an
 //!   unknown task answer `0.0`**, as Neo4j's `MATCH` with no row.
 //! - `run_data_migrations` returns an empty list: the one-time migrations are
-//!   Neo4j's (`neo4j::data_migrations`); the data of an obrain base is brought by
-//!   the migrator at boot.
+//!   written in Cypher for a Neo4j base (`neo4j::data_migrations`) and none is
+//!   ported. Their effect on migrated data is NOT guaranteed by this backend: the
+//!   migrator (outside this repository) must have run them on the source before the
+//!   copy; the list is in `CONSOLIDATION.md`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -285,7 +299,9 @@ fn lire_bras(get: Lecteur) -> Result<ArmStats> {
 }
 
 /// What the index keeps of a decision: enough to filter, order and find it. The
-/// document itself (`json`) is decoded for the page that is served, no more.
+/// document (`json`) is DECODED at open (a node whose document does not decode is
+/// quarantined by name there, never served), but only the page is decoded again to
+/// be served.
 #[derive(Clone)]
 pub(super) struct DecisionLegere {
     id: Uuid,
@@ -298,8 +314,14 @@ fn lire_decision_legere(get: Lecteur) -> Result<DecisionLegere> {
     let id = uuid_requis(get, "id", "nœud RoutingDecision")?;
     let quoi = format!("décision de routage {id}");
     let quoi = quoi.as_str();
-    // The document is read to be served, not here: but it must be there.
-    requise(get, "json", quoi)?;
+    // Decoded here, once: an unreadable document is a quarantine at open (Neo4j skips
+    // it at each read and logs), never a page that fails as a whole.
+    let brut = requise(get, "json", quoi)?;
+    let doc: CognitiveDecision = serde_json::from_str(&brut)
+        .map_err(|e| anyhow!("{quoi} : document `json` illisible : {e}"))?;
+    if doc.id != id {
+        bail!("{quoi} : le document porte l'id {}", doc.id);
+    }
     Ok(DecisionLegere {
         at: requise(get, "at", quoi)?,
         projet: chaine_ou_vide(get, "project_slug", quoi)?,
@@ -471,24 +493,58 @@ pub(super) struct IndexAnalyse {
     decisions: HashMap<Uuid, Fiche<DecisionLegere>>,
     /// Keys of the quarantined nodes ([`cle_reservee`]): never taken again.
     reserves: HashSet<String>,
+    /// label → the scope of each quarantined node (`None`: unreadable scope). A list
+    /// that could miss one of them refuses, as the other ported domains do
+    /// (`sharing.rs`'s `list_tombstones`, `task.rs`'s partial plans): the project of
+    /// a profile (`""` = global), the project of a rule, the class of an arm.
+    quarantaines: HashMap<&'static str, Vec<Option<String>>>,
+    /// (user, project) of the `WORKS_ON` edges quarantined at open (`None`: the
+    /// target project is unreadable, every relation of the user is in doubt).
+    relations_reservees: HashSet<(String, Option<Uuid>)>,
+}
+
+/// Records the scope of a node that does not decode, then gives the error back.
+fn noter_quarantaine<T>(
+    notes: &std::cell::RefCell<Vec<Option<String>>>,
+    get: Lecteur,
+    portee: &str,
+    lu: Result<T>,
+) -> Result<T> {
+    if lu.is_err() {
+        notes
+            .borrow_mut()
+            .push(get(portee).and_then(|v| v.as_str().map(str::to_string)));
+    }
+    lu
 }
 
 impl IndexAnalyse {
     pub(super) fn reconstruire(db: &ObrainDB, rapport: &mut RapportOuverture) -> Self {
         let mut index = Self::default();
-        for label in [PROFIL, UTILISATEUR, BRAS] {
+        for label in [PROFIL, UTILISATEUR, BRAS, DECISION] {
             rapport.mises_a_jour_achevees += achever_les_mises_a_jour(db, label);
         }
+        // The scopes of the nodes each label quarantines (filled by `noter_quarantaine`).
+        let q_profils = std::cell::RefCell::<Vec<Option<String>>>::default();
+        let q_regles = std::cell::RefCell::<Vec<Option<String>>>::default();
+        let q_bras = std::cell::RefCell::<Vec<Option<String>>>::default();
         index.profils = indexer(
             charger(db, PROFIL, rapport, &mut index.reserves, &|g| {
-                sans_marqueur(g, PROFIL, lire_profil)
+                noter_quarantaine(
+                    &q_profils,
+                    g,
+                    "project_id",
+                    sans_marqueur(g, PROFIL, lire_profil),
+                )
             }),
             PROFIL,
             rapport,
             |p| p.id.clone(),
         );
         index.regles = indexer(
-            charger(db, REGLE, rapport, &mut index.reserves, &lire_regle),
+            charger(db, REGLE, rapport, &mut index.reserves, &|g| {
+                noter_quarantaine(&q_regles, g, "project_id", lire_regle(g))
+            }),
             REGLE,
             rapport,
             |r| r.id.clone(),
@@ -503,7 +559,7 @@ impl IndexAnalyse {
         );
         // Keyed by the ArmKey itself (a joined string could collide on a `|` in a name).
         for f in charger(db, BRAS, rapport, &mut index.reserves, &|g| {
-            sans_marqueur(g, BRAS, lire_bras)
+            noter_quarantaine(&q_bras, g, "class", sans_marqueur(g, BRAS, lire_bras))
         }) {
             match index.bras.entry(f.valeur.key.clone()) {
                 std::collections::hash_map::Entry::Occupied(_) => {
@@ -519,19 +575,54 @@ impl IndexAnalyse {
             }
         }
         index.decisions = indexer(
-            charger(
-                db,
-                DECISION,
-                rapport,
-                &mut index.reserves,
-                &lire_decision_legere,
-            ),
+            charger(db, DECISION, rapport, &mut index.reserves, &|g| {
+                sans_marqueur(g, DECISION, lire_decision_legere)
+            }),
             DECISION,
             rapport,
             |d| d.id,
         );
+        index.quarantaines.insert(PROFIL, q_profils.into_inner());
+        index.quarantaines.insert(REGLE, q_regles.into_inner());
+        index.quarantaines.insert(BRAS, q_bras.into_inner());
         index.relier_les_utilisateurs(db, rapport);
         index
+    }
+
+    /// Refuses a list of `label` that could miss a quarantined node: one whose scope
+    /// is in `portees`, or unreadable.
+    fn garde_liste(&self, label: &str, portees: &[&str]) -> Result<()> {
+        let suspects = self
+            .quarantaines
+            .get(label)
+            .into_iter()
+            .flatten()
+            .filter(|p| p.as_deref().is_none_or(|p| portees.contains(&p)))
+            .count();
+        if suspects > 0 {
+            bail!(
+                "{suspects} nœud(s) {label} de cette portée sont en quarantaine (illisibles à \
+                 l'ouverture) : la liste serait partielle, elle est refusée"
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuses the `WORKS_ON` of a user when one of its edges was quarantined.
+    fn garde_relation(&self, user: &str, projet: Option<Uuid>) -> Result<()> {
+        let douteuse = self.relations_reservees.contains(&(user.to_string(), None))
+            || projet.is_some_and(|p| {
+                self.relations_reservees
+                    .contains(&(user.to_string(), Some(p)))
+            })
+            || (projet.is_none() && self.relations_reservees.iter().any(|(u, _)| u == user));
+        if douteuse {
+            bail!(
+                "une arête WORKS_ON de « {user} » est en quarantaine (illisible à l'ouverture) : \
+                 elle n'est ni lue, ni réécrite (sa fréquence serait perdue)"
+            );
+        }
+        Ok(())
     }
 
     /// The `WORKS_ON` edges of the user profiles that were read. Two edges for one
@@ -539,6 +630,7 @@ impl IndexAnalyse {
     /// the one with the highest frequency (then the latest date) is kept.
     fn relier_les_utilisateurs(&mut self, db: &ObrainDB, rapport: &mut RapportOuverture) {
         let store = db.store();
+        let mut reservees = Vec::new();
         for f in self.utilisateurs.values() {
             let mut par_projet: HashMap<Uuid, Vec<Relation>> = HashMap::new();
             for (cible, arete) in store.edges_from(f.noeud, Direction::Outgoing) {
@@ -560,6 +652,7 @@ impl IndexAnalyse {
                         "arête WORKS_ON {arete:?} de {} : cible sans id lisible",
                         f.valeur.user_id
                     ));
+                    reservees.push((f.valeur.user_id.clone(), None));
                     continue;
                 };
                 let get = |cle: &str| {
@@ -580,10 +673,13 @@ impl IndexAnalyse {
                 })();
                 match lue {
                     Ok(r) => par_projet.entry(projet).or_default().push(r),
-                    Err(err) => rapport.en_quarantaine.push(format!(
-                        "arête WORKS_ON {arete:?} de {} : {err}",
-                        f.valeur.user_id
-                    )),
+                    Err(err) => {
+                        rapport.en_quarantaine.push(format!(
+                            "arête WORKS_ON {arete:?} de {} : {err}",
+                            f.valeur.user_id
+                        ));
+                        reservees.push((f.valeur.user_id.clone(), Some(projet)));
+                    }
                 }
             }
             for (projet, mut rels) in par_projet {
@@ -601,6 +697,7 @@ impl IndexAnalyse {
                     .insert(projet, garde);
             }
         }
+        self.relations_reservees.extend(reservees);
     }
 
     /// Refuses, by name, a key a quarantined node holds.
@@ -716,8 +813,8 @@ impl ObrainGraphStore {
                     etat.analyse.garde(REGLE, &[&r.id])?;
                     if etat.analyse.regles.contains_key(&r.id) {
                         bail!(
-                            "la règle de topologie {} existe déjà (Neo4j en créerait un second nœud ; \
-                             le backend obrain refuse)",
+                            "la règle de topologie {} existe déjà (unicité de TopologyRule.id, comme \
+                             la contrainte Neo4j `topology_rule_id`)",
                             r.id
                         );
                     }
@@ -754,7 +851,7 @@ impl ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 {
                     let etat = w.index()?;
-                    etat.analyse.garde(UTILISATEUR, &[&uid])?;
+                    etat.analyse.garde(UTILISATEUR, &["user_id", &uid])?;
                     if let Some(f) = etat.analyse.utilisateurs.get(&uid) {
                         return Ok(f.valeur.clone());
                     }
@@ -780,7 +877,7 @@ impl ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let noeud = {
                     let etat = w.index()?;
-                    etat.analyse.garde(UTILISATEUR, &[&p.user_id])?;
+                    etat.analyse.garde(UTILISATEUR, &["user_id", &p.user_id])?;
                     match etat.analyse.utilisateurs.get(&p.user_id) {
                         Some(f) => f.noeud,
                         None => bail!(
@@ -826,18 +923,19 @@ impl ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let (utilisateur, projet, ancienne) = {
                     let etat = w.index()?;
-                    etat.analyse.garde(UTILISATEUR, &[&uid])?;
+                    etat.analyse.garde(UTILISATEUR, &["user_id", &uid])?;
+                    etat.analyse.garde_relation(&uid, Some(project_id))?;
+                    // Neo4j's `MATCH … MATCH … MERGE`: an absent user or project writes
+                    // nothing and answers Ok. Kept, and logged: the profile aggregator
+                    // (`profile/aggregator.rs`) upserts every project of a flush with `?`,
+                    // so a refusal here would drop the relations of the projects after it.
                     let Some(u) = etat.analyse.utilisateurs.get(&uid) else {
-                        bail!(
-                            "le profil utilisateur « {uid} » n'existe pas : la relation WORKS_ON \
-                             n'est pas écrite (Neo4j ne ferait rien et répondrait Ok)"
-                        );
+                        tracing::warn!(user = %uid, "upsert_works_on : profil utilisateur absent, rien n'est écrit (comme Neo4j)");
+                        return Ok(());
                     };
                     let Some(p) = etat.projets.noeud_de(project_id) else {
-                        bail!(
-                            "le projet {project_id} n'existe pas : la relation WORKS_ON n'est pas \
-                             écrite (Neo4j ne ferait rien et répondrait Ok)"
-                        );
+                        tracing::warn!(user = %uid, project = %project_id, "upsert_works_on : projet absent, rien n'est écrit (comme Neo4j)");
+                        return Ok(());
                     };
                     let ancienne = etat
                         .analyse
@@ -899,7 +997,7 @@ impl ObrainGraphStore {
                 let existant = {
                     let etat = w.index()?;
                     etat.analyse
-                        .garde(BRAS, &[&k.class, &k.provider_id, &k.model])?;
+                        .garde(BRAS, &["bras", &k.class, &k.provider_id, &k.model])?;
                     etat.analyse
                         .bras
                         .get(&k)
@@ -1174,6 +1272,11 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<Vec<AnalysisProfile>> {
         let pid = project_id.map(str::to_string);
         self.lire(move |_, etat| {
+            let mut portees = vec![""];
+            if let Some(p) = pid.as_deref() {
+                portees.push(p);
+            }
+            etat.analyse.garde_liste(PROFIL, &portees)?;
             let mut v: Vec<&AnalysisProfile> = etat
                 .analyse
                 .profils
@@ -1214,6 +1317,7 @@ impl AnalyticsStore for ObrainGraphStore {
     async fn list_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyRule>> {
         let pid = project_id.to_string();
         self.lire(move |_, etat| {
+            etat.analyse.garde_liste(REGLE, &[&pid])?;
             let mut v: Vec<&TopologyRule> = etat
                 .analyse
                 .regles
@@ -1248,7 +1352,7 @@ impl AnalyticsStore for ObrainGraphStore {
     async fn get_user_profile(&self, user_id: &str) -> Result<Option<UserProfile>> {
         let uid = user_id.to_string();
         self.lire(move |_, etat| {
-            etat.analyse.garde(UTILISATEUR, &[&uid])?;
+            etat.analyse.garde(UTILISATEUR, &["user_id", &uid])?;
             Ok(etat
                 .analyse
                 .utilisateurs
@@ -1264,7 +1368,8 @@ impl AnalyticsStore for ObrainGraphStore {
     async fn get_works_on(&self, user_id: &str) -> Result<Vec<WorksOnRelation>> {
         let uid = user_id.to_string();
         self.lire(move |_, etat| {
-            etat.analyse.garde(UTILISATEUR, &[&uid])?;
+            etat.analyse.garde(UTILISATEUR, &["user_id", &uid])?;
+            etat.analyse.garde_relation(&uid, None)?;
             if !etat.analyse.utilisateurs.contains_key(&uid) {
                 return Ok(Vec::new());
             }
@@ -1295,7 +1400,7 @@ impl AnalyticsStore for ObrainGraphStore {
         let k = key.clone();
         self.lire(move |_, etat| {
             etat.analyse
-                .garde(BRAS, &[&k.class, &k.provider_id, &k.model])?;
+                .garde(BRAS, &["bras", &k.class, &k.provider_id, &k.model])?;
             Ok(etat.analyse.bras.get(&k).map(|f| f.valeur.clone()))
         })
     }
@@ -1303,6 +1408,9 @@ impl AnalyticsStore for ObrainGraphStore {
     async fn list_routing_arms(&self, class: &str) -> Result<Vec<ArmStats>> {
         let classe = class.to_string();
         self.lire(move |_, etat| {
+            // A quarantined arm of this class: the list refuses; `observe_routing_arm`
+            // and `get_routing_arm` on that arm refuse by its reserved key.
+            etat.analyse.garde_liste(BRAS, &[&classe])?;
             let mut v: Vec<ArmStats> = etat
                 .analyse
                 .bras
@@ -1419,10 +1527,12 @@ impl AnalyticsStore for ObrainGraphStore {
         self.frustration_ecrire(task_id, delta, false).await
     }
 
-    /// The one-time data migrations are Neo4j's (`neo4j::data_migrations`): there is
-    /// none to run on an obrain base, whose data the migrator brings at boot. This
-    /// is the contract's own "backends without migrations do nothing", written here
-    /// so that the contract's default is not inherited by omission.
+    /// The one-time data migrations are Cypher for a Neo4j base
+    /// (`neo4j::data_migrations`); none is ported to obrain, so none runs here. This
+    /// is NOT a proof that migrated data is repaired: the migrator (outside this
+    /// repository) must run them on the Neo4j source before the copy — the list is in
+    /// `CONSOLIDATION.md`. Written by hand (it cannot carry a refusal: it returns no
+    /// `Result`) so that the contract's default is not inherited by omission.
     async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
         Vec::new()
     }
@@ -2142,5 +2252,23 @@ mod tests {
         b.sort_unstable();
         assert_eq!(a, b);
         assert_eq!(REFUSEES.len(), 119);
+    }
+
+    /// The reserved keys of `trigger::cle_reservee` never collide on a value that
+    /// contains what used to be the separator.
+    #[test]
+    fn reserved_keys_are_unambiguous() {
+        assert_ne!(
+            cle_reservee(BRAS, &["bras", "a|b", "c", "m"]),
+            cle_reservee(BRAS, &["bras", "a", "b|c", "m"])
+        );
+        assert_ne!(
+            cle_reservee(UTILISATEUR, &["alice"]),
+            cle_reservee(UTILISATEUR, &["user_id", "alice"])
+        );
+        assert_ne!(
+            cle_reservee(REGLE, &["ab"]),
+            cle_reservee(REGLE, &["a", "b"])
+        );
     }
 }
