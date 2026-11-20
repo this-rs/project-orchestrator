@@ -56,7 +56,6 @@ ignore = [
     { id = "RUSTSEC-2024-0419", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
     { id = "RUSTSEC-2024-0420", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
     { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter Iterator unsoundness — transitive via the same Tauri/GTK3 stack. The affected iterator is never constructed in our code paths." },
-    # ── unic-* unmaintained text crates — transitive (idna/url parsing chain).
     # ── other unmaintained transitive deps.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained — transitive build-time proc-macro dep. No runtime/security impact." },
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained — transitive via zbus (Tauri Linux DBus stack). Not in any security-sensitive path on macOS or Linux." },

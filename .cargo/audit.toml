@@ -40,7 +40,7 @@ ignore = [
     "RUSTSEC-2026-0370", # zvariant unmaintained
     "RUSTSEC-2026-0371", # zbus_names unmaintained
     "RUSTSEC-2026-0372", # zvariant_derive unmaintained
-    # Mirrored from deny.toml for the Linux-only Tauri stack and text crates.
+    # Mirrored from deny.toml for the Linux-only Tauri stack.
     "RUSTSEC-2024-0411", # gtk-rs GTK3 unmaintained (Tauri Linux)
     "RUSTSEC-2024-0412",
     "RUSTSEC-2024-0413",
