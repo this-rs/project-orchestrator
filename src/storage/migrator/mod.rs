@@ -83,7 +83,20 @@ pub struct Neo4jToObrain {
     user: String,
     password: String,
     tuning: Tuning,
+    after_write: Option<AfterWrite>,
+    before_properties: Option<BeforeProperties>,
 }
+
+/// A TEST SEAM: awaited after the identifiers and the structure are read and
+/// before the node properties are, so a test can change the live source in
+/// between. Production never sets it.
+pub type BeforeProperties =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+/// A TEST SEAM: runs between the write of the base and its read-back, so a test
+/// can tamper with the written base and prove the read-back notices. Production
+/// never sets it.
+pub type AfterWrite = Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 
 impl Neo4jToObrain {
     pub fn new(uri: &str, user: &str, password: &str) -> Self {
@@ -92,7 +105,21 @@ impl Neo4jToObrain {
             user: user.to_string(),
             password: password.to_string(),
             tuning: Tuning::default(),
+            after_write: None,
+            before_properties: None,
         }
+    }
+
+    /// Install the test seam [`BeforeProperties`].
+    pub fn with_before_properties(mut self, hook: BeforeProperties) -> Self {
+        self.before_properties = Some(hook);
+        self
+    }
+
+    /// Install the test seam [`AfterWrite`].
+    pub fn with_after_write(mut self, hook: AfterWrite) -> Self {
+        self.after_write = Some(hook);
+        self
     }
 
     /// The migrator for the Neo4j the configuration names (`neo4j.*`).
@@ -147,14 +174,20 @@ async fn counts(graph: &Graph, cypher: &str) -> Result<BTreeMap<String, usize>> 
 }
 
 fn props_of(row: &Row, losses: &mut Losses) -> Result<Props> {
+    // A row that does not carry its properties as a map is a FAILED READ, not an
+    // entity without properties: reading it as empty would make the fingerprint
+    // agree on a loss.
+    let map = match row.get::<BoltType>("p") {
+        Ok(BoltType::Map(m)) => m,
+        Ok(other) => anyhow::bail!("the properties of a row are not a map ({other:?})"),
+        Err(e) => anyhow::bail!("the properties of a row cannot be read: {e}"),
+    };
     let mut props = Props::new();
-    if let Ok(BoltType::Map(m)) = row.get::<BoltType>("p") {
-        props.reserve(m.value.len());
-        for (k, v) in &m.value {
-            let value = import_value(k.value.as_str(), v, losses)
-                .map_err(|e| anyhow::anyhow!("property '{}': {e}", k.value))?;
-            props.push((intern(&k.value), value));
-        }
+    props.reserve(map.value.len());
+    for (k, v) in &map.value {
+        let value = import_value(k.value.as_str(), v, losses)
+            .map_err(|e| anyhow::anyhow!("property '{}': {e}", k.value))?;
+        props.push((intern(&k.value), value));
     }
     Ok(props)
 }
@@ -267,6 +300,7 @@ struct RelRead {
 async fn copy_into(
     graph: &Graph,
     tuning: &Tuning,
+    before_properties: Option<&BeforeProperties>,
     dest: &Path,
 ) -> Result<(Prints, u64, u64, Losses)> {
     let mut losses = Losses::default();
@@ -399,6 +433,10 @@ async fn copy_into(
         );
     }
 
+    if let Some(hook) = before_properties {
+        hook().await;
+    }
+
     // Phase D — node properties, read and written in batches.
     let nb = node_ids.len();
     let batches: Vec<(i64, i64)> = (0..nb.div_ceil(batch))
@@ -410,6 +448,7 @@ async fn copy_into(
         let first = k * batch;
         let size = batch.min(ids2.len() - first);
         let mut packet: Vec<Props> = vec![Props::new(); size];
+        let mut seen = vec![false; size];
         let mut losses = Losses::default();
         for row in &rows {
             let id: i64 = row.get("i")?;
@@ -421,6 +460,17 @@ async fn copy_into(
                 "node {id} answered outside its batch"
             );
             packet[rank - first] = props_of(row, &mut losses)?;
+            seen[rank - first] = true;
+        }
+        // The source is read live, not frozen: a node deleted since phase A is
+        // DETECTED here (every expected node must answer) and fails the copy by
+        // name, instead of being written empty.
+        if let Some(missing) = seen.iter().position(|s| !s) {
+            anyhow::bail!(
+                "node {} was read in phase A but did not answer in phase D: it was deleted \
+                 from the source during the copy",
+                ids2[first + missing]
+            );
         }
         let mut prints: BTreeMap<String, Print> = BTreeMap::new();
         for (i, props) in packet.iter().enumerate() {
@@ -479,12 +529,16 @@ impl Migrator for Neo4jToObrain {
 
     async fn copy(&self, dest: &Path) -> Result<()> {
         let graph = self.connect().await?;
-        let (expected, nodes, links, losses) = copy_into(&graph, &self.tuning, dest).await?;
+        let (expected, nodes, links, losses) =
+            copy_into(&graph, &self.tuning, self.before_properties.as_ref(), dest).await?;
+        if let Some(why) = losses.refusal() {
+            anyhow::bail!("the copy would lose information — {why}");
+        }
         if losses != Losses::default() {
-            tracing::warn!(
-                ?losses,
-                "storage migration: conversions that narrow a value"
-            );
+            tracing::info!(?losses, "storage migration: documented lossless narrowings");
+        }
+        if let Some(hook) = &self.after_write {
+            hook(dest)?;
         }
         let dest = dest.to_path_buf();
         let read =
@@ -519,6 +573,37 @@ mod tests {
     fn ranges_cover_zero_to_max_without_overlap() {
         assert_eq!(ranges(0, 10), vec![(0, 0)]);
         assert_eq!(ranges(24, 10), vec![(0, 9), (10, 19), (20, 24)]);
+    }
+
+    fn row(fields: &[&str], data: Vec<BoltType>) -> Row {
+        use neo4rs::{BoltList, BoltString};
+        Row::new(
+            BoltList {
+                value: fields
+                    .iter()
+                    .map(|f| BoltType::String(BoltString::new(f)))
+                    .collect(),
+            },
+            BoltList { value: data },
+        )
+    }
+
+    #[test]
+    fn a_row_whose_properties_are_not_a_map_fails_instead_of_reading_empty() {
+        let mut l = Losses::default();
+        let not_a_map = row(&["p"], vec![BoltType::Integer(neo4rs::BoltInteger::new(1))]);
+        let err = props_of(&not_a_map, &mut l).unwrap_err().to_string();
+        assert!(err.contains("not a map"), "{err}");
+        let absent = row(&["i"], vec![BoltType::Integer(neo4rs::BoltInteger::new(1))]);
+        let err = props_of(&absent, &mut l).unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+        let empty = row(
+            &["p"],
+            vec![BoltType::Map(neo4rs::BoltMap {
+                value: Default::default(),
+            })],
+        );
+        assert!(props_of(&empty, &mut l).unwrap().is_empty());
     }
 
     #[test]

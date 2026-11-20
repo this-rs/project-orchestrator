@@ -1,9 +1,10 @@
 //! Bolt value → obrain value, with no silent loss.
 //!
 //! Everything that cannot be represented exactly is either COUNTED in
-//! [`Losses`] (and then refused by the copy unless it is a documented,
-//! lossless-in-meaning narrowing) or returned as an error — never turned into
-//! text. Ported from the measured spike (`spike-migrateur/src/conv.rs`), minus
+//! [`Losses`] — and then [`Losses::refusal`] makes the copy FAIL with the cause,
+//! except for the one documented narrowing that keeps the exact value (an
+//! inexact f32 vector kept as a list) — or returned as an error — never turned
+//! into text. Ported from the measured spike (`spike-migrateur/src/conv.rs`), minus
 //! its measuring-only oracle.
 
 use neo4rs::BoltType;
@@ -28,6 +29,35 @@ pub struct Losses {
 }
 
 impl Losses {
+    /// The named cause that must fail the copy, `None` when nothing was lost.
+    /// Every counter but `inexact_vector` is a real loss: sub-microsecond
+    /// precision, the NAME of a zone, the "local" nature of a datetime, a value
+    /// with no equivalent. `inexact_vector` loses nothing (the exact floats are
+    /// kept, as a list rather than an f32 vector) and is only logged.
+    pub fn refusal(&self) -> Option<String> {
+        let mut causes = Vec::new();
+        for (n, what) in [
+            (
+                self.sub_microsecond,
+                "datetime(s) with sub-microsecond precision (obrain keeps microseconds)",
+            ),
+            (
+                self.named_zone,
+                "datetime(s) carrying a zone NAME (obrain keeps the offset only)",
+            ),
+            (
+                self.local_datetime,
+                "local datetime(s) (obrain stores a UTC instant)",
+            ),
+            (self.no_equivalent, "value(s) with no equivalent type"),
+        ] {
+            if n > 0 {
+                causes.push(format!("{n} {what}"));
+            }
+        }
+        (!causes.is_empty()).then(|| causes.join("; "))
+    }
+
     pub fn add(&mut self, o: &Losses) {
         self.sub_microsecond += o.sub_microsecond;
         self.named_zone += o.named_zone;
@@ -195,6 +225,36 @@ fn zoned(c: chrono::DateTime<chrono::FixedOffset>, losses: &mut Losses) -> Resul
 mod tests {
     use super::*;
     use neo4rs::{BoltFloat, BoltInteger, BoltList, BoltString};
+
+    #[test]
+    fn only_real_losses_refuse_the_copy() {
+        assert_eq!(Losses::default().refusal(), None);
+        let inexact = Losses {
+            inexact_vector: 3,
+            ..Default::default()
+        };
+        assert_eq!(inexact.refusal(), None, "an exact list loses nothing");
+        for l in [
+            Losses {
+                sub_microsecond: 1,
+                ..Default::default()
+            },
+            Losses {
+                named_zone: 1,
+                ..Default::default()
+            },
+            Losses {
+                local_datetime: 1,
+                ..Default::default()
+            },
+            Losses {
+                no_equivalent: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(l.refusal().is_some(), "{l:?}");
+        }
+    }
 
     fn floats(xs: &[f64]) -> BoltType {
         BoltType::List(BoltList {
