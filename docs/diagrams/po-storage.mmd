@@ -1,5 +1,5 @@
 %% name: po-storage
-%% covers: backend:src/storage.rs backend:src/neo4j/trajectory.rs backend:docs/storage/** backend:src/neo4j/graph_sampler.rs backend:src/obrain/** backend:src/neo4j/unsigned.rs
+%% covers: backend:src/storage/** backend:src/neo4j/trajectory.rs backend:docs/storage/** backend:src/neo4j/graph_sampler.rs backend:src/obrain/** backend:src/neo4j/unsigned.rs
 %% verified: 1c5451eb
 %% ---
 %% PROUVE : ce que la couche de stockage PROMET au reste du backend.
@@ -8,7 +8,7 @@
 %%   Le perimetre de la promesse est borne par un controle executable, pas par une note.
 %% ---
 %% SOURCES LUES :
-%%   src/storage.rs            — StorageBackend::from_config, select_backend, BackendKind {Default, Memory, Obrain}
+%%   src/storage/mod.rs        — StorageBackend::from_config, select_backend, BackendKind {Default, Memory, Obrain}
 %%   src/obrain/mod.rs         — ObrainGraphStore (ecrivain unique + index sous verrou court, fsync WAL par ecriture, flush complet pour les valeurs en colonne blob, garde-fou d ouverture), NonPorte, magasins qui refusent
 %%   src/obrain/project.rs     — ProjectStore porte par l API Rust d obrain, creation atomique par ordre (marqueur brouillon pose en premier, retire en dernier), index Uuid vers NodeId reconstruit a l ouverture qui repare et met en quarantaine
 %%   build/refus_obrain.rs     — genere, depuis les contrats, les impl de refus des traits non portes ; echoue si un impl ecrit a la main omet une methode
@@ -21,7 +21,7 @@
 flowchart TD
     subgraph composition["point de composition unique"]
         CFG["Config<br/>storage.backend (defaut : adaptateur courant)"]
-        FAB["StorageBackend::from_config()<br/>src/storage.rs"]
+        FAB["StorageBackend::from_config()<br/>src/storage/mod.rs"]
         CFG --> FAB
     end
 

@@ -40,7 +40,7 @@ L'attente est la **nanoseconde sur des millions de nœuds**, pas la centaine de 
 | b | recall@10 ≥ 0,95 à 25 000 vecteurs 768-d, après réouverture | en cours côté obrain (plan O-VEC), non vérifié ici |
 | c | Graphe migré, aller-retour vérifié | **en cours** — source figée et référence par type faites (voir plus bas) ; migrateur en spike |
 | d | Double-run sans divergence de justesse | à faire |
-| e | Retour arrière = une variable de configuration | à faire — la fabrique `src/storage.rs` est le point unique, la variante obrain arrive avec (a) |
+| e | Retour arrière = une variable de configuration | à faire — la fabrique `src/storage/mod.rs` est le point unique, la variante obrain arrive avec (a) |
 
 ## État des lots
 
@@ -79,7 +79,7 @@ L'attente est la **nanoseconde sur des millions de nœuds**, pas la centaine de 
 1. Fusionner les correctifs obrain dont PO dépend (tableau suivant).
 2. **O-BASE** — remonter l'épingle obrain de `pins.toml`, dans le commit qui introduit la première dépendance.
 3. **O-TRAITS** (reliquat) — `GraphStore` exige ses 20 sous-traits en bloc : un backend partiel doit fournir ~730 méthodes d'un coup.
-4. **Magasin de trajectoires** — ouvert en dur sur Neo4j dans `src/storage.rs`, hors de la fabrique ; aucune tâche ne le portait.
+4. **Magasin de trajectoires** — ouvert en dur sur Neo4j dans `src/storage/mod.rs`, hors de la fabrique ; aucune tâche ne le portait.
 5. **O-GRAPH** — portage par vagues (voir plus bas), puis **O-SEARCH** (27 méthodes de `SearchStore`).
 6. **O-CLONE → O-MIGRATE → O-SOAK → O-FLIP.**
 

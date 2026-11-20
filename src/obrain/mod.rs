@@ -861,6 +861,15 @@ impl ObrainGraphStore {
         Self::ouvrir(chemin, Durabilite::Wal, creer, None)
     }
 
+    /// The base a disposable migration copied into `dir`, opened with the same
+    /// guards as [`Self::open`] (it must be a PO base). The directory is owned
+    /// by the store and removed when the store is dropped.
+    pub fn open_disposable(dir: tempfile::TempDir) -> Result<Self> {
+        let chemin = dir.path().to_path_buf();
+        let creer = Self::garde_fou_d_ouverture(&chemin, Creation::Interdite)?;
+        Self::ouvrir(chemin, Durabilite::Wal, creer, Some(dir))
+    }
+
     /// A base in a fresh temporary directory, removed when the store is
     /// dropped. For tests and conformance runs: nothing outlives the store.
     pub fn open_temporary() -> Result<Self> {

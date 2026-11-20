@@ -1,4 +1,4 @@
-//! The obrain storage backend behind the factory (`src/storage.rs`,
+//! The obrain storage backend behind the factory (`src/storage/`,
 //! `src/obrain/`).
 //!
 //! What the cross-backend conformance suite (`tests/store_conformance.rs`,
@@ -14,6 +14,7 @@
 //! overridden by the environment FAILS naming the variable (it never passes
 //! without having checked).
 
+use project_orchestrator::storage::migrate::{Migrator, PerTypeCounts, ReadOnlyGate, DONE_MARKER};
 use project_orchestrator::storage::StorageBackend;
 use project_orchestrator::Config;
 use std::path::Path;
@@ -26,6 +27,9 @@ fn env_propre() {
         "STORAGE_BACKEND",
         "STORAGE_OBRAIN_PATH",
         "STORAGE_OBRAIN_CREATE",
+        "STORAGE_MIGRATION_FROM",
+        "STORAGE_MIGRATION_ROLLBACK",
+        "STORAGE_MIGRATION_DISPOSABLE",
     ] {
         assert!(
             std::env::var_os(v).is_none(),
@@ -1011,6 +1015,142 @@ mod with_the_feature {
     }
 
     // ------------------------------------------------------------------
+    // Startup migration (default -> obrain) through the factory, on a REAL
+    // obrain base. Names start with `with_the_feature` so the CI job
+    // « Obrain backend » (which filters on it) runs them.
+    // ------------------------------------------------------------------
+
+    /// A migrator whose "copy" creates a real PO obrain base in `dest` and
+    /// whose source is empty (so the target must read back empty too).
+    struct CreatesBase {
+        gate: ReadOnlyGate,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+    impl CreatesBase {
+        fn new(gate: &ReadOnlyGate) -> Self {
+            Self {
+                gate: gate.clone(),
+                copies: Default::default(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Migrator for CreatesBase {
+        async fn source_counts(&self) -> anyhow::Result<PerTypeCounts> {
+            assert!(self.gate.is_read_only(), "read under the gate");
+            Ok(PerTypeCounts::default())
+        }
+        async fn copy(&self, dest: &Path) -> anyhow::Result<()> {
+            assert!(self.gate.is_read_only(), "copy under the gate");
+            self.copies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dest = dest.to_path_buf();
+            tokio::task::spawn_blocking(move || ObrainGraphStore::open(dest, Creation::Permise))
+                .await??;
+            Ok(())
+        }
+        async fn target_counts(&self, _dest: &Path) -> anyhow::Result<PerTypeCounts> {
+            Ok(PerTypeCounts::default())
+        }
+    }
+
+    fn migrating_config(dir: &Path, base: &Path, disposable: bool) -> Config {
+        config_from_yaml(
+            dir,
+            &format!(
+                "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n  migration:\n    from: default\n    disposable: {disposable}\n",
+                base.display()
+            ),
+        )
+    }
+
+    /// The backend the factory BUILDS is the obrain base that was VERIFIED (same
+    /// path): it holds obrain's exclusive lock on it, and a second start serves
+    /// it on the marker without copying again.
+    #[tokio::test]
+    async fn with_the_feature_the_built_backend_is_the_verified_obrain_base() {
+        let gate = ReadOnlyGate::new();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let config = migrating_config(dir.path(), &base, false);
+
+        let m = CreatesBase::new(&gate);
+        let backend = StorageBackend::from_config_in(&config, &m, &gate)
+            .await
+            .unwrap();
+        assert!(!gate.is_read_only(), "the gate is lowered once built");
+        assert!(base.join(DONE_MARKER).is_file());
+        // The store the factory built holds the exclusive lock of THAT base:
+        // a second open is refused by the engine (one writable base per process).
+        let refused = try_open(&base, Creation::Interdite)
+            .await
+            .err()
+            .expect("the verified base is open in the factory's store");
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains(&base.display().to_string())
+                && msg.contains("already open in this process"),
+            "the refusal must be the engine's one-writer refusal on THIS base: {msg}"
+        );
+        drop(backend);
+
+        // Second start: the marker is served, nothing is copied.
+        let again = CreatesBase::new(&gate);
+        StorageBackend::from_config_in(&config, &again, &gate)
+            .await
+            .unwrap();
+        assert_eq!(again.copies.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `open_disposable` opens the copy a disposable run verified, with the
+    /// same guards as `open`, and removes its directory with the store.
+    #[tokio::test]
+    async fn with_the_feature_open_disposable_serves_the_copy_and_removes_it_with_the_store() {
+        let scratch = tempfile::Builder::new()
+            .prefix("po-disposable-")
+            .tempdir()
+            .unwrap();
+        let path = scratch.path().to_path_buf();
+        // What the migrator's copy leaves: a PO base.
+        let p = path.clone();
+        tokio::task::spawn_blocking(move || ObrainGraphStore::open(p, Creation::Permise).map(drop))
+            .await
+            .unwrap()
+            .unwrap();
+        let store = ObrainGraphStore::open_disposable(scratch).unwrap();
+        assert_eq!(store.chemin(), path);
+        drop(store);
+        assert!(!path.exists(), "the scratch goes with its store");
+
+        // A directory that is not a PO base is refused, nothing written.
+        let empty = tempfile::tempdir().unwrap();
+        let p = empty.path().to_path_buf();
+        let err = ObrainGraphStore::open_disposable(empty)
+            .err()
+            .expect("an empty scratch is not a base")
+            .to_string();
+        assert!(err.contains("répertoire vide"), "{err}");
+        assert!(!p.join("substrate.meta").exists());
+    }
+
+    /// The whole disposable path on a real base: copy into a scratch, mount it,
+    /// remove it with the backend; the configured target is never touched.
+    #[tokio::test]
+    async fn with_the_feature_a_disposable_run_mounts_a_scratch_copy_never_the_target() {
+        let gate = ReadOnlyGate::new();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let config = migrating_config(dir.path(), &base, true);
+        let m = CreatesBase::new(&gate);
+        let backend = StorageBackend::from_config_in(&config, &m, &gate)
+            .await
+            .unwrap();
+        assert_eq!(m.copies.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!base.exists(), "the configured target is untouched");
+        drop(backend);
+    }
+
+    // ------------------------------------------------------------------
     // Single writer
     // ------------------------------------------------------------------
 
@@ -1181,7 +1321,8 @@ mod with_the_feature {
                 let long = p.description.as_ref().unwrap().len() > 256;
                 i += 1;
                 store.create_project(&p).await.unwrap();
-                writeln!(log, "{}\t{}", p.id, i - 1).unwrap();
+                log.write_all(format!("{}\t{}\n", p.id, i - 1).as_bytes())
+                    .unwrap();
                 if mode != "wal" {
                     continue;
                 }
@@ -1273,7 +1414,12 @@ mod with_the_feature {
                 let mut etat: std::collections::HashMap<(&str, Uuid), MajVue> =
                     std::collections::HashMap::new();
                 let log = std::fs::read_to_string(&acquittes).unwrap();
-                for ligne in log.lines() {
+                // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+                for ligne in log
+                    .split_inclusive('\n')
+                    .filter(|l| l.ends_with('\n'))
+                    .map(|l| l.trim_end_matches('\n'))
+                {
                     let (id, i) = ligne.split_once('\t').unwrap();
                     let (id, i): (Uuid, u32) = (id.parse().unwrap(), i.parse().unwrap());
                     let p = store.get_project(id).await.unwrap().unwrap_or_else(|| {
@@ -1448,7 +1594,8 @@ mod with_the_feature {
                     .await
                     .unwrap();
                 use std::io::Write as _;
-                writeln!(log, "{k}\t{}", u.id).unwrap();
+                log.write_all(format!("{k}\t{}\n", u.id).as_bytes())
+                    .unwrap();
             }
         }
 
@@ -1487,7 +1634,13 @@ mod with_the_feature {
                 "round {tour}: an auth write killed half-way is repaired, never quarantined: \
                  {rapport:?}"
             );
-            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+            // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+            for ligne in std::fs::read_to_string(&acquittes)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|l| l.ends_with('\n'))
+                .map(|l| l.trim_end_matches('\n'))
+            {
                 let (k, id) = ligne.split_once('\t').unwrap();
                 let id: Uuid = id.parse().unwrap();
                 let u = store
@@ -4690,7 +4843,13 @@ mod with_the_feature {
             // A line without its three fields was cut by the kill: ignored.
             let mut derniers: std::collections::HashMap<String, (Option<String>, Option<String>)> =
                 Default::default();
-            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+            // A line the SIGKILL cut has no newline: never acknowledged, skipped.
+            for ligne in std::fs::read_to_string(&acquittes)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|l| l.ends_with('\n'))
+                .map(|l| l.trim_end_matches('\n'))
+            {
                 let champs: Vec<&str> = ligne.split('\t').collect();
                 let [genre, path, hash] = champs[..] else {
                     continue;
