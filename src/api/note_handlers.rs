@@ -373,15 +373,16 @@ pub struct SelfCoreNote {
 ///
 /// The declared core is a human act (`pinned_notes_human_only`): this route only READS.
 /// It publishes the two things a screen cannot guess and that decide everything:
-/// how many characters the foundation really gets (`max_content_chars / 2` at the
-/// project's scaffolding level), and how many characters of ONE note the prompt keeps.
-/// A core written for 4 000 characters lands as two lines of 300 — saying it is the
-/// whole point of this endpoint.
+/// how many characters the foundation really gets (`foundation_budget_chars()`, level-
+/// independent — the foundation is never adjusted by the scaffolding level), and how many
+/// characters of ONE note the prompt keeps. A core written for 4 000 characters lands as
+/// two lines of 300 — saying it is the whole point of this endpoint.
 #[derive(Debug, Serialize)]
 pub struct SelfCoreView {
     /// Always `global`: the core of the self is not a project's foundation.
     pub scope: String,
-    /// The scaffolding level the budget was read at (L4, the strictest, without a project).
+    /// The scaffolding level of the project (informational: the foundation budget is
+    /// level-independent). L4, the strictest, without a project.
     pub level: u8,
     /// Characters the foundation section gets.
     pub budget_chars: usize,
@@ -403,7 +404,7 @@ pub async fn get_self_core(
     Query(query): Query<PinnedNotesQuery>,
 ) -> Result<Json<SelfCoreView>, AppError> {
     use crate::chat::stages::knowledge_injection::{
-        foundation_entry, foundation_landing, load_pinned_notes, scaffolding_config,
+        foundation_budget_chars, foundation_entry, foundation_landing, load_pinned_notes,
         PINNED_NOTE_CHARS,
     };
     const SELF_TAG: &str = "self";
@@ -412,8 +413,9 @@ pub async fn get_self_core(
     let graph = state.orchestrator.neo4j();
     let project = query.project.as_deref();
 
-    // The budget the turn will really use. Without a project, publish the STRICTEST
-    // level: a generous guess would promise a room the prompt does not have.
+    // The budget the turn will really use. Level-independent: the foundation is never
+    // adjusted by the scaffolding level, so publishing a level-dependent number would
+    // promise a room the prompt does not have (or hide the room it does).
     let level = match project {
         Some(slug) => {
             let p = graph
@@ -429,7 +431,7 @@ pub async fn get_self_core(
         }
         None => 4,
     };
-    let budget_chars = scaffolding_config(level).max_content_chars / 2;
+    let budget_chars = foundation_budget_chars();
 
     // The declared core, read exactly as the injection reads it: the GLOBAL pins.
     let mut pinned_notes: Vec<Note> = Vec::new();
@@ -2182,8 +2184,8 @@ mod tests {
     // GET /api/knowledge/self-core — the declared core
     // ====================================================================
 
-    /// T8 — une note DÉCLARÉE passe devant tout ce qui est mesuré, et le budget vient du
-    /// projet quand on en nomme un (pas du défaut strict).
+    /// T8 — une note DÉCLARÉE passe devant tout ce qui est mesuré, et le budget publié est
+    /// celui que le tour porte vraiment (indépendant du niveau de scaffolding).
     #[tokio::test]
     async fn a_declared_note_takes_the_slot_and_a_project_gives_its_own_budget() {
         use crate::notes::models::{Note, NoteImportance, NoteType};
@@ -2236,13 +2238,11 @@ mod tests {
             json["candidates"].as_array().unwrap().is_empty(),
             "déclaré ⇒ plus de proposition"
         );
-        // Le budget suit le niveau du projet, il n'est pas deviné.
-        let level = json["level"].as_u64().unwrap() as u8;
+        // Le budget est indépendant du niveau : la fondation n'est jamais ajustée par le
+        // scaffolding. La route publie exactement ce que le tour porte, pas un autre nombre.
         assert_eq!(
             json["budget_chars"].as_u64().unwrap(),
-            crate::chat::stages::knowledge_injection::scaffolding_config(level).max_content_chars
-                as u64
-                / 2
+            crate::chat::stages::knowledge_injection::foundation_budget_chars() as u64
         );
 
         // Un projet inconnu est une erreur nommée, pas un repli silencieux.
@@ -2257,8 +2257,9 @@ mod tests {
     ///
     /// La lecture est bornée à dix notes, le RENDU l'est bien plus : chaque note est
     /// aplatie et coupée à `PINNED_NOTE_CHARS`, et la boucle s'arrête à la première qui ne
-    /// tient pas dans `max_content_chars / 2`. Sans projet, la route annonce le niveau le
-    /// plus strict (L4 : 750 caractères), pas une place généreuse qu'on n'a pas.
+    /// tient pas dans `foundation_budget_chars()`. Sans projet, la route annonce le niveau
+    /// le plus strict (L4), mais le budget qu'elle publie est celui que le tour porte — il
+    /// ne dépend pas du niveau.
     #[tokio::test]
     async fn the_self_core_publishes_what_will_really_land() {
         use crate::notes::models::{Note, NoteImportance, NoteType};
@@ -2286,7 +2287,10 @@ mod tests {
         let json = body_json(resp).await;
 
         assert_eq!(json["level"], 4, "sans projet : le niveau le plus strict");
-        assert_eq!(json["budget_chars"], 750);
+        assert_eq!(
+            json["budget_chars"],
+            crate::chat::stages::knowledge_injection::foundation_budget_chars() as u64
+        );
         assert_eq!(json["note_char_cap"], 300);
         assert_eq!(json["max_notes"], 10);
         assert!(
@@ -2304,15 +2308,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[guideline|critical]"));
-        // 400 caractères écrits → une ligne de 300 + une ellipse ; 750 / 328 = deux notes.
+        // 400 caractères écrits → une ligne de 300 + une ellipse ; 1500 / 328 = quatre notes.
         assert_eq!(candidates[0]["lands"], true);
         assert_eq!(candidates[1]["lands"], true);
-        assert_eq!(
-            candidates[2]["lands"], false,
-            "la troisième n'entre pas dans le budget : elle est dite, pas cachée"
-        );
-        assert_eq!(candidates[3]["lands"], false);
-        assert_eq!(json["slots_used"], 2);
+        assert_eq!(candidates[2]["lands"], true);
+        assert_eq!(candidates[3]["lands"], true);
+        assert_eq!(json["slots_used"], 4);
         let landed = candidates[0]["entry"].as_str().unwrap().chars().count();
         assert!(
             landed < 26 + 300 + 4,

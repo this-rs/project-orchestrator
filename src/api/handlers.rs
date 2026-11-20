@@ -644,15 +644,27 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
+/// What `DELETE /api/tasks/{id}` removed.
+#[derive(Debug, Serialize)]
+pub struct DeleteTaskResponse {
+    pub deleted: bool,
+    /// Steps deleted with the task.
+    pub steps_deleted: usize,
+    /// Decisions deleted with the task (`deleted_decision_ids.len()`).
+    pub decisions_deleted: usize,
+    pub deleted_decision_ids: Vec<Uuid>,
+}
+
 /// Delete a task and all its related data.
 ///
 /// The task's steps and decisions go with it — the same ownership rule as
-/// deleting a plan or a project. The answer stays an empty 204; what went with
-/// the task is logged here, so the cascade is at least on the record.
+/// deleting a plan or a project. The answer used to be an empty 204, so the
+/// loss of the decisions was discovered later, by a 404 (issue #1189): it now
+/// says how many went and which ones.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<DeleteTaskResponse>, AppError> {
     let report = state
         .orchestrator
         .plan_manager()
@@ -667,7 +679,12 @@ pub async fn delete_task(
     state
         .event_bus
         .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(DeleteTaskResponse {
+        deleted: true,
+        steps_deleted: report.steps_deleted,
+        decisions_deleted: report.deleted_decision_ids.len(),
+        deleted_decision_ids: report.deleted_decision_ids,
+    }))
 }
 
 /// Update task status
@@ -792,6 +809,17 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The store's update matches nothing for an unknown id and reports success:
+    // without this read, a mistyped id is answered 204 (issue #1189).
+    if state
+        .orchestrator
+        .neo4j()
+        .get_task(task_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!("Task not found: {task_id}")));
+    }
     // The task's model alias (A16): it must name a defined alias; an empty
     // string clears it. Stored in the provider settings, not on the task node.
     if let Some(alias) = req.model_alias.as_deref() {
@@ -1395,6 +1423,10 @@ pub async fn delegate_task(
         opening.as_ref(),
     )
     .await?;
+    // #1188 §1b: refused after authentication and the envelope (a caller refused with 401/403 is
+    // never told about another session), and before anything is built or opened. The `opening`
+    // ticket is released when this returns.
+    refuse_task_already_in_flight(graph.as_ref(), chat_manager, task_id).await?;
     let default_mode = chat_manager.default_permission_mode().await;
     let mut chat_request = delegation_chat_request(
         req.cwd,
@@ -1465,6 +1497,46 @@ pub(crate) struct PreparedDelegation {
     pub stated_class: Option<String>,
     pub parent_session_id: Option<Uuid>,
     pub custom_sections: Vec<String>,
+}
+
+/// #1188 §1b: a task already being delegated is not delegated again. A delegation is
+/// « in flight » while its `AgentExecution` is `running` AND its child session still works
+/// ([`ChatManager::is_session_working`]): a delegation closed (completed, failed, timeout,
+/// interrupted) never blocks a retry, and an execution left `running` by a dead process
+/// (its session is gone) does not block it forever. Delegations of OTHER tasks are not
+/// looked at. Two agents on one task shared one worktree and overwrote each other.
+///
+/// Known limit (P1): a child that is alive but silent (a stream or background task that never
+/// ends) keeps the task blocked until the listener's delay (`DelegationLimits`, 3 h) closes the
+/// delegation. The 409 says how to lift the block sooner.
+///
+/// Known limit (P3): the execution row is written in a spawned task and the prompt is sent in
+/// another. In that gap the child is neither streaming nor queued, so a second call that
+/// arrives at the same moment is not refused. The guard covers a parent that re-delegates later.
+pub(crate) async fn refuse_task_already_in_flight(
+    graph: &dyn crate::neo4j::GraphStore,
+    chat_manager: &ChatManager,
+    task_id: Uuid,
+) -> Result<(), AppError> {
+    let running = graph
+        .list_running_agent_executions()
+        .await
+        .map_err(AppError::Internal)?;
+    for execution in running.iter().filter(|e| e.task_id == task_id) {
+        let Some(session) = execution.session_id else {
+            continue;
+        };
+        let session = session.to_string();
+        if chat_manager.is_session_working(&session).await {
+            return Err(AppError::Conflict(format!(
+                "Task {task_id} is already being delegated: child session {session} has not \
+                 finished. To lift the block, interrupt it (POST /api/chat/sessions/{session}/interrupt) \
+                 or close it (DELETE /api/chat/sessions/{session}); the delegation then ends and the \
+                 task can be delegated again."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Open the session of a prepared delegation and send it its prompt. `place`: the ephemeral
@@ -1995,7 +2067,7 @@ async fn listen_delegation_result(
         std::time::Duration::from_secs(limits.timeout_secs)
     };
 
-    let closure = DelegationClosure {
+    let mut closure = DelegationClosure {
         task_id,
         task_title,
         event_bus,
@@ -2004,20 +2076,51 @@ async fn listen_delegation_result(
         owner,
         limits,
         halt,
+        close_child: false,
     };
 
-    // Every `break` leaves `execution` to drop: closed `failed` (channel closed without a
-    // result). Every other end — a `Result`, the delay — goes through ONE closure
-    // (`DelegationClosure::finish`, PYSR-3b).
+    // A `Result` closes a TURN, not a session (#1188). A delegated child that ends its turn
+    // while it waits on something — a `run_in_background` command it started, a turn still
+    // open — is woken again and goes on working. Closing the delegation
+    // on its FIRST `Result` told the parent « completed » while the child kept running; the
+    // parent re-delegated the same task, and two agents worked one task in one worktree. The
+    // delegation ends when the child has nothing left to do, on the LAST `Result` it gave —
+    // the spend it states is cumulative, so the later one is also the true total.
+    //
+    // Every `break` leaves `execution` to drop: closed `failed` (channel closed with nothing
+    // to close on). Every other end — a `Result` with nothing left behind it, the child's
+    // death, the delay — goes through ONE closure (`DelegationClosure::finish`, PYSR-3b).
+    let mut ended_turn: Option<(DelegationEnd, Option<serde_json::Value>)> = None;
+    // Whether a NEW turn began since `ended_turn` (#1239). Decided on the ORDER of the events
+    // of this one channel — `StreamingStatus { true }` (emitted when a turn starts) comes
+    // before the `SessionError` of a CLI that dies in that turn — and not on a state read
+    // after the fact (`is_turn_running`): the runtime resets its streaming flag with no
+    // synchronisation with the emission of the death, so a late read could see « no turn ».
+    let mut new_turn_since_end = false;
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             tracing::warn!(task_id = %task_id, timeout_secs = limits.timeout_secs, "Delegation past its delay: the child is stopped");
+            // Whether a turn runs NOW, asked before the interrupt (which ends it). A finished
+            // turn (`ended_turn`) is the last one only if no later turn began since: the child
+            // woken by its background work runs a new turn whose `Result` is the one to read.
+            let turn_running = new_turn_since_end || delegation_turn_running(&closure.halt).await;
             // Stop the CHILD, not only the listening: its running turn is interrupted, and
             // what it spent up to there is read from the `Result` that interrupted turn gives
             // (bounded wait). The session is closed by the closure, its descendants with it.
             if let Some(halt) = &closure.halt {
                 halt.interrupt().await;
+            }
+            // A turn already ended and the child only waited on its background work: no turn
+            // is running, so the interrupt gives no `Result` to wait for. The delegation closes
+            // on that finished turn — its answer and its spend — and the background work the
+            // interrupt stopped does not make it a failure. The child is closed all the same
+            // (PYSR-3b), with what it spawned, although the status stays `completed`.
+            if !turn_running {
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    closure.close_child = true;
+                    return closure.finish(end, cost_detail, execution).await;
+                }
             }
             let ended = result_after_interrupt(&mut rx).await;
             let duration_secs = start.elapsed().as_secs_f64();
@@ -2048,28 +2151,123 @@ async fn listen_delegation_result(
             return closure.finish(end, cost_detail, execution).await;
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+        // Once a turn has ended but the child may still be working, look again soon enough
+        // that a delegation which really ended is not held back by a finished task's last
+        // bookkeeping. The rest of the time, the 10 s tick is enough.
+        let tick = if ended_turn.is_some() {
+            DELEGATION_SETTLE_TICK
+        } else {
+            DELEGATION_LISTEN_TICK
+        };
+        match tokio::time::timeout(tick, rx.recv()).await {
             Ok(Ok(result @ crate::chat::types::ChatEvent::Result { .. })) => {
                 let (end, cost_detail) =
                     end_of_result(result, &limits, start.elapsed().as_secs_f64());
+                // This `Result` is the newest turn's end: no turn began since it.
+                new_turn_since_end = false;
+                if delegation_child_has_work(&closure.halt).await {
+                    ended_turn = Some((end, cost_detail));
+                    continue;
+                }
                 return closure.finish(end, cost_detail, execution).await;
+            }
+            Ok(Ok(crate::chat::types::ChatEvent::SessionError {
+                reason, message, ..
+            })) => {
+                // The child's session is gone for good (`SessionError`: every later message on
+                // it is a silent no-op), so no turn will ever end and the delegation used to
+                // wait for its delay while the parent believed the work was going on (#1188
+                // §3). Its death is reported as a FAILED delegation — unless a turn had already
+                // ended AND no later turn was running when it died (that turn's death is not a
+                // success): the work it did stands, and the delegation closes on it.
+                let turn_running =
+                    new_turn_since_end || delegation_turn_running(&closure.halt).await;
+                if let Some((end, cost_detail)) = ended_turn.take().filter(|_| !turn_running) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        reason = %reason,
+                        "Delegation: the child's session ended ({message}) after a finished turn; closing on that turn"
+                    );
+                    return closure.finish(end, cost_detail, execution).await;
+                }
+                tracing::warn!(
+                    task_id = %task_id,
+                    reason = %reason,
+                    "Delegation: the child's session ended ({message}); closing it failed"
+                );
+                let end = DelegationEnd {
+                    duration_secs: Some(start.elapsed().as_secs_f64()),
+                    ..DelegationEnd::failed()
+                };
+                // The session is dead: closing it frees what it spawned, and changes no status.
+                closure.close_child = true;
+                return closure.finish(end, None, execution).await;
+            }
+            Ok(Ok(crate::chat::types::ChatEvent::StreamingStatus { is_streaming })) => {
+                // A turn began (`true`) after the finished one, or this turn ended (`false`).
+                new_turn_since_end = is_streaming && ended_turn.is_some();
             }
             Ok(Ok(_)) => {
                 // Other event types — keep listening
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!("Delegation listener lagged by {} events", n);
+                // Events were missed, among them perhaps the start of a turn: take the
+                // prudent path (a death or the delay is then not read as the end of T1).
+                new_turn_since_end = true;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                // The child left with nothing more to say: close on its last finished turn,
+                // otherwise `failed` (the `execution` drop, below).
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    return closure.finish(end, cost_detail, execution).await;
+                }
                 tracing::warn!(task_id = %task_id, "Delegation channel closed");
                 break;
             }
             Err(_) => {
-                // 10s poll timeout — loop again
+                // The tick: close on the finished turn once the child has nothing left to do
+                // (the background task it waited on is over), else keep waiting for its wake.
+                if let Some((end, cost_detail)) = ended_turn.take() {
+                    if delegation_child_has_work(&closure.halt).await {
+                        ended_turn = Some((end, cost_detail));
+                    } else {
+                        return closure.finish(end, cost_detail, execution).await;
+                    }
+                }
             }
         }
     }
     None
+}
+
+/// How often the listener polls its channel while the child works and says nothing.
+const DELEGATION_LISTEN_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the listener looks again once a turn ended but the child may still be working
+/// (a background task it waits on, a queued message): short, so a delegation that really
+/// ended is closed at once instead of on the next [`DELEGATION_LISTEN_TICK`].
+const DELEGATION_SETTLE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the child of a delegation still has work: a turn running, or a background task its
+/// provider still reports ([`ChatManager::is_session_working`]). A `Result` that arrives while
+/// it does closes a turn, not the delegation (#1188).
+async fn delegation_child_has_work(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_working().await,
+        // No handle on the child (a delegation nobody opened from a session): the `Result` is
+        // the end, as it was before.
+        None => false,
+    }
+}
+
+/// Whether a turn of the child runs right now ([`ChatManager::is_session_streaming`]): a
+/// background task alone is not a turn. Without a handle on the child, none.
+async fn delegation_turn_running(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_turn_running().await,
+        None => false,
+    }
 }
 
 /// How long the listener waits, once it interrupted a delegation past its delay, for the
@@ -2153,6 +2351,9 @@ struct DelegationClosure<'a> {
     owner: DelegationOwner,
     limits: crate::runner::DelegationLimits,
     halt: Option<Arc<dyn DelegationHalt>>,
+    /// Close the child (cascade) even when no stop is recorded: the delay found it with a
+    /// finished turn and only background work left — `completed`, yet not left open.
+    close_child: bool,
 }
 
 impl DelegationClosure<'_> {
@@ -2265,8 +2466,9 @@ impl DelegationClosure<'_> {
             }
         }
 
-        // Stopped by its own limits: the child does not stay open, nor anything it spawned.
-        if end.stop.is_some() {
+        // Stopped by its own limits (or by the delay after a finished turn): the child does not
+        // stay open, nor anything it spawned.
+        if end.stop.is_some() || self.close_child {
             if let Some(halt) = &self.halt {
                 halt.close().await;
             }
@@ -2303,6 +2505,13 @@ fn delegation_stop_reason(
 pub(crate) trait DelegationHalt: Send + Sync {
     /// The running turn is interrupted (the session stays, so its last `Result` comes).
     async fn interrupt(&self);
+    /// Whether the child still has work: a turn running, or a background task its provider
+    /// still reports. A `Result` that arrives while it does closes a TURN, not the
+    /// delegation (#1188).
+    async fn is_working(&self) -> bool;
+    /// Whether a turn runs right now (not a background task alone): a `Result` already seen
+    /// is then not the last one.
+    async fn is_turn_running(&self) -> bool;
     /// The session is closed with every session it spawned (cascade): a sub-agent of the
     /// child does not outlive the stop.
     async fn close(&self);
@@ -2316,6 +2525,14 @@ struct HaltSession {
 
 #[async_trait::async_trait]
 impl DelegationHalt for HaltSession {
+    async fn is_working(&self) -> bool {
+        self.manager.is_session_working(&self.session_id).await
+    }
+
+    async fn is_turn_running(&self) -> bool {
+        self.manager.is_session_streaming(&self.session_id).await
+    }
+
     async fn interrupt(&self) {
         if let Err(e) = self.manager.interrupt(&self.session_id).await {
             tracing::debug!(session_id = %self.session_id, "interrupting the delegation past its limit: {e}");
@@ -2422,6 +2639,11 @@ fn delegation_wake(
 /// the two can never disagree.
 fn delegation_notification(task_id: Uuid, task_title: &str, end: &DelegationEnd) -> String {
     let status = if end.is_error { "failed" } else { "completed" };
+    let verb = if end.is_error {
+        "stopped without finishing"
+    } else {
+        "ended"
+    };
     let mut detail = String::new();
     if let Some(secs) = end.duration_secs {
         detail.push_str(&format!(" in {secs:.0}s"));
@@ -2435,10 +2657,19 @@ fn delegation_notification(task_id: Uuid, task_title: &str, end: &DelegationEnd)
             crate::chat::provider::event_map::stop_reason_name(*stop)
         ));
     }
+    // `completed` means the child is idle with nothing left to do (#1188): what it answered is
+    // on the task. `failed` means it stopped without finishing — the parent must not read that
+    // as done, so the two say different things.
+    let tail = if end.is_error {
+        " The work is NOT finished as far as the task and its AgentExecution show: read them \
+         with task(action: \"get\") and decide — delegate it again, or do it yourself."
+    } else {
+        " Its answer is on the task and its AgentExecution: read them with task(action: \
+         \"get\"), then carry on with what it was needed for."
+    };
     format!(
         "<task-notification task_id=\"{task_id}\" status=\"{status}\">Delegated task \
-         «{task_title}» ended{detail}. Its answer is on the task and its AgentExecution: read \
-         them with task(action: \"get\"), then carry on with what it was needed for.\
+         «{task_title}» {verb}{detail}.{tail}\
          </task-notification>"
     )
 }
@@ -3301,6 +3532,13 @@ pub async fn supersede_decision(
     State(state): State<OrchestratorState>,
     Path((new_id, old_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    // The store's `MATCH (new) MATCH (old)` writes nothing when either is
+    // missing and reports success (issue #1189).
+    for id in [new_id, old_id] {
+        if state.orchestrator.neo4j().get_decision(id).await?.is_none() {
+            return Err(AppError::NotFound(format!("Decision not found: {id}")));
+        }
+    }
     state
         .orchestrator
         .neo4j()
@@ -3846,6 +4084,17 @@ pub async fn update_step(
     Path(step_id): Path<Uuid>,
     Json(req): Json<UpdateStepRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The store's update matches nothing for an unknown id and reports success:
+    // without this read, a mistyped id is answered 204 (issue #1189).
+    if state
+        .orchestrator
+        .neo4j()
+        .get_step(step_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!("Step not found: {step_id}")));
+    }
     if let Some(status) = req.status.clone() {
         state
             .orchestrator
@@ -9130,6 +9379,405 @@ pub(crate) mod tests {
         }
     }
 
+    /// A turn of the fake provider that ended well, with the cumulative spend it states.
+    fn a_finished_turn(cost_usd: f64) -> nexus_claude::agent::AgentEvent {
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+        AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some("done".into()),
+            usage: Default::default(),
+            cost: Cost {
+                usd: Some(cost_usd),
+                basis: CostBasis::Reported,
+            },
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m".into()),
+            provider_session_id: Some("p-1".into()),
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    /// A `run_in_background` command the child started and still waits on.
+    fn a_running_shell_task() -> nexus_claude::agent::BackgroundTask {
+        use nexus_claude::agent::{BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus};
+        BackgroundTask {
+            id: "nt-1".into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "sleep 30".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: Some("c7".into()),
+            parent: None,
+            pid: Some(4242),
+        }
+    }
+
+    /// Waits until the fake provider opened its `n`-th turn.
+    async fn wait_for_turns(fake: &crate::chat::agent_runtime::fake::FakeProvider, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if fake.state.turns_started.lock().unwrap().len() >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake provider never opened turn {n}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// What the parent was told about the delegation within `within`, if anything: the
+    /// notification names the task.
+    async fn delegation_told_within(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        within: std::time::Duration,
+        task_id: Uuid,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task_id.to_string()) =>
+                {
+                    return Some(content)
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The rig of a delegation that OPENS on the in-process fake provider: the parent (a
+    /// session a person drives) is live and listened to, its child runs on the fake, and the
+    /// fake's queue is what a test pushes that child's events into. Returns the manager, the
+    /// fake, the parent's events, the delegated task and the child's session id.
+    #[allow(clippy::type_complexity)]
+    async fn open_a_delegation_on_the_fake() -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        Uuid,
+        String,
+    ) {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        // The parent is live (a child only opens under a live parent) and listened to.
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state =
+            crate::test_helpers::server_state_with_chat(manager.clone(), mock.clone()).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        let req = DelegateTaskRequest {
+            cwd: parent.cwd.clone(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+
+        let response = super::delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the delegation opens on the fake provider: {e:?}"));
+        let (status, Json(outcome)) = response;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        let DelegateTaskOutcome::Launched(launched) = outcome else {
+            panic!("no execution place was asked for: nothing to confirm")
+        };
+        (manager, fake, rx, task.id, launched.session_id)
+    }
+
+    /// The rig of the re-delegation tests (#1188 §1b): like [`open_a_delegation_on_the_fake`],
+    /// but nothing is delegated yet and the plan holds TWO tasks.
+    #[allow(clippy::type_complexity)]
+    async fn a_rig_to_delegate_twice() -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        OrchestratorState,
+        axum::http::HeaderMap,
+        Uuid,
+        [Uuid; 2],
+        String,
+    ) {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task_a = crate::test_helpers::test_task();
+        let task_b = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task_a).await.unwrap();
+        mock.create_task(plan.id, &task_b).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state =
+            crate::test_helpers::server_state_with_chat(manager.clone(), mock.clone()).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        (
+            manager,
+            fake,
+            rx,
+            state,
+            headers,
+            plan.id,
+            [task_a.id, task_b.id],
+            parent.cwd.clone(),
+        )
+    }
+
+    /// Delegates `task` as the rig's parent; the child's session id, or the refusal.
+    async fn delegate_in_the_rig(
+        state: &OrchestratorState,
+        headers: &axum::http::HeaderMap,
+        plan: Uuid,
+        task: Uuid,
+        cwd: &str,
+    ) -> Result<String, AppError> {
+        let req = DelegateTaskRequest {
+            cwd: cwd.to_string(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+        let (_, Json(outcome)) = super::delegate_task(
+            State(state.clone()),
+            None,
+            headers.clone(),
+            Path((plan, task)),
+            Json(req),
+        )
+        .await?;
+        let DelegateTaskOutcome::Launched(launched) = outcome else {
+            panic!("no execution place was asked for")
+        };
+        Ok(launched.session_id)
+    }
+
+    /// #1188 §1b: a task whose delegation is still in flight is not delegated again (two agents
+    /// worked one task in one worktree); another task still can be delegated at the same time.
+    #[tokio::test]
+    async fn a_task_already_being_delegated_is_refused_but_another_task_is_not() {
+        let (_manager, fake, _rx, state, headers, plan, [task_a, task_b], cwd) =
+            a_rig_to_delegate_twice().await;
+
+        let first = delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("the first delegation of a task opens");
+        wait_for_turns(&fake, 1).await;
+
+        let second = delegate_in_the_rig(&state, &headers, plan, task_a, &cwd).await;
+        match second {
+            Err(AppError::Conflict(message)) => assert!(
+                message.contains(&first),
+                "the refusal names the session already on the task: {message}"
+            ),
+            other => panic!("the same task was delegated twice (#1188 §1b): {other:?}"),
+        }
+
+        delegate_in_the_rig(&state, &headers, plan, task_b, &cwd)
+            .await
+            .expect("a delegation of ANOTHER task in parallel stays allowed");
+    }
+
+    /// #1188 §1b: a delegation that is over does not block the next attempt (a legitimate retry).
+    #[tokio::test]
+    async fn a_task_whose_delegation_is_over_can_be_delegated_again() {
+        let (_manager, fake, mut rx, state, headers, plan, [task_a, _], cwd) =
+            a_rig_to_delegate_twice().await;
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("the first delegation opens");
+        wait_for_turns(&fake, 1).await;
+        fake.state.push(a_finished_turn(0.01));
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_a)
+            .await
+            .expect("the end of the delegation never reached the parent");
+        assert!(told.contains("status=\"completed\""), "{told}");
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("a finished delegation must not block a retry");
+    }
+
+    /// #1188 §1b: an execution left `running` whose session is gone (a dead process) does not
+    /// block the task: only a child that still works does.
+    #[tokio::test]
+    async fn an_execution_whose_session_is_gone_does_not_block_its_task() {
+        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+
+        let (_manager, _fake, _rx, state, headers, plan, [task_a, _], cwd) =
+            a_rig_to_delegate_twice().await;
+        state
+            .orchestrator
+            .neo4j_arc()
+            .create_agent_execution(&AgentExecutionNode {
+                id: Uuid::new_v4(),
+                run_id: Uuid::nil(),
+                task_id: task_a,
+                session_id: Some(Uuid::new_v4()),
+                started_at: chrono::Utc::now(),
+                status: AgentExecutionStatus::Running,
+                persona_profile: "delegation".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        delegate_in_the_rig(&state, &headers, plan, task_a, &cwd)
+            .await
+            .expect("a running execution whose session is gone must not block the task");
+    }
+
+    /// #1188 §1: a `Result` closes a TURN, not the delegation. A child that ends its turn
+    /// while it still waits on a `run_in_background` command is woken again and goes on
+    /// working; reporting « completed » there made the parent re-delegate the same task into
+    /// the same worktree, and two agents worked one task at once.
+    #[tokio::test]
+    async fn a_delegation_is_not_over_while_its_child_still_has_work() {
+        use nexus_claude::agent::AgentEvent;
+
+        let (manager, fake, mut rx, task_id, child) = open_a_delegation_on_the_fake().await;
+        wait_for_turns(&fake, 1).await;
+        // The child started a background command and ends its turn waiting on it.
+        fake.state.push(AgentEvent::BackgroundTasks {
+            tasks: vec![a_running_shell_task()],
+        });
+        fake.state.push(a_finished_turn(0.01));
+
+        assert!(
+            delegation_told_within(&mut rx, std::time::Duration::from_millis(2500), task_id)
+                .await
+                .is_none(),
+            "a child that still has a background task running was reported over (#1188 §1)"
+        );
+
+        // The task ends, the child is woken and finishes: THIS is the end of the delegation.
+        manager
+            .send_message(&child, "the task ended, carry on")
+            .await
+            .unwrap();
+        wait_for_turns(&fake, 2).await;
+        fake.state
+            .push(AgentEvent::BackgroundTasks { tasks: vec![] });
+        fake.state.push(a_finished_turn(0.02));
+
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_id)
+            .await
+            .expect("the end of the delegation never reached the parent");
+        assert!(told.contains("status=\"completed\""), "{told}");
+        assert!(
+            told.contains("$0.0200"),
+            "the spend closed on is the cumulative one, not the first turn's: {told}"
+        );
+    }
+
+    /// #1188 §3: a delegated child whose provider process dies is reported FAILED. Its death
+    /// used to reach nobody — the task stayed `in_progress` and the delegation waited for its
+    /// delay while the parent believed the work was going on.
+    #[tokio::test]
+    async fn a_delegation_whose_child_dies_is_reported_failed() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+
+        let (_manager, fake, mut rx, task_id, _child) = open_a_delegation_on_the_fake().await;
+        wait_for_turns(&fake, 1).await;
+        fake.state.push(AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: Some(137) },
+        });
+
+        let told = delegation_told_within(&mut rx, std::time::Duration::from_secs(10), task_id)
+            .await
+            .expect("the death of the child never reached the parent");
+        assert!(told.contains("status=\"failed\""), "{told}");
+        assert!(told.contains("NOT finished"), "{told}");
+    }
+
     /// The stored execution, once it is no longer `running` (the drop path
     /// writes from a spawned task).
     async fn closed_execution(
@@ -9392,10 +10040,19 @@ pub(crate) mod tests {
     /// A `DelegationHalt` that records what it was asked (`interrupted`, `closed`) and, when
     /// it holds the child's channel, answers the interrupt with the `Result` an interrupted
     /// turn gives.
+    ///
+    /// Its child has nothing left to do unless the test says so ([`Self::still_working`]),
+    /// which is what a `Result` in the middle of a session looks like (#1188 §1).
     #[derive(Default)]
     struct HaltRecorder {
         interrupted: std::sync::atomic::AtomicBool,
         closed: std::sync::atomic::AtomicBool,
+        /// Whether the child still has work — a background task, a turn still open.
+        working: std::sync::atomic::AtomicBool,
+        /// Whether a turn runs (a new turn began after a finished one).
+        turn_running: std::sync::atomic::AtomicBool,
+        /// How many times the listener asked: a test waits for the question, then answers it.
+        work_checks: std::sync::atomic::AtomicUsize,
         on_interrupt:
             std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>>>,
         result: std::sync::Mutex<Option<crate::chat::types::ChatEvent>>,
@@ -9412,6 +10069,23 @@ pub(crate) mod tests {
                 ..Default::default()
             }
         }
+        /// The child still has work until the test says otherwise ([`Self::stopped_working`]).
+        fn still_working(self) -> Self {
+            self.working
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        /// A new turn is running (the child was woken by its background work).
+        fn in_a_turn(self) -> Self {
+            self.turn_running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        /// The work the child was waiting on is over: the next turn is its last.
+        fn stopped_working(&self) {
+            self.working
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         fn interrupted(&self) -> bool {
             self.interrupted.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -9422,6 +10096,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl super::DelegationHalt for HaltRecorder {
+        async fn is_turn_running(&self) -> bool {
+            self.turn_running.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn is_working(&self) -> bool {
+            self.work_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.working.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn interrupt(&self) {
             self.interrupted
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9472,6 +10154,119 @@ pub(crate) mod tests {
             }
         }
         None
+    }
+
+    /// #1239 — with the REAL `ChatManager` (not `HaltRecorder`): a child that finished a
+    /// turn (while a background task of it still runs) and began a NEW turn, whose CLI then
+    /// dies. The death reaches the listener as the `SessionError` the out-of-band listener
+    /// publishes (`emit_subprocess_death`); while the new turn's own stream is closing on the
+    /// same dead output. The delegation is `failed`: the dead turn's work is not a success.
+    /// Since #1239 the verdict does not depend on `is_session_streaming` at the read (the
+    /// runtime resets it in `next_queued`/`drive` with no synchronisation with the death's
+    /// emission): the `StreamingStatus { true }` of T2 on the channel, before the
+    /// `SessionError`, is what says a new turn began.
+    #[tokio::test]
+    async fn a_child_whose_cli_dies_in_a_new_turn_fails_its_delegation_with_the_real_manager() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        use crate::neo4j::GraphStore;
+        use nexus_claude::Message;
+
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            graph,
+            search,
+            crate::chat::manager::test_support::chat_config(),
+        ));
+        let sid = Uuid::new_v4().to_string();
+        let cli =
+            crate::chat::manager::test_support::insert_dying_cli_session(&manager, &sid).await;
+        // The child waits on a background task of its own, so a `Result` is a turn's end.
+        crate::chat::manager::test_support::set_cli_background_tasks(&manager, &sid, 1).await;
+        let rx = manager.subscribe(&sid).await.unwrap();
+        // What the manager says at the instant the `SessionError` is published.
+        let mut probe = manager.subscribe(&sid).await.unwrap();
+        let probe_manager = manager.clone();
+        let probe_sid = sid.clone();
+        let streaming_at_death = tokio::spawn(async move {
+            loop {
+                if let Ok(crate::chat::types::ChatEvent::SessionError { .. }) = probe.recv().await {
+                    return probe_manager.is_session_streaming(&probe_sid).await;
+                }
+            }
+        });
+
+        let result = || Message::Result {
+            subtype: "success".into(),
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            session_id: "cli-1".into(),
+            total_cost_usd: Some(0.1),
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        let halt = Arc::new(HaltSession {
+            manager: manager.clone(),
+            session_id: sid.clone(),
+        });
+        let listener = tokio::spawn(super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt),
+        ));
+
+        // T1 runs and ends: the listener keeps the finished turn, the child still has work.
+        manager.send_message(&sid, "t1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cli.say(result());
+        wait_until(|| async { !manager.is_session_streaming(&sid).await }).await;
+        // T2 begins, and the CLI dies in it.
+        manager.send_message(&sid, "t2").await.unwrap();
+        wait_until(|| async { manager.is_session_streaming(&sid).await }).await;
+        cli.die();
+
+        let stop = tokio::time::timeout(std::time::Duration::from_secs(15), listener)
+            .await
+            .expect("the delegation ends")
+            .unwrap();
+        let streaming = streaming_at_death.await.unwrap();
+
+        let stored = closed_execution(&mock, id).await;
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(
+            stored.status,
+            AgentExecutionStatus::Failed,
+            "stop={stop:?} streaming_at_death={streaming} event={event}"
+        );
+        assert_eq!(event["event"], "delegation_failed");
+    }
+
+    /// Polls `condition` for up to 10 s.
+    async fn wait_until<F, Fut>(condition: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the condition never held");
     }
 
     /// PYSR-3b — a delegation stopped by its DELAY goes through the same closure as one that
@@ -9637,6 +10432,412 @@ pub(crate) mod tests {
         assert!(!halt.closed() && !halt.interrupted());
         let task = mock.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(task.status, crate::neo4j::models::TaskStatus::InProgress);
+    }
+
+    /// #1188 §1 — a `Result` that arrives while the child still has work closes a TURN, not
+    /// the delegation: the listener keeps waiting, and what it closes on is the CUMULATIVE
+    /// spend of the LAST turn (the parent used to be told « completed » on the first one and
+    /// re-delegated the same task, so two agents worked one task in one worktree).
+    #[tokio::test]
+    async fn a_result_while_the_child_still_works_closes_a_turn_not_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+
+        let listening = tokio::spawn({
+            let halt = halt.clone();
+            let event_bus = Arc::new(crate::events::HybridEmitter::new(bus));
+            async move {
+                super::listen_delegation_result(
+                    rx,
+                    task_id,
+                    "delegated",
+                    event_bus,
+                    None,
+                    None,
+                    execution,
+                    super::DelegationOwner::default(),
+                    crate::runner::DelegationLimits::default(),
+                    Some(halt),
+                )
+                .await
+            }
+        });
+
+        // The first `Result` reached the listener, which asked whether the child still works.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while halt.work_checks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never asked whether the child still works"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            delegation_event(&mut events).is_none(),
+            "a turn's `Result` was reported as the end of the delegation (#1188 §1)"
+        );
+
+        // The command the child waited on is over; its last turn states the total spent.
+        halt.stopped_working();
+        tx.send(reported(0.9)).unwrap();
+
+        let stop = listening.await.unwrap();
+        assert_eq!(stop, None, "the delegation ended on its own");
+        assert!(!halt.closed() && !halt.interrupted());
+        let event = delegation_event(&mut events).expect("the end of the delegation is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(
+            event["cost_usd"], 0.9,
+            "the delegation closes on the last turn's cumulative spend: {event}"
+        );
+    }
+
+    /// #1188 — the delay expires while the child, its turn ended, only waits on background
+    /// work: no turn is running, so the interrupt gives no `Result`. The delegation closes on
+    /// the finished turn (completed, its spend), at once. Red before: the listener waited the
+    /// whole `INTERRUPT_RESULT_GRACE` for a `Result` that never comes, then closed `failed`
+    /// at an unknown cost.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        let start = tokio::time::Instant::now();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        let waited = start.elapsed();
+        drop(tx);
+
+        assert!(halt.interrupted(), "the background work is stopped");
+        assert!(halt.closed(), "the child is closed, with what it spawned");
+        assert_eq!(stop, None, "the finished turn is the delegation's end");
+        assert!(
+            waited < std::time::Duration::from_secs(90) + super::INTERRUPT_RESULT_GRACE,
+            "no grace is waited for a `Result` no turn will give: {waited:?}"
+        );
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 §3 — the child's session dies AFTER a finished turn (it only waited on
+    /// background work): the work it did stands, the delegation closes on that turn,
+    /// completed. Red before: any `SessionError` closed the delegation `failed`.
+    #[tokio::test]
+    async fn a_session_error_after_a_finished_turn_closes_on_that_turn() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, None);
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.4, "the finished turn's spend");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed");
+        assert_eq!(event["cost_usd"], 0.4);
+    }
+
+    /// #1188 — T1 ended, the background work finished, the child woke and T2 RUNS when the
+    /// delay expires: T2 is interrupted and its `Result` read (its cumulative spend), the
+    /// delegation closes `Interrupted`, the child closed. Red before: the listener closed
+    /// `completed` on T1's spend and dropped T2's.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_during_a_new_turn_reads_that_turns_result() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.9)).in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        halt.working
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        assert!(halt.interrupted() && halt.closed());
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed");
+        assert_eq!(
+            event["cost_usd"], 0.9,
+            "T2's cumulative spend is read, not T1's: {event}"
+        );
+    }
+
+    /// #1188 — the child's session dies while a NEW turn runs, after a finished one: that
+    /// turn's death is a failure, not a success on T1. Red before: `completed` at T1's spend.
+    #[tokio::test]
+    async fn a_session_error_during_a_new_turn_fails_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working().in_a_turn());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
+    }
+
+    /// #1239 — the DANGEROUS ORDER, forced: T1 ended, T2 began (`StreamingStatus { true }` on
+    /// the channel), and the runtime's streaming flag is ALREADY back to `false` (the halt says
+    /// « no turn ») when the `SessionError` is read. The order of the events decides, not the
+    /// flag: the delegation is `failed`. Red before: `completed` on T1's answer.
+    #[tokio::test]
+    async fn a_session_error_after_a_new_turn_began_fails_even_if_the_flag_is_already_reset() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        // Working (so T1's `Result` is a turn's end), no turn running at the read.
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
+        assert!(halt.closed(), "the dead child is closed");
+    }
+
+    /// #1239 — a turn that began and ENDED (`StreamingStatus { false }`) before the death is
+    /// not a running one: the delegation closes on T1's last `Result`, as before.
+    #[tokio::test]
+    async fn a_session_error_after_the_new_turn_ended_closes_on_the_last_result() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+        tx.send(reported(0.6)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus {
+            is_streaming: false,
+        })
+        .unwrap();
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        halt.working
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_completed", "{event}");
+        assert_eq!(event["cost_usd"], 0.6, "{event}");
+    }
+
+    /// #1239 — the same order for the DELAY: a new turn began (seen on the channel) while the
+    /// streaming flag already reads `false`: the turn is interrupted and its `Result` read
+    /// (`Interrupted`, T2's spend), not closed `completed` on T1. Red before: `completed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_after_a_new_turn_began_interrupts_even_if_the_flag_is_already_reset() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.9)).still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        tx.send(crate::chat::types::ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["cost_usd"], 0.9, "{event}");
+    }
+
+    /// #1239 — a `Lagged` broadcast may have swallowed the start of a turn: the death is then
+    /// read the prudent way (`failed`).
+    #[tokio::test]
+    async fn a_session_error_after_a_lag_fails_the_delegation() {
+        let (_mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let halt = Arc::new(HaltRecorder::default().still_working());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        tx.send(reported(0.4)).unwrap();
+        let listener = tokio::spawn(super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        ));
+        // The listener kept T1's `Result` (it asked whether the child works).
+        wait_until(|| async { halt.work_checks.load(std::sync::atomic::Ordering::SeqCst) > 0 })
+            .await;
+        // The buffer overflows with the listener not reading: it lags, losing the start of
+        // a turn, then reads the death.
+        for _ in 0..4 {
+            tx.send(crate::chat::types::ChatEvent::StreamDelta {
+                text: "x".into(),
+                parent_tool_use_id: None,
+            })
+            .unwrap();
+        }
+        tx.send(crate::chat::types::ChatEvent::SessionError {
+            reason: "subprocess_exited".to_string(),
+            message: "the provider process exited".to_string(),
+            received_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        listener.await.unwrap();
+        drop(tx);
+
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
     }
 
     /// PYSR-3b — the halt of a delegation closes the child AND what the child spawned (a
@@ -14041,27 +15242,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Kept as it is on main, on purpose: superseding two ids that name no
-    /// decision answers 204 and writes nothing. Refusing it is a contract
-    /// change, made in the contract PR, not here.
-    #[tokio::test]
-    async fn superseding_two_unknown_ids_still_answers_204() {
-        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let (app, _bus) = test_app_parts(graph).await;
-        let resp = app
-            .oneshot(auth_post_json(
-                &format!(
-                    "/api/decisions/{}/supersedes/{}",
-                    Uuid::new_v4(),
-                    Uuid::new_v4()
-                ),
-                serde_json::json!({}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
     /// A task in the mock store, with its id.
     async fn seeded_task(graph: &crate::neo4j::mock::MockGraphStore) -> Uuid {
         let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
@@ -14077,6 +15257,331 @@ pub(crate) mod tests {
             .unwrap();
         assert!(resp.status().is_success(), "POST {uri}: {}", resp.status());
         resp_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    /// PATCH /api/steps/{id} on an id that names no step used to answer 204,
+    /// which the MCP tool turned into `updated: true`.
+    #[tokio::test]
+    async fn patching_a_step_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+        let ghost = Uuid::new_v4();
+
+        for body in [
+            serde_json::json!({ "description": "never written" }),
+            serde_json::json!({ "status": "completed" }),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(auth_patch_json(
+                    &format!("/api/steps/{ghost}"),
+                    body.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "body {body}");
+        }
+    }
+
+    /// The same silence on PATCH /api/tasks/{id}.
+    #[tokio::test]
+    async fn patching_a_task_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{}", Uuid::new_v4()),
+                serde_json::json!({ "acceptance_criteria": ["never written"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PATCH /api/tasks/{id} writes the criteria and the files, and a step that
+    /// exists is still updated (the 404 above is not a blanket refusal).
+    #[tokio::test]
+    async fn patching_an_existing_task_and_step_still_writes() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{task_id}"),
+                serde_json::json!({
+                    "acceptance_criteria": ["The export is complete"],
+                    "affected_files": ["src/export.rs"],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.acceptance_criteria, vec!["The export is complete"]);
+        assert_eq!(stored.affected_files, vec!["src/export.rs"]);
+
+        let step_id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "first wording" }),
+        )
+        .await;
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/steps/{step_id}"),
+                serde_json::json!({ "description": "second wording", "status": "skipped" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let step = graph
+            .get_step(step_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.description, "second wording");
+        assert_eq!(step.status, crate::neo4j::models::StepStatus::Skipped);
+    }
+
+    /// DELETE /api/tasks/{id} takes the task's steps and decisions with it. It
+    /// used to do so behind an empty 204: the caller learned of the lost
+    /// decisions when `decision get` answered 404.
+    #[tokio::test]
+    async fn deleting_a_task_says_which_decisions_went_with_it() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let bystander = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let decision = serde_json::json!({ "description": "d", "rationale": "r" });
+        let mut lost = Vec::new();
+        for _ in 0..2 {
+            lost.push(
+                posted_id(
+                    &app,
+                    &format!("/api/tasks/{task_id}/decisions"),
+                    decision.clone(),
+                )
+                .await,
+            );
+        }
+        let kept = posted_id(
+            &app,
+            &format!("/api/tasks/{bystander}/decisions"),
+            decision.clone(),
+        )
+        .await;
+        posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "a step" }),
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp_json(resp).await;
+        assert_eq!(json["deleted"], true);
+        assert_eq!(json["decisions_deleted"], 2);
+        assert_eq!(json["steps_deleted"], 1);
+        let mut reported: Vec<String> = json["deleted_decision_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        reported.sort();
+        lost.sort();
+        assert_eq!(reported, lost);
+
+        // What the answer says is what happened.
+        for id in &lost {
+            assert!(graph
+                .get_decision(id.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(graph
+            .get_decision(kept.parse().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// A task without decisions: the same answer, with zeros.
+    #[tokio::test]
+    async fn deleting_a_task_without_decisions_reports_zero() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp_json(resp).await;
+        assert_eq!(json["deleted"], true);
+        assert_eq!(json["decisions_deleted"], 0);
+        assert_eq!(json["steps_deleted"], 0);
+        assert!(graph.get_task(task_id).await.unwrap().is_none());
+    }
+
+    /// Pinned, not endorsed: through REST a decision may be superseded by itself
+    /// (204), while the MCP `decision supersede` refuses it (`supersede_self`).
+    /// Aligning REST would be one more contract change.
+    #[tokio::test]
+    async fn superseding_a_decision_with_itself_through_rest_is_still_accepted() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let id = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/decisions"),
+            serde_json::json!({ "description": "d", "rationale": "r" }),
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/decisions/{id}/supersedes/{id}"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The log keeps what the cascade removed: the line an operator greps for
+    /// after a task disappeared, with the counts (issue #1189, review U5).
+    #[derive(Clone, Default)]
+    struct EventText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventText {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", event.metadata().target(), fields.0));
+        }
+    }
+
+    /// The capture of every event of this test binary. It is the process-wide
+    /// subscriber: a thread-local one is not seen reliably by a callsite that the
+    /// other tests, running in parallel, have already registered.
+    fn captured_events() -> &'static EventText {
+        static CAPTURE: std::sync::OnceLock<EventText> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let capture = EventText::default();
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            capture
+        })
+    }
+
+    #[tokio::test]
+    async fn deleting_a_task_logs_what_went_with_it() {
+        let capture = captured_events();
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        for _ in 0..2 {
+            posted_id(
+                &app,
+                &format!("/api/tasks/{task_id}/decisions"),
+                serde_json::json!({ "description": "d", "rationale": "r" }),
+            )
+            .await;
+        }
+        posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "a step" }),
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The line of THIS task: other tests delete tasks in parallel.
+        let events = capture.0.lock().unwrap().clone();
+        let line = events
+            .iter()
+            .find(|l| {
+                l.contains("task deleted with its steps and decisions")
+                    && l.contains(&task_id.to_string())
+            })
+            .unwrap_or_else(|| panic!("no deletion line for {task_id} in {events:?}"));
+        assert!(line.contains("decisions_deleted=2"), "{line}");
+        assert!(line.contains("steps_deleted=1"), "{line}");
+    }
+
+    /// POST /api/decisions/{new}/supersedes/{old} with an id that names no
+    /// decision used to answer 204 and mark nothing.
+    #[tokio::test]
+    async fn superseding_with_a_decision_that_does_not_exist_is_a_404() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        let real = posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/decisions"),
+            serde_json::json!({ "description": "d", "rationale": "r" }),
+        )
+        .await;
+        let ghost = Uuid::new_v4();
+
+        for uri in [
+            format!("/api/decisions/{ghost}/supersedes/{real}"),
+            format!("/api/decisions/{real}/supersedes/{ghost}"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(auth_post_json(&uri, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let untouched = graph
+            .get_decision(real.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            untouched.status,
+            crate::neo4j::models::DecisionStatus::Superseded
+        );
     }
 }
 

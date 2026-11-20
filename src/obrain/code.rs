@@ -810,6 +810,50 @@ impl CodeStore for ObrainGraphStore {
         })
     }
 
+    async fn find_project_files_by_path_suffix(
+        &self,
+        project_id: Uuid,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        // Membership is the CONTAINS edge (`contenus`), never the `project_id`
+        // property of the file, and the project filter comes before the limit
+        // (#1189): the same rule as Neo4j and the mock.
+        self.lire(|_, etat| {
+            etat.code
+                .ferme("CodeStore::find_project_files_by_path_suffix")?;
+            if !etat.projets.contient(project_id) {
+                return Ok(Vec::new());
+            }
+            let mut v: Vec<String> = etat
+                .code
+                .contenus
+                .get(&project_id)
+                .into_iter()
+                .flatten()
+                .filter(|p| p.ends_with(suffix))
+                .cloned()
+                .collect();
+            v.sort();
+            v.truncate(limit);
+            Ok(v)
+        })
+    }
+
+    async fn project_contains_file(&self, project_id: Uuid, path: &str) -> Result<bool> {
+        self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::project_contains_file")?;
+            if !etat.projets.contient(project_id) {
+                return Ok(false);
+            }
+            Ok(etat
+                .code
+                .contenus
+                .get(&project_id)
+                .is_some_and(|s| s.contains(path)))
+        })
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         self.lire(|_, etat| {
             etat.code.ferme("CodeStore::list_project_files")?;

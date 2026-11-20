@@ -26,6 +26,9 @@
 //!
 //! 1. a permission is pending, a question (`ask_user_question`) or a secret request is
 //!    open, or the last event says a person must act → [`SessionState::WaitingOnPerson`];
+//!    * a question is closed by the PERSON, never by the harness: its `tool_result` is
+//!      only the acknowledgement that the card was shown, so it does not close the
+//!      question it announces (see [`classify`]) — the person's next `Input` and a stop do;
 //! 2. streaming:
 //!    * no event for [`STALLED_AFTER_MS`] or more → [`SessionState::Stalled`];
 //!    * a tool call has no result yet → [`SessionState::Working`];
@@ -219,6 +222,12 @@ pub enum Signal {
     ToolEnd {
         id: String,
     },
+    /// The tool call was CANCELLED (an interrupt, the dead-tool sweep). Unlike a
+    /// `tool_result`, which for a question is only its acknowledgement, this says nobody
+    /// will ever answer it: a question it belongs to is dead, not waiting.
+    ToolCancelled {
+        id: String,
+    },
     QuestionAsked {
         id: String,
     },
@@ -266,9 +275,10 @@ pub fn signal_of(event: &ChatEvent) -> Option<Signal> {
             top_level: parent_tool_use_id.is_none(),
         },
         ChatEvent::ToolUse { id, .. } => Signal::ToolStart { id: id.clone() },
-        ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
-            Signal::ToolEnd { id: id.clone() }
-        }
+        // A cancellation is NOT a result: it is the only harness signal that proves a
+        // question will never be answered (see `classify`).
+        ChatEvent::ToolCancelled { id, .. } => Signal::ToolCancelled { id: id.clone() },
+        ChatEvent::ToolResult { id, .. } => Signal::ToolEnd { id: id.clone() },
         ChatEvent::AskUserQuestion { tool_call_id, .. } => Signal::QuestionAsked {
             id: tool_call_id.clone(),
         },
@@ -444,17 +454,46 @@ pub fn classify(
     }
     let mut ended_tools = BTreeSet::new();
     let mut resolved_secrets = BTreeSet::new();
+    let mut cancelled_tools = BTreeSet::new();
     let mut open_tool: Option<&TailEvent> = None;
+    // The `tool_call_id` of every question this tail asked. A question is closed by the
+    // PERSON, never by the harness: the `tool_result` of an `ask_user_question` is an
+    // ACKNOWLEDGEMENT ("The question was shown to the user. Their answer will arrive as
+    // the next user message"), emitted milliseconds after the question on BOTH engines
+    // (natif: `providers/native/loop.rs` + `QUESTION_ASKED`; Claude Code: the backend
+    // refuses the control request, §15.6, so the CLI answers a `tool_result` at once).
+    // Counting it as a `ToolEnd` closed every question at birth: `waiting_on_person` and
+    // `question_open` never held together, and no card was ever answerable (session
+    // 1c0d3e9e, 17/11/2026: « Cette question ne peut plus être répondue »). The answer is
+    // the next `Input`, a stop is `Ended { Interrupted }`: both stop the walk below.
+    let asked_questions: BTreeSet<&str> = tail
+        .iter()
+        .filter_map(|e| match &e.signal {
+            Signal::QuestionAsked { id } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
     // Walk back: a question or secret is open when nothing later closes it.
     for e in tail.iter().rev() {
         match &e.signal {
-            Signal::ToolEnd { id } => {
+            // The acknowledgement of a question is not the end of its tool call: it would
+            // close the question it just announced.
+            Signal::ToolEnd { id } if !asked_questions.contains(id.as_str()) => {
                 ended_tools.insert(id.as_str());
+            }
+            // A cancellation, on the other hand, is proof that nobody will answer: the tool
+            // call is gone (lock-free interrupt, dead-tool sweep), so a question it carried
+            // must not stay clickable — its answer would go to a tool that no longer exists.
+            Signal::ToolCancelled { id } => {
+                ended_tools.insert(id.as_str());
+                cancelled_tools.insert(id.as_str());
             }
             Signal::SecretResolved { id } => {
                 resolved_secrets.insert(id.as_str());
             }
-            Signal::QuestionAsked { id } if !ended_tools.contains(id.as_str()) => {
+            // No `ended_tools` guard: nothing the HARNESS emits closes a question — only
+            // the person's `Input`, a stop, or the cancellation of its tool call do.
+            Signal::QuestionAsked { id } if !cancelled_tools.contains(id.as_str()) => {
                 return v(SessionState::WaitingOnPerson, Rule::QuestionOpen, Some(e));
             }
             Signal::SecretAsked { id } if !resolved_secrets.contains(id.as_str()) => {
@@ -469,11 +508,13 @@ pub fn classify(
             {
                 open_tool = Some(e);
             }
-            // An interrupted turn closes what it had open: a question it asked never gets its
-            // `tool_result` (measured 10/11/2026: none, and no `tool_cancelled`), so the end
-            // of the turn is the only witness that nobody is waited on any more.
+            // An interrupted or FAILED turn closes what it had open: a question it asked
+            // never gets its `tool_result` (measured 10/11/2026: none, and no
+            // `tool_cancelled`), so the end of the turn is the only witness that nobody is
+            // waited on any more. `Failed` counts too: the tool call died with the turn,
+            // and a card left clickable would answer a tool that no longer exists.
             Signal::Ended {
-                how: TurnEnd::Interrupted,
+                how: TurnEnd::Interrupted | TurnEnd::Failed,
                 ..
             } => break,
             // A question answered as a user turn (a provider without native questions)
@@ -1117,7 +1158,9 @@ mod tests {
                 id: "a".into(),
                 parent_tool_use_id: None,
             }),
-            Some(Signal::ToolEnd { id: "a".into() })
+            // Its own signal: a cancellation is not a result (`classify` closes a question
+            // on one and never on the other).
+            Some(Signal::ToolCancelled { id: "a".into() })
         );
         assert_eq!(
             s(&E::ToolUse {
@@ -1269,18 +1312,92 @@ mod tests {
         );
     }
 
-    /// A question or a secret closed by its answer is no longer waited on.
+    /// A question the harness ACKNOWLEDGED is still waiting on the person. Measured
+    /// 17/11/2026 (session 1c0d3e9e): 17 ms after `ask_user_question` the harness emits the
+    /// `tool_result` of that very `tool_call_id` — "The question was shown to the user.
+    /// Their answer will arrive as the next user message" — and `signal_of` maps it to
+    /// `ToolEnd`. Read as the end of the tool call, it closed the question at birth: the
+    /// frontend gate (`questionAwaitsPerson`) needs `waiting_on_person` + `question_open`,
+    /// so every card said « Cette question ne peut plus être répondue » with greyed options.
     #[test]
-    fn an_answered_question_or_secret_is_not_waited_on() {
-        let question_answered = vec![
+    fn the_acknowledgement_of_a_question_does_not_close_it() {
+        let acknowledged = vec![
             input(T0),
             ev(
-                T0 + 1,
+                T0 + 17,
                 "ask_user_question",
                 Signal::QuestionAsked { id: "q".into() },
             ),
-            result(T0 + 2, "q"),
+            result(T0 + 34, "q"),
         ];
+        // Streaming and not: both the running turn and a turn that already returned to the
+        // person must report the question as open.
+        for activity in [streaming(), idle()] {
+            let got = classify(&acknowledged, T0, &activity, T0 + 40);
+            assert_eq!(got.state, SessionState::WaitingOnPerson, "{got:?}");
+            assert_eq!(got.reason.rule, Rule::QuestionOpen, "{got:?}");
+        }
+    }
+
+    /// A question whose tool call was CANCELLED, or whose turn DIED, is not waited on any
+    /// more. Without this, opening the question on its acknowledgement alone would leave it
+    /// clickable for ever whenever the turn ends badly: the answer would go to a tool that no
+    /// longer exists (the very failure the frontend gate was built to prevent).
+    #[test]
+    fn a_cancelled_question_or_a_dead_turn_is_not_waited_on() {
+        let question = ev(
+            T0 + 1,
+            "ask_user_question",
+            Signal::QuestionAsked { id: "q".into() },
+        );
+        let cancelled = vec![
+            input(T0),
+            question.clone(),
+            result(T0 + 2, "q"),
+            ev(
+                T0 + 3,
+                "tool_cancelled",
+                Signal::ToolCancelled { id: "q".into() },
+            ),
+        ];
+        let failed = vec![
+            input(T0),
+            question.clone(),
+            result(T0 + 2, "q"),
+            end(T0 + 3, TurnEnd::Failed, false),
+        ];
+        for (name, tail) in [("cancelled", cancelled), ("failed", failed)] {
+            for activity in [streaming(), idle()] {
+                let got = classify(&tail, T0, &activity, T0 + 4);
+                assert_ne!(got.reason.rule, Rule::QuestionOpen, "{name}: {got:?}");
+            }
+        }
+    }
+
+    /// A question answered as a user turn (a provider without native questions) is closed
+    /// by that input, the acknowledgement before it notwithstanding.
+    #[test]
+    fn the_persons_answer_or_a_stop_closes_an_acknowledged_question() {
+        let question = ev(
+            T0 + 1,
+            "ask_user_question",
+            Signal::QuestionAsked { id: "q".into() },
+        );
+        let acknowledged = vec![input(T0), question.clone(), result(T0 + 2, "q")];
+        let mut answered = acknowledged.clone();
+        answered.push(input(T0 + 60));
+        let mut stopped = acknowledged;
+        stopped.push(end(T0 + 60, TurnEnd::Interrupted, false));
+        for tail in [answered, stopped] {
+            let got = classify(&tail, T0, &idle(), T0 + 61);
+            assert_ne!(got.reason.rule, Rule::QuestionOpen, "{got:?}");
+        }
+    }
+
+    /// A secret closed by its resolution is no longer waited on. (Its resolution is a real
+    /// event: unlike a question, a secret request is not acknowledged by a `tool_result`.)
+    #[test]
+    fn a_secret_resolved_is_not_waited_on() {
         let secret_resolved = vec![
             input(T0),
             ev(
@@ -1294,12 +1411,6 @@ mod tests {
                 Signal::SecretResolved { id: "k".into() },
             ),
         ];
-        assert_eq!(
-            classify(&question_answered, T0, &streaming(), T0 + 3)
-                .reason
-                .rule,
-            Rule::TurnRunning
-        );
         assert_eq!(
             classify(&secret_resolved, T0, &streaming(), T0 + 3)
                 .reason
