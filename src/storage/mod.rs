@@ -177,22 +177,27 @@ impl StorageBackend {
                 // here: a migrated one (its marker) or one written directly. The
                 // rollback leaves no trace without `from`, so refuse that case.
                 // An empty or absent target has nothing to lose.
-                let holds_data = requested == BackendKind::Obrain
-                    && config
+                let held = match requested == BackendKind::Obrain {
+                    false => None,
+                    true => config
                         .storage_obrain_path
                         .as_deref()
                         .map(str::trim)
                         .filter(|p| !p.is_empty())
-                        .map(|p| {
-                            migrate::holds_anything(std::path::Path::new(&crate::expand_tilde(p)))
-                                .unwrap_or(true)
-                        })
-                        .unwrap_or(false);
-                if holds_data {
+                        .and_then(|p| {
+                            let dir = std::path::PathBuf::from(crate::expand_tilde(p));
+                            match migrate::holds_anything(&dir) {
+                                Ok(false) => None,
+                                Ok(true) => Some(format!("{} is not empty", dir.display())),
+                                Err(e) => Some(format!("{e:#}")),
+                            }
+                        }),
+                };
+                if let Some(why) = held {
                     bail!(
-                        "storage.migration.rollback: the obrain target holds data, and without \
-                         storage.migration.from = '{DEFAULT_BACKEND}' the rollback leaves no trace: \
-                         writes made on obrain would vanish silently. Set from to roll back"
+                        "storage.migration.rollback: the obrain target holds data ({why}), and \
+                         without storage.migration.from = '{DEFAULT_BACKEND}' the rollback leaves no \
+                         trace: writes made on obrain would vanish silently. Set from to roll back"
                     );
                 }
                 tracing::error!(
@@ -698,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_without_from_refuses_only_a_migrated_obrain_target() {
+    async fn rollback_without_from_refuses_a_non_empty_obrain_target() {
         let gate = ReadOnlyGate::new();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
