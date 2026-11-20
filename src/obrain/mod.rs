@@ -126,6 +126,7 @@ mod search;
 mod sharing;
 mod skill;
 mod step;
+mod synapse;
 mod task;
 mod trigger;
 mod workspace;

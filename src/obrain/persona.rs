@@ -346,7 +346,7 @@ fn poids_fini(poids: f64) -> Result<()> {
 #[derive(Clone)]
 pub(super) struct EntreePersona {
     noeud: NodeId,
-    persona: PersonaNode,
+    pub(super) persona: PersonaNode,
     /// `USES` → note: the edge and its weight.
     notes: BTreeMap<Uuid, (EdgeId, f64)>,
     /// `EXTENDS` → parent persona.
@@ -560,9 +560,29 @@ impl IndexPersonas {
     }
 }
 
+/// Set properties on a persona node (one engine write each, in order), re-decode it, make
+/// the write durable and publish it. `Ok(false)`: no such persona, nothing written.
+pub(super) fn ecrire_proprietes_de_persona(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    proprietes: Vec<(&'static str, Value)>,
+) -> Result<bool> {
+    let Some(e) = ObrainGraphStore::entree_persona(w, id)? else {
+        return Ok(false);
+    };
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        w.poser(e.noeud, cle, valeur);
+    }
+    let entree = w.apres_ecriture(EntreePersona::decoder(w.db, e.noeud, Some(&e)))?;
+    w.rendre_durable()?;
+    w.index_mut()?.personas.par_id.insert(id, entree);
+    Ok(true)
+}
+
 impl ObrainGraphStore {
     /// The persona entry of `id`, cloned (a write publishes a new state).
-    fn entree_persona(w: &Ecriture<'_>, id: Uuid) -> Result<Option<EntreePersona>> {
+    pub(super) fn entree_persona(w: &Ecriture<'_>, id: Uuid) -> Result<Option<EntreePersona>> {
         Ok(w.index()?.personas.par_id.get(&id).cloned())
     }
 
