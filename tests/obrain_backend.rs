@@ -3814,6 +3814,98 @@ mod with_the_feature {
         }
     }
 
+    /// #1189 (main, #1223/#1245) on obrain: the project-scoped suffix lookup filters
+    /// by the CONTAINS edge BEFORE its limit, and membership is that edge, never the
+    /// `project_id` property — the two conformance checks
+    /// `check_project_scoped_suffix_lookup_filters_before_limit` and
+    /// `check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path`, here
+    /// because the file domain is closed outside test builds. Checked again after a
+    /// close and a reopen: the answer comes from the edges on disk.
+    #[tokio::test]
+    async fn project_file_membership_is_the_contains_edge_and_filters_before_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvert(open(&base).await);
+        let suffix = "/tag/src/lib.rs";
+        let wanted = a_project("suffix wanted");
+        store.create_project(&wanted).await.unwrap();
+        let mut others = Vec::new();
+        for i in 0..7 {
+            let other = a_project(&format!("suffix other {i}"));
+            store.create_project(&other).await.unwrap();
+            store
+                .upsert_file(&a_file(&format!("a{i}{suffix}"), "rust", Some(other.id)))
+                .await
+                .unwrap();
+            others.push(other);
+        }
+        let wanted_path = format!("z-wanted{suffix}");
+        store
+            .upsert_file(&a_file(&wanted_path, "rust", Some(wanted.id)))
+            .await
+            .unwrap();
+        // A file of the SAME project that does not end with the suffix: it sorts
+        // before the wanted one, so only the suffix filter keeps it out of the
+        // answer (without a filter this test would not see the difference).
+        store
+            .upsert_file(&a_file("z-wanted/README.md", "markdown", Some(wanted.id)))
+            .await
+            .unwrap();
+        // A project that does not exist: the node is written, nothing contains it.
+        let ghost = Uuid::new_v4();
+        store
+            .upsert_file(&a_file(&format!("ghost{suffix}"), "rust", Some(ghost)))
+            .await
+            .unwrap();
+
+        let check = |s: ObrainGraphStore| {
+            let (wanted, others, wanted_path) =
+                (wanted.clone(), others.clone(), wanted_path.clone());
+            async move {
+                assert_eq!(
+                    s.find_project_files_by_path_suffix(wanted.id, suffix, 2)
+                        .await
+                        .unwrap(),
+                    vec![wanted_path.clone()],
+                    "filtered before the limit"
+                );
+                assert_eq!(
+                    s.find_project_files_by_path_suffix(others[0].id, suffix, 2)
+                        .await
+                        .unwrap(),
+                    vec![format!("a0{suffix}")]
+                );
+                assert!(s
+                    .find_project_files_by_path_suffix(ghost, suffix, 10)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert!(s
+                    .project_contains_file(wanted.id, &wanted_path)
+                    .await
+                    .unwrap());
+                assert!(!s
+                    .project_contains_file(others[0].id, &wanted_path)
+                    .await
+                    .unwrap());
+                assert!(!s
+                    .project_contains_file(ghost, &format!("ghost{suffix}"))
+                    .await
+                    .unwrap());
+                // Over all projects: path order before the limit.
+                let first = s.find_files_by_path_suffix(suffix, 1).await.unwrap();
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].0, format!("a0{suffix}"));
+                s
+            }
+        };
+        let store = check(store).await;
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvert(open(&base).await);
+        check(store).await;
+    }
+
     /// The end-to-end proof of the code domain: write every kind of file operation,
     /// CLOSE, REOPEN, read back. A passing test here means the files, their edges to
     /// the projects, the updates, the deletions and the three project switches are on
@@ -4133,6 +4225,19 @@ mod with_the_feature {
         assert_eq!(
             not_ported(store.find_files_by_path_suffix(".rs", 10).await),
             NonPorte("CodeStore::find_files_by_path_suffix")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .find_project_files_by_path_suffix(p.id, ".rs", 10)
+                    .await
+            ),
+            NonPorte("CodeStore::find_project_files_by_path_suffix")
+        );
+        assert_eq!(
+            not_ported(store.project_contains_file(p.id, "src/main.rs").await),
+            NonPorte("CodeStore::project_contains_file"),
+            "never a `false` that looks like \"not in the project\""
         );
         assert_eq!(
             not_ported(store.list_project_files(p.id).await),

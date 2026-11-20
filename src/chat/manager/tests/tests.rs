@@ -18428,6 +18428,31 @@ async fn a_cli_session_is_working_while_a_background_task_runs() {
     assert!(!manager.is_session_working("s-nowhere").await);
 }
 
+/// #1188 §1a: a message waiting in the queue, with no turn running and no background
+/// task, is work to come. The queue normally fills only while a turn streams, so the
+/// state is built directly on the real queue: this pins the contract of
+/// `is_session_working`, not a reproduction of the race that leaves it so.
+#[tokio::test]
+async fn a_cli_session_with_a_queued_message_is_working() {
+    let state = mock_app_state();
+    let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+    let (queued, _) = create_dummy_session(false, "", vec![]);
+    queued
+        .pending_messages
+        .lock()
+        .await
+        .push_back(PendingMessage::user("carry on".to_string()));
+    manager
+        .active_sessions
+        .write()
+        .await
+        .insert("s-queued".into(), queued);
+    assert!(
+        manager.is_session_working("s-queued").await,
+        "a queued message with no turn open was seen as idle (#1188 §1a)"
+    );
+}
+
 /// A dead CLI (zombie process) whose `cli_background_tasks` was left > 0 must NOT
 /// be counted as working — the stale counter is cleared so the child slot is freed
 /// (ZOMBIE-CLI: `envelope_too_many_children` caused by a defunct `<defunct>` entry).

@@ -140,11 +140,61 @@ const TASK_UPDATE_KEYS: &[&str] = &[
 /// Fields `step(action: "update")` writes.
 const STEP_UPDATE_KEYS: &[&str] = &["status", "description", "verification"];
 
+/// Refuse, before any request, an update that would answer `updated: true`
+/// without doing what it was asked:
+///
+/// - `unsupported_fields`: an argument the update cannot write, published by the
+///   tool or not (`due_date`, `model_alias`, …). It used to be dropped, and the
+///   answer said the update had happened; an unpublished one was refused only
+///   when it was the ONLY one, by `empty_update`, and ignored next to a written one.
+/// - `empty_update`: no writable field at all, so nothing would change.
+///
+/// A `null` value and a `_`-prefixed key (client metadata) are not fields.
+fn refuse_unwritable_fields(
+    args: &Value,
+    writable: &[&str],
+    what: &str,
+    id_key: &str,
+) -> Result<()> {
+    let given: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| {
+            let key = key.as_str();
+            !value.is_null() && key != "action" && key != id_key && !key.starts_with('_')
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let mut unsupported: Vec<&str> = given
+        .iter()
+        .copied()
+        .filter(|key| !writable.contains(key))
+        .collect();
+    unsupported.sort_unstable();
+    if !unsupported.is_empty() {
+        return Err(anyhow!(
+            "unsupported_fields: {what} cannot write {} — nothing was changed. It writes: {}",
+            unsupported.join(", "),
+            writable.join(", ")
+        ));
+    }
+    // Counted on the keys the update WRITES. Without this the call went
+    // through with an empty body and answered success.
+    if !given.iter().any(|key| writable.contains(key)) {
+        return Err(anyhow!(
+            "empty_update: {what} was given no field to write — nothing was changed. It writes: {}",
+            writable.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// The body of an update, and the names of the fields it writes.
 ///
-/// Only the keys in `writable` are copied, as before; the answer names them so
-/// a caller can see what was written. Keys the update does not write are not
-/// copied and not refused here: refusing them is a contract change (#1189).
+/// Only the keys in `writable` are copied; the answer names them so
+/// a caller can see what was written. Keys the update does not write never
+/// get here: [`refuse_unwritable_fields`] refuses them first.
 ///
 /// A `null` writes nothing (the API reads it as "absent"), so it is neither
 /// sent nor named. `session_id` is sent — it is the link the API makes when a
@@ -177,13 +227,9 @@ fn take_malformed_string_lists(
 ) -> serde_json::Map<String, Value> {
     let mut rejected = serde_json::Map::new();
     for key in keys {
-        // `[]` is refused here too: clearing a list is a contract change
-        // (#1223), not part of this PR. It is named, not silently dropped.
+        // `[]` is a value: it clears the list (a contract change, see the PR).
         let reason = match body.get(*key) {
             None => continue,
-            Some(Value::Array(items)) if items.is_empty() => {
-                "not written: [] is not sent by this version (clearing a list is a contract change)"
-            }
             Some(Value::Array(items)) if items.iter().all(Value::is_string) => continue,
             Some(_) => "not written: must be an array of strings",
         };
@@ -1710,17 +1756,20 @@ impl ToolHandler {
 
             "update_task" => {
                 let task_id = extract_id(args, "task_id")?;
+                refuse_unwritable_fields(args, TASK_UPDATE_KEYS, "task update", "task_id")?;
                 let (mut body, mut fields) = written_update_body(args, TASK_UPDATE_KEYS);
                 let rejected = take_malformed_string_lists(
                     &mut body,
                     &["acceptance_criteria", "affected_files"],
                 );
                 fields.retain(|field| !rejected.contains_key(field));
+                // `updated` says something was written: a refused list alone is not.
+                let written_any = !body.is_empty();
                 let result = http
                     .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
                     .await?;
                 Ok(Some(if result.is_null() {
-                    let mut answer = json!({"updated": true, "updated_fields": fields});
+                    let mut answer = json!({"updated": written_any, "updated_fields": fields});
                     if !rejected.is_empty() {
                         answer["rejected_fields"] = Value::Object(rejected);
                     }
@@ -1932,8 +1981,28 @@ impl ToolHandler {
                 }))
             }
             "enrich_task" => {
-                let plan_id = extract_id(args, "plan_id")?;
                 let task_id = extract_id(args, "task_id")?;
+                // The task already belongs to a plan: `plan_id` is optional, and
+                // when it is given it must be that plan (never silently ignored).
+                let actual = http
+                    .get(&format!("/api/tasks/{}/plan", task_id))
+                    .await?
+                    .get("plan_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("task {task_id} belongs to no plan"))?;
+                let plan_id = match args.get("plan_id").filter(|v| !v.is_null()) {
+                    None => actual,
+                    Some(_) => {
+                        let given = extract_id(args, "plan_id")?;
+                        if !given.eq_ignore_ascii_case(&actual) {
+                            return Err(anyhow!(
+                                "plan_mismatch: task {task_id} belongs to plan {actual}, not {given} — nothing was enriched. Omit plan_id to use the task's plan"
+                            ));
+                        }
+                        actual
+                    }
+                };
                 let result = http
                     .post(
                         &format!("/api/plans/{}/tasks/{}/enrich", plan_id, task_id),
@@ -1989,6 +2058,7 @@ impl ToolHandler {
 
             "update_step" => {
                 let step_id = extract_id(args, "step_id")?;
+                refuse_unwritable_fields(args, STEP_UPDATE_KEYS, "step update", "step_id")?;
                 let (body, fields) = written_update_body(args, STEP_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
@@ -2176,12 +2246,22 @@ impl ToolHandler {
             }
 
             "supersede_decision" => {
-                // REST: /api/decisions/{new}/supersedes/{old}, which marks `old`.
-                // The MCP names are bound as they always were, so the decision
-                // marked superseded is `superseded_by_id`. Which one it is comes
-                // back in the answer: a change of direction is a separate change.
-                let new_id = extract_id(args, "decision_id")?;
-                let old_id = extract_id(args, "superseded_by_id")?;
+                // `decision_id: A, superseded_by_id: B` reads "A is superseded by
+                // B": A is the OLD decision, B the one that replaces it. The two
+                // were bound the other way round, so B — the new decision — was
+                // the one marked `superseded` (issue #1189).
+                // Compared as UUIDs: `extract_id` validates the format and returns the
+                // text, so `…ABC` and `…abc` are one decision, and the REST path
+                // (which normalises the id) would supersede it by itself.
+                let old_id = uuid::Uuid::parse_str(&extract_id(args, "decision_id")?)?;
+                let new_id = uuid::Uuid::parse_str(&extract_id(args, "superseded_by_id")?)?;
+                if old_id == new_id {
+                    return Err(anyhow!(
+                        "supersede_self: decision_id and superseded_by_id are the same \
+                         decision ({old_id}) — nothing was changed"
+                    ));
+                }
+                // REST: /api/decisions/{new}/supersedes/{old}
                 let result = http
                     .post(
                         &format!("/api/decisions/{}/supersedes/{}", new_id, old_id),
@@ -2189,15 +2269,21 @@ impl ToolHandler {
                     )
                     .await?;
                 Ok(Some(if result.is_null() {
+                    // Which one changed is part of the answer: a bare "ok" is
+                    // what let the inverted binding go unnoticed. `marked_superseded`
+                    // is the key the additive PR already answered with; `superseded`
+                    // says the same thing and is kept alongside it.
                     json!({
                         "status": "ok",
-                        "marked_superseded": old_id.to_string(),
-                        "superseded_by": new_id.to_string(),
+                        "marked_superseded": old_id,
+                        "superseded": old_id,
+                        "superseded_by": new_id,
                     })
                 } else {
                     result
                 }))
             }
+
             "get_decision_timeline" => {
                 let mut query = Vec::new();
                 if let Some(tid) = extract_optional_string(args, "task_id") {
@@ -7915,10 +8001,11 @@ mod tests {
         }
     }
 
-    /// `[]` is named in `rejected_fields` and clears nothing in this PR: the
-    /// clearing is a contract change, kept for the contract PR (#1223).
+    /// `[]` clears the list, as documented: `acceptance_criteria: []` and
+    /// `affected_files: []` are the way to empty them. This is a contract change
+    /// (a `[]` used to be dropped), so it lives in this PR only.
     #[tokio::test]
-    async fn an_empty_list_is_refused_by_name_and_clears_nothing() {
+    async fn an_empty_list_clears_the_criteria_and_the_files() {
         use crate::neo4j::traits::*;
         let (handler, graph, task_id) = real_handler_with_task().await;
         let result = handler
@@ -7934,17 +8021,473 @@ mod tests {
             .await
             .unwrap();
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
-        assert_eq!(stored.acceptance_criteria, vec!["old criterion"]);
-        assert_eq!(stored.affected_files, vec!["src/old.rs"]);
-        assert_eq!(result["updated_fields"], json!([]));
-        for key in ["acceptance_criteria", "affected_files"] {
+        assert!(stored.acceptance_criteria.is_empty());
+        assert!(stored.affected_files.is_empty());
+        assert_eq!(
+            result["updated_fields"],
+            json!(["acceptance_criteria", "affected_files"])
+        );
+        assert!(result.get("rejected_fields").is_none(), "{result}");
+    }
+
+    /// `decision supersede` against the real API: the answer names the decision
+    /// that was marked under `marked_superseded` (the key the additive PR already
+    /// answered with) and under `superseded`, and what it names is what changed.
+    #[tokio::test]
+    async fn supersede_answers_with_the_decision_marked_under_both_keys() {
+        use crate::neo4j::models::{DecisionNode, DecisionStatus};
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let decision = |label: &str| DecisionNode {
+            id: uuid::Uuid::new_v4(),
+            description: format!("decision {label}"),
+            rationale: "r".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "test".to_string(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let (old, new) = (decision("old"), decision("new"));
+        graph.create_decision(task_id, &old).await.unwrap();
+        graph.create_decision(task_id, &new).await.unwrap();
+
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": old.id.to_string(),
+                    "superseded_by_id": new.id.to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["marked_superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded"], old.id.to_string(), "{result}");
+        assert_eq!(result["superseded_by"], new.id.to_string(), "{result}");
+        let old_after = graph.get_decision(old.id).await.unwrap().unwrap();
+        let new_after = graph.get_decision(new.id).await.unwrap().unwrap();
+        assert_eq!(old_after.status, DecisionStatus::Superseded);
+        assert_eq!(new_after.status, DecisionStatus::Accepted);
+    }
+
+    /// The real router on a free port: its base URL.
+    async fn spawn_real_router(
+        graph: std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) -> String {
+        let app = crate::test_helpers::router_with_auth(graph).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base_url
+    }
+
+    /// A task of a plan behind the REAL router (not the fake server above):
+    /// the handler, the base URL, the plan id and the task id.
+    async fn real_router_with_plan_task() -> (ToolHandler, String, uuid::Uuid, uuid::Uuid) {
+        use crate::neo4j::traits::*;
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan_id = uuid::Uuid::new_v4();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        let base_url = spawn_real_router(graph).await;
+        let token = crate::test_helpers::test_bearer_token()
+            .trim_start_matches("Bearer ")
+            .to_string();
+        let handler = ToolHandler::new(McpHttpClient::new(base_url.clone(), Some(token)));
+        (handler, base_url, plan_id, task.id)
+    }
+
+    /// `GET /api/tasks/{id}/plan`, called with a JWT.
+    async fn real_task_plan_answer(base_url: &str, task_id: uuid::Uuid) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{base_url}/api/tasks/{task_id}/plan"))
+            .header("Authorization", crate::test_helpers::test_bearer_token())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The route answers the plan of a task, from the graph.
+    #[tokio::test]
+    async fn real_route_answers_the_plan_of_a_task() {
+        let (_, base_url, plan_id, task_id) = real_router_with_plan_task().await;
+        let resp = real_task_plan_answer(&base_url, task_id).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["plan_id"], json!(plan_id.to_string()), "{body}");
+    }
+
+    /// Without `plan_id` the enrich takes the task's plan from the real route:
+    /// the enrich call goes to `/api/plans/{plan}/tasks/{task}/enrich` with the
+    /// plan of the task. Either it succeeds, or its error names that very call
+    /// (not the plan lookup, not the argument).
+    #[tokio::test]
+    async fn real_task_enrich_without_plan_id_deduces_the_plan() {
+        let (handler, _, plan_id, task_id) = real_router_with_plan_task().await;
+        let enrich_path = format!("/api/plans/{plan_id}/tasks/{task_id}/enrich");
+        let outcome = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": task_id.to_string()})),
+            )
+            .await;
+        if let Err(err) = outcome {
+            let msg = err.to_string();
             assert!(
-                result["rejected_fields"][key]
-                    .as_str()
-                    .is_some_and(|why| why.contains("[]")),
-                "{key}: {result}"
+                msg.contains(&enrich_path),
+                "the enrich did not go to the task's plan: {msg}"
             );
         }
+    }
+
+    /// Another plan than the task's own is refused by name, before any request.
+    #[tokio::test]
+    async fn real_task_enrich_with_another_plan_is_refused_as_a_mismatch() {
+        let (handler, _, plan_id, task_id) = real_router_with_plan_task().await;
+        let other = uuid::Uuid::new_v4();
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "enrich",
+                    "task_id": task_id.to_string(),
+                    "plan_id": other.to_string(),
+                })),
+            )
+            .await
+            .expect_err("another plan is a mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("plan_mismatch"), "{msg}");
+        assert!(
+            msg.contains(&plan_id.to_string()) && msg.contains(&other.to_string()),
+            "{msg}"
+        );
+    }
+
+    /// A task the graph does not know has no plan: 404 on the route, and a
+    /// readable MCP error that says so.
+    #[tokio::test]
+    async fn real_task_enrich_of_an_unknown_task_is_a_readable_error() {
+        let (handler, base_url, _, _) = real_router_with_plan_task().await;
+        let unknown = uuid::Uuid::new_v4();
+        let resp = real_task_plan_answer(&base_url, unknown).await;
+        assert_eq!(resp.status(), 404);
+        let msg = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": unknown.to_string()})),
+            )
+            .await
+            .expect_err("a task with no plan cannot be enriched")
+            .to_string();
+        assert!(msg.contains("belongs to no plan"), "{msg}");
+    }
+
+    /// The route is behind the authentication of the protected API.
+    #[tokio::test]
+    async fn real_task_plan_route_refuses_a_call_without_authentication() {
+        let (_, base_url, _, task_id) = real_router_with_plan_task().await;
+        let resp = reqwest::get(format!("{base_url}/api/tasks/{task_id}/plan"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// The keys `task update` and `step update` now refuse are the published
+    /// parameters of the tool that the update does not write: they used to be
+    /// ignored. The list is the one in the PR description; a new published
+    /// parameter changes it, and this test says so.
+    #[tokio::test]
+    async fn task_and_step_update_refuse_exactly_the_published_keys_they_do_not_write() {
+        let (handler, _) = make_http_handler().await;
+        let tools = crate::mcp::tools::all_tools();
+        let cases: [(&str, &str, &[&str]); 2] = [
+            (
+                "task",
+                "task_id",
+                &[
+                    "custom_sections",
+                    "dependency_id",
+                    "dependency_ids",
+                    "depends_on",
+                    "limit",
+                    "offset",
+                    "plan_id",
+                    "priority_max",
+                    "priority_min",
+                    "project_id",
+                    "sort_by",
+                    "sort_order",
+                    "steps",
+                    "workspace_slug",
+                ],
+            ),
+            ("step", "step_id", &["task_id"]),
+        ];
+        for (tool, id_key, expected) in cases {
+            let definition = tools
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("{tool} is published"));
+            let mut args = serde_json::Map::new();
+            for key in definition
+                .input_schema
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .expect("published properties")
+                .keys()
+            {
+                args.insert(key.clone(), json!("x"));
+            }
+            args.insert("action".to_string(), json!("update"));
+            args.insert(id_key.to_string(), json!(UUID1));
+
+            let err = handler
+                .handle(tool, Some(Value::Object(args)))
+                .await
+                .expect_err("keys the update does not write are refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "cannot write {} — nothing was changed",
+                    expected.join(", ")
+                )),
+                "{tool}: {msg}"
+            );
+        }
+    }
+
+    /// The same decision written in two cases is still the same decision: the
+    /// guard compares UUIDs, not text. Without it the request reached REST, which
+    /// normalises the id, and the decision was marked superseded by itself.
+    #[tokio::test]
+    async fn supersede_refuses_the_same_decision_whatever_the_case_of_its_uuid() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "superseded_by_id": "550E8400-E29B-41D4-A716-446655440000",
+                })),
+            )
+            .await
+            .expect_err("the same decision in two cases");
+        assert!(err.to_string().contains("supersede_self"), "{err}");
+    }
+
+    /// A key the API writes but the tool does not publish (`due_date`) next to a
+    /// published one used to be ignored in silence while the answer said
+    /// `updated`. It is refused by name, and nothing is written (#1189 §1).
+    #[tokio::test]
+    async fn an_unpublished_key_mixed_with_published_ones_is_refused_by_name() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let before = graph.get_task(task_id).await.unwrap().unwrap();
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "title": "new title",
+                    "due_date": "2026-12-01",
+                    "estimated_minutes": 30,
+                })),
+            )
+            .await
+            .expect_err("an unwritable key mixed with a written one is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "unsupported_fields: task update cannot write due_date, estimated_minutes"
+            ),
+            "{msg}"
+        );
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.title, before.title, "nothing was changed");
+    }
+
+    /// Only published-and-written fields: still goes through.
+    #[tokio::test]
+    async fn an_update_with_only_written_fields_still_goes_through() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "title": "new title",
+                })),
+            )
+            .await
+            .expect("written fields only");
+        assert_eq!(result["updated_fields"], json!(["title"]), "{result}");
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.title.as_deref(), Some("new title"));
+    }
+
+    /// The same on a step: `order` next to a written field is refused by name.
+    #[tokio::test]
+    async fn step_update_with_an_unpublished_key_mixed_is_refused_by_name() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({"action": "update", "step_id": UUID1, "status": "completed", "order": 3})),
+            )
+            .await
+            .expect_err("order is not written");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("order"),
+            "{msg}"
+        );
+    }
+
+    /// An unwritable key alone is refused, by name (it was `empty_update`).
+    #[tokio::test]
+    async fn step_update_with_only_an_unpublished_key_is_refused_by_name() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({"action": "update", "step_id": UUID1, "order": 3})),
+            )
+            .await
+            .expect_err("nothing is written");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("order"),
+            "{msg}"
+        );
+    }
+
+    /// The same on a task, against the real API.
+    #[tokio::test]
+    async fn task_update_with_only_an_unpublished_key_is_refused_by_name() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "model_alias": "opus",
+                })),
+            )
+            .await
+            .expect_err("nothing is written");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported_fields") && msg.contains("model_alias"),
+            "{msg}"
+        );
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.due_date, None);
+    }
+
+    /// A server that knows the plan of the task UUID1 and echoes the rest.
+    async fn make_handler_with_task_plan(plan: &'static str) -> ToolHandler {
+        let app = Router::new()
+            .route(
+                "/api/tasks/{task_id}/plan",
+                axum::routing::get(move || async move {
+                    axum::Json(json!({"task_id": UUID1, "plan_id": plan}))
+                }),
+            )
+            .fallback(any(echo_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ToolHandler::new(McpHttpClient::new(base_url, Some("test-token".to_string())))
+    }
+
+    /// `task enrich` asked for a `plan_id` the task already carries. Without it
+    /// the plan is the task's own (#1189 §6).
+    #[tokio::test]
+    async fn task_enrich_without_plan_id_uses_the_plan_of_the_task() {
+        let handler = make_handler_with_task_plan(UUID2).await;
+        let result = handler
+            .handle("task", Some(json!({"action": "enrich", "task_id": UUID1})))
+            .await
+            .expect("plan_id is optional");
+        assert_eq!(
+            result["path"],
+            json!(format!("/api/plans/{UUID2}/tasks/{UUID1}/enrich")),
+            "{result}"
+        );
+    }
+
+    /// A `plan_id` that is the task's plan is accepted; another one is refused
+    /// by name, never ignored.
+    #[tokio::test]
+    async fn task_enrich_with_another_plan_id_is_refused_as_a_mismatch() {
+        let handler = make_handler_with_task_plan(UUID2).await;
+        handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .expect("the task's own plan is fine");
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({"action": "enrich", "task_id": UUID1, "plan_id": UUID1})),
+            )
+            .await
+            .expect_err("another plan is a mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("plan_mismatch"), "{msg}");
+        assert!(msg.contains(UUID2), "{msg}");
+    }
+
+    /// A list refused by name and nothing else: nothing was written, so the
+    /// answer says `updated: false` (in #1221 it said `true`, as on main).
+    #[tokio::test]
+    async fn a_refused_list_alone_answers_updated_false() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "acceptance_criteria": "one plain string",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["updated"], false, "{result}");
+        assert_eq!(result["updated_fields"], json!([]));
+        assert!(result["rejected_fields"]["acceptance_criteria"].is_string());
+        assert_eq!(
+            graph
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .acceptance_criteria,
+            vec!["old criterion"]
+        );
     }
 
     /// `updated_fields` names what was written, and only that: a `null` writes
@@ -7978,6 +8521,108 @@ mod tests {
         assert_eq!(stored.acceptance_criteria, vec!["new criterion"]);
         assert_eq!(stored.priority, before.priority, "null wrote nothing");
         assert_eq!(stored.tags, before.tags, "null wrote nothing");
+    }
+
+    /// A field `update` cannot write is refused by name, before any request.
+    #[tokio::test]
+    async fn task_update_refuses_a_field_it_cannot_write() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": UUID1,
+                    "title": "t",
+                    "steps": [{"description": "s"}],
+                    "depends_on": [UUID2],
+                })),
+            )
+            .await
+            .expect_err("steps and depends_on are not written by update");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported_fields"), "{msg}");
+        // The refused fields are named, and only they are.
+        assert!(
+            msg.contains("cannot write depends_on, steps — nothing was changed"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_update_refuses_a_field_it_cannot_write() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "step",
+                Some(json!({
+                    "action": "update",
+                    "step_id": UUID1,
+                    "description": "d",
+                    "task_id": UUID2,
+                })),
+            )
+            .await
+            .expect_err("task_id is a published parameter that step update does not write");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported_fields"), "{msg}");
+        assert!(msg.contains("task_id"), "{msg}");
+    }
+
+    /// `decision_id: A, superseded_by_id: B` reads "A is superseded by B". The
+    /// handler sent it the other way round: B was marked superseded.
+    #[tokio::test]
+    async fn supersede_marks_decision_id_as_superseded_by_superseded_by_id() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": UUID1,
+                    "superseded_by_id": UUID2,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        // REST: /api/decisions/{new}/supersedes/{old}
+        assert_eq!(
+            result["path"],
+            format!("/api/decisions/{UUID2}/supersedes/{UUID1}")
+        );
+    }
+
+    /// A decision does not supersede itself: refused before any request.
+    #[tokio::test]
+    async fn supersede_refuses_the_same_decision_on_both_sides() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": UUID1,
+                    "superseded_by_id": UUID1,
+                })),
+            )
+            .await
+            .expect_err("same id on both sides");
+        assert!(err.to_string().contains("supersede_self"), "{err}");
+    }
+
+    /// An update that names no writable field changes nothing: it is refused,
+    /// not answered `updated: true`.
+    #[tokio::test]
+    async fn an_update_without_any_writable_field_is_refused() {
+        let (handler, _) = make_http_handler().await;
+        for (tool, id_key) in [("task", "task_id"), ("step", "step_id")] {
+            let err = handler
+                .handle(tool, Some(json!({"action": "update", id_key: UUID1})))
+                .await
+                .expect_err("nothing to write");
+            assert!(err.to_string().contains("empty_update"), "{tool}: {err}");
+        }
     }
 
     #[tokio::test]
