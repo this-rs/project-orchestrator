@@ -3842,6 +3842,13 @@ mod with_the_feature {
             .upsert_file(&a_file(&wanted_path, "rust", Some(wanted.id)))
             .await
             .unwrap();
+        // A file of the SAME project that does not end with the suffix: it sorts
+        // before the wanted one, so only the suffix filter keeps it out of the
+        // answer (without a filter this test would not see the difference).
+        store
+            .upsert_file(&a_file("z-wanted/README.md", "markdown", Some(wanted.id)))
+            .await
+            .unwrap();
         // A project that does not exist: the node is written, nothing contains it.
         let ghost = Uuid::new_v4();
         store
