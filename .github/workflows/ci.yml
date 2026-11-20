@@ -385,6 +385,11 @@ jobs:
         run: cargo xtask containment
       - name: path-pins — les voisins sont à leur commit épinglé
         run: cargo xtask path-pins
+      # Cliquet de la migration Neo4j → obrain (docs/migration/GATES.md, G2-G3) :
+      # un trait de contrat porté à la main ne peut pas perdre son port, et le
+      # backend par défaut reste neo4j tant que la migration n'est pas finie.
+      - name: migration-gate — les traits portés ne régressent pas, le défaut reste neo4j
+        run: cargo xtask migration-gate --strict
 
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
