@@ -14,4 +14,4 @@ pub use traits::SearchStore;
 // selects `storage.backend = "memory"` gets it through the `mock-store`
 // feature (see src/neo4j/mod.rs for the same gate).
 #[cfg(any(test, feature = "mock-store"))]
-pub(crate) mod mock;
+pub mod mock;

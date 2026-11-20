@@ -4744,8 +4744,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ///
     /// Cleanup order:
     /// 1. Lookup project (get name + slug before deletion)
-    /// 2. MeiliSearch: delete code documents (best-effort)
-    /// 3. Neo4j: archive notes/decisions, cascade delete structural entities
+    /// 2. Graph: archive notes/decisions, cascade delete structural entities
+    /// 3. Search: delete code documents (best-effort), only once the graph
+    ///    deletion SUCCEEDED — a refused or failed deletion leaves the project,
+    ///    and it must keep its code index (the obrain graph refuses the cascade).
     /// 4. Emit CrudEvent with slug in payload
     pub async fn delete_project(&self, id: Uuid) -> Result<()> {
         // Lookup project before deleting — we need the name and slug
@@ -4755,7 +4757,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .await?
             .ok_or_else(|| anyhow::anyhow!("Project {} not found", id))?;
 
-        // MeiliSearch cleanup — best-effort, don't block deletion on failure
+        // Graph cascade delete (archives notes/decisions, deletes everything else)
+        self.neo4j().delete_project(id, &project.name).await?;
+
+        // Search cleanup — best-effort, the project is already gone
         if let Err(e) = self.meili().delete_code_for_project(&project.slug).await {
             tracing::warn!(
                 "Failed to delete MeiliSearch code documents for project '{}': {}",
@@ -4763,9 +4768,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 e
             );
         }
-
-        // Neo4j cascade delete (archives notes/decisions, deletes everything else)
-        self.neo4j().delete_project(id, &project.name).await?;
 
         // Emit event with slug in payload for subscribers (watcher bridge, etc.)
         let mut payload = serde_json::Map::new();

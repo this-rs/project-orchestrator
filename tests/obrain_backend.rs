@@ -93,7 +93,6 @@ mod with_the_feature {
     use super::*;
     use chrono::Utc;
     use obrain_common::types::Value;
-    use project_orchestrator::meilisearch::SearchStore;
     use project_orchestrator::neo4j::models::{
         CommitNode, FileChangedInfo, FileNode, PlanNode, PlanStatus, ProgressKind, ProjectNode,
         ProjectProfile,
@@ -104,7 +103,7 @@ mod with_the_feature {
         refusees_analytics, refusees_chat, refusees_code, refusees_commit, refusees_decision,
         refusees_featuregraph, refusees_note, refusees_persona, refusees_plan, refusees_planrun,
         refusees_protocolrun, refusees_release, refusees_sharing, refusees_skill, Creation,
-        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, RapportOuverture,
         FLUSH_COMPLET_APRES_OCTETS, MARQUEUR_PO, PLAFOND_WAL_OBRAIN, REFUS_ECRITS_A_LA_MAIN,
         SCHEMA_PO,
     };
@@ -301,15 +300,23 @@ mod with_the_feature {
             fields(&backend.graph.get_project(p.id).await.unwrap().unwrap()),
             fields(&p)
         );
-        // …and the rest of the storage refuses by name, graph, search and
+        // …and the rest of the storage refuses by name, graph and
         // trajectories alike.
         assert_eq!(
             not_ported(backend.graph.compute_coupling_matrix(Uuid::new_v4()).await),
             NonPorte("WorkspaceStore::compute_coupling_matrix")
         );
+        // …the search store is the obrain one: ported, it answers (an empty index
+        // says so with a count, not with a refusal).
+        assert!(backend.search.health_check().await.unwrap());
         assert_eq!(
-            not_ported(backend.search.delete_code("x").await),
-            NonPorte("SearchStore::delete_code")
+            backend
+                .search
+                .get_code_stats()
+                .await
+                .unwrap()
+                .total_documents,
+            0
         );
         let trajectories = backend.trajectories.count().await.unwrap_err();
         assert!(
@@ -2004,10 +2011,6 @@ mod with_the_feature {
         assert_eq!(
             not_ported(store.get_progress_batch(ProgressKind::Project, &[id]).await),
             NonPorte("GraphStore::get_progress_batch")
-        );
-        assert_eq!(
-            not_ported(ObrainSearchStore.delete_code("x").await),
-            NonPorte("SearchStore::delete_code")
         );
 
         // The message is the stated one.

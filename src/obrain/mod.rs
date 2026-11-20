@@ -122,6 +122,7 @@ mod project;
 mod protocol;
 mod protocolrun;
 mod release;
+mod search;
 mod sharing;
 mod skill;
 mod step;
@@ -504,6 +505,9 @@ pub struct RapportOuverture {
     /// Plans whose `unlink_plan_from_project` was interrupted after its marker:
     /// finished at open (`constraint.rs`).
     pub deliaisons_achevees: usize,
+    /// Search documents (`search.rs`) whose searchable text disagreed with their
+    /// document (an update cut between the two writes): recomputed from the document.
+    pub recherches_reparees: usize,
 }
 
 /// The graph store on obrain.
@@ -567,6 +571,8 @@ struct Etat {
     partage: sharing::IndexPartage,
 
     code: code::IndexCode,
+
+    recherche: search::IndexRecherche,
 
     analyse: analytics::IndexAnalyse,
 }
@@ -1010,6 +1016,9 @@ impl ObrainGraphStore {
         let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
         let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
 
+        let recherche =
+            search::IndexRecherche::reconstruire(&db, &mut rapport).with_context(contexte)?;
+
         let etat = Etat {
             projets,
             plans,
@@ -1036,6 +1045,8 @@ impl ObrainGraphStore {
             partage,
 
             code,
+
+            recherche,
 
             analyse,
         };
@@ -1218,10 +1229,7 @@ impl GraphStore for ObrainGraphStore {
     }
 }
 
-/// The search store of the obrain backend: nothing is ported, every method of
-/// `SearchStore` is refused by name (generated).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ObrainSearchStore;
+pub use search::ObrainSearchStore;
 
 /// The trajectory store of the obrain backend: nothing is ported.
 ///
