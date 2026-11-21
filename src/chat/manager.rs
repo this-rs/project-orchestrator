@@ -601,6 +601,9 @@ pub struct ActiveSession {
     /// Capped at `OBJECTIVE_REMINDER_MAX_IN_A_ROW`: past it the tracker stays silent until the
     /// agent works again (a reminder that is answered by text only, every turn, is a loop).
     pub objective_reminders_in_a_row: Arc<AtomicU32>,
+    /// The store's state of the session's linked tasks at the last reminder, the
+    /// reference real progress is judged against (`post_stream::made_progress`).
+    pub(crate) objective_baseline: super::post_stream::ProgressBaseline,
     /// Accumulates work performed during the session: files modified, files read,
     /// steps completed, last tool used. Source of truth for resumption after
     /// compaction or max_turns.
@@ -2873,7 +2876,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                     "objective_tracking",
                     super::post_stream::objective_reminder(
                         &self.graph,
-                        ctx.project_slug.as_deref(),
+                        uuid,
                         &self.session.objectives,
                         turn,
                         self.work_summary(),
@@ -8652,8 +8655,12 @@ impl ChatManager {
                     // is noise it never asked for (measured 17/10/2026: an extra unrequested
                     // turn, ~9.4k cache tokens, to answer a reminder meant for someone else).
                     objective_tracking: tracks_own_objectives(request.spawned_by.is_some()),
+                    // A fresh session: the full allowance of reminders.
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(
+                        super::post_stream::ObjectiveCounters::initial_in_a_row(false),
+                    )),
+                    objective_baseline: Default::default(),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
                     provider_outage: Arc::new(std::sync::Mutex::new(
@@ -13939,6 +13946,13 @@ impl ChatManager {
         let mirror_tap = self.mirror_tap(session_id);
         let parent =
             super::cancelled_parents::parent_checked_on_resume(session_node.spawned_by.as_deref());
+        // The reference real progress is judged against, read before the first turn of the
+        // reopened session (`ObjectiveCounters::reopening_baseline`).
+        let objective_baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
+            &self.graph,
+            Some(session_node.id),
+        )
+        .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // B36-RACE: a child the warm pool resumes for a new delegation, whose parent a
@@ -14008,8 +14022,13 @@ impl ChatManager {
                     // child stays one — it must not start receiving the parent's objective
                     // reminders just because it crossed a restart.
                     objective_tracking: tracks_own_objectives(session_node.spawned_by.is_some()),
+                    // A reopened session: the allowance stays spent until real progress
+                    // (`ObjectiveCounters::opening`), so reopening never rearms it.
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(
+                        super::post_stream::ObjectiveCounters::initial_in_a_row(true),
+                    )),
+                    objective_baseline: objective_baseline.clone(),
                     work_log: work_log.clone(),
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
@@ -18332,6 +18351,7 @@ impl ChatManager {
             false,
             mcp_names,
             super::cancelled_parents::parent_of(request.spawned_by.as_deref()),
+            false,
         )
         .await?;
         // Live: the token and the router are the session's now (a refusal above left
@@ -18483,10 +18503,13 @@ impl ChatManager {
     }
 
     /// The end-of-turn state of the agent session `session_id`, from its node: its
-    /// memory conversation, the protocol run it was spawned in. Objective tracking is
-    /// on, as for every Claude Code session, EXCEPT for a child of a conversation: a
-    /// sub-agent's objective is the prompt it was given, never the project's backlog.
-    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// follows the rule of the Claude Code engine (`tracks_own_objectives`): off for any
+    /// session with a `spawned_by`.
+    ///
+    /// `reopened`: the session is opened again (resume, restart, engine switch), so its
+    /// objective reminders start spent ([`super::post_stream::ObjectiveCounters::opening`]).
+    async fn agent_turn_state(&self, session_id: &str, reopened: bool) -> AgentTurnState {
         let node = match Uuid::parse_str(session_id) {
             Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
             Err(_) => None,
@@ -18505,15 +18528,15 @@ impl ChatManager {
             .as_ref()
             .and_then(|n| n.spawned_by.as_deref())
             .and_then(parse_spawned_by);
-        // A child of a conversation is a sub-agent: its objective is the prompt it was
-        // given. The objective reminder reads the PROJECT's pending tasks
-        // (`post_stream::objective_reminder`), so on a child it nags about work the child
-        // never took — and the child pays a whole extra billed turn to answer it.
-        // Measured 17/10/2026 on a throwaway child: 9 413 cache-creation tokens, 600
-        // output tokens, $0.0094, for a task list that was never its own.
-        let subagent = spawned
+        // A spawned session's objective is the prompt it was given (measured 17/10/2026
+        // on a throwaway child: a reminder cost it an extra billed turn, 9 413
+        // cache-creation tokens). The rule of the Claude Code engine, one function for both
+        // (`tracks_own_objectives`): any session with a `spawned_by` — conversation
+        // sub-agent, delegation, runner, pipeline, gate, trigger, protocol runner — does
+        // not track objectives. A session whose node cannot be read is not tracked either.
+        let tracks = node
             .as_ref()
-            .is_some_and(|ctx| ctx.spawn_type == "conversation");
+            .is_some_and(|n| tracks_own_objectives(n.spawned_by.is_some()));
         // What waited for this session's next turn before it closed or the server
         // restarted.
         let held = self.held_slot(session_id).await;
@@ -18533,16 +18556,22 @@ impl ChatManager {
             }
             None => None,
         };
+        let mut objectives = super::post_stream::ObjectiveCounters::opening(tracks, reopened);
+        if reopened && tracks {
+            // The reference, read before the first turn of the reopened session.
+            objectives.baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
+                &self.graph,
+                node.as_ref().map(|n| n.id),
+            )
+            .await;
+        }
         AgentTurnState {
             memory,
             context_window,
             protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
             held,
             protocol_state: spawned.and_then(|s| s.protocol_state),
-            objectives: super::post_stream::ObjectiveCounters {
-                enabled: !subagent,
-                ..Default::default()
-            },
+            objectives,
             ..Default::default()
         }
     }
@@ -18557,7 +18586,9 @@ impl ChatManager {
     /// (`session_grants::declarations_for_project`). `lasting`: the person and project whose
     /// lasting approvals the session keeps and obeys (`None`: `always` is not offered).
     /// `resumed`: a resumed session starts with its shell taken as moved unless it is known
-    /// it never moved ([`Self::session_grants_for`]).
+    /// it never moved ([`Self::session_grants_for`]). `reopened`: an existing session opened
+    /// again (resume, restart, provider switch — unlike `resumed`, a switch counts), whose
+    /// objective reminders start spent ([`super::post_stream::ObjectiveCounters::opening`]).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -18574,6 +18605,7 @@ impl ChatManager {
         resumed: bool,
         mcp_names: Vec<String>,
         parent: Option<String>,
+        reopened: bool,
     ) -> std::result::Result<(), super::cancelled_parents::ParentCancelled> {
         // What the provider's kind tells beyond its capabilities (an unknown window on
         // the native harness, no sub-agents and no fallback).
@@ -18646,7 +18678,7 @@ impl ChatManager {
                 tool_policy,
                 Some(
                     self.turn_services_with(
-                        self.agent_turn_state(session_id).await,
+                        self.agent_turn_state(session_id, reopened).await,
                         // Claude Code runs its sub-agents itself: they get read-only mirrors
                         // (P18c). A native session's sub-agents are real children already.
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
@@ -19363,6 +19395,9 @@ impl ChatManager {
             // B36-RACE: a warm child the pool resumes for a delegation is refused like a fresh
             // one; a person resuming it passes (B36-RACE-RESUME).
             super::cancelled_parents::parent_checked_on_resume(node.spawned_by.as_deref()),
+            // Reopened (a resume, a restart, a provider switch alike): its objective
+            // reminders start spent, rearmed only by real progress.
+            true,
         )
         .await?;
         cleanup.disarm();
@@ -33037,6 +33072,7 @@ mod tests {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+            objective_baseline: Default::default(),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             provider_outage: Arc::new(std::sync::Mutex::new(
                 crate::chat::provider::outage::TurnHold::new(
@@ -35327,6 +35363,7 @@ mod tests {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+            objective_baseline: Default::default(),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             provider_outage: Arc::new(std::sync::Mutex::new(
                 crate::chat::provider::outage::TurnHold::new(
@@ -40503,6 +40540,7 @@ pub(crate) mod test_support {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+            objective_baseline: Default::default(),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -41134,7 +41172,7 @@ mod held_context_tests {
     async fn a_failed_clear_is_retried_on_the_next_turn() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
         mock.fail_llm_setting_writes(HeldContext::KEY, true);
@@ -41145,7 +41183,7 @@ mod held_context_tests {
             "the store refused the clear"
         );
         assert!(s.session.held.unsynced(), "and the slot knows it");
-        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
         assert!(
             !prepared(&reopened, &sid, "two").await.contains(HELD),
             "a reopen keeps memory over a store known to be behind"
@@ -41175,7 +41213,7 @@ mod held_context_tests {
     async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.step_budget = Duration::from_secs(1);
         s.after_turn(&sid, &compacted()).await;
         mock.stall_llm_setting_deletes(HeldContext::KEY);
@@ -41240,7 +41278,7 @@ mod held_context_tests {
     #[tokio::test]
     async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
         let (manager, sid) = world().await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.step_budget = Duration::from_millis(500);
         s.stall_step = Some("objective_tracking");
         let s = Arc::new(s);
@@ -41252,7 +41290,7 @@ mod held_context_tests {
             s.session.held.held().context.is_some()
         })
         .await;
-        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
         turn.await.unwrap();
         assert!(
             prepared(&reopened, &sid, "next").await.contains(HELD),
@@ -41274,7 +41312,7 @@ mod held_context_tests {
     #[tokio::test]
     async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
         let (manager, sid) = world().await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         s.step_budget = Duration::from_millis(500);
         s.stall_step = Some("context");
@@ -41287,7 +41325,7 @@ mod held_context_tests {
             s.session.held.held().is_empty()
         })
         .await;
-        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
         assert!(
             !prepared(&reopened, &sid, "next").await.contains(HELD),
             "not reloaded from the store the clear has not reached yet"
@@ -41302,11 +41340,11 @@ mod held_context_tests {
     async fn a_store_read_error_at_reopen_keeps_memory() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         assert!(!s.session.held.unsynced());
         mock.fail_llm_setting_reads(HeldContext::KEY, true);
-        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
         assert!(
             prepared(&reopened, &sid, "next").await.contains(HELD),
             "a read error is not an empty context"
@@ -41322,7 +41360,7 @@ mod held_context_tests {
     async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         assert!(!s.session.held.unsynced());
         mock.stall_llm_setting_reads(HeldContext::KEY);
@@ -41360,7 +41398,7 @@ mod held_context_tests {
     async fn a_failed_write_is_retried_without_a_turn() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         mock.fail_llm_setting_writes(HeldContext::KEY, true);
         s.after_turn(&sid, &answered()).await;
@@ -41386,7 +41424,7 @@ mod held_context_tests {
     async fn a_store_write_that_never_answers_releases_the_lock() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.step_budget = Duration::from_millis(100);
         s.after_turn(&sid, &compacted()).await;
         mock.stall_llm_setting_deletes(HeldContext::KEY);
@@ -41406,7 +41444,7 @@ mod held_context_tests {
     #[tokio::test]
     async fn a_compaction_without_a_fresh_context_holds_what_the_turn_carried() {
         let (manager, sid) = world().await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.step_budget = Duration::from_millis(200);
         s.stall_step = Some("post_compaction");
         let carried = HeldContext {
@@ -41432,10 +41470,10 @@ mod held_context_tests {
     #[tokio::test]
     async fn the_held_context_survives_a_restart() {
         let (manager, sid) = world().await;
-        let before = services(&manager, manager.agent_turn_state(&sid).await);
+        let before = services(&manager, manager.agent_turn_state(&sid, false).await);
         before.after_turn(&sid, &compacted()).await;
         drop(before);
-        let after = services(&manager, manager.agent_turn_state(&sid).await);
+        let after = services(&manager, manager.agent_turn_state(&sid, false).await);
         let sent = prepared(&after, &sid, "next").await;
         assert!(sent.contains("Post-Compaction Context"), "{sent}");
     }
@@ -41447,7 +41485,7 @@ mod held_context_tests {
     #[tokio::test]
     async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
         let (manager, sid) = world().await;
-        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.after_turn(&sid, &compacted()).await;
         let first = prepared(&s, &sid, "one").await;
         assert!(first.contains("Post-Compaction Context"));
@@ -41477,7 +41515,7 @@ mod held_context_tests {
     async fn the_post_tool_advice_is_dropped_only_once_a_turn_is_answered() {
         use super::super::agent_runtime::TurnServices as _;
         let (manager, sid) = world().await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.hook_fallback = Some(Arc::new(super::super::provider::hooks::HookFallback::new(
             Arc::new(super::super::provider::hooks::TestAdvisor),
             Arc::new(super::super::hook_ledger::HookLedger::new()),
@@ -41542,7 +41580,7 @@ mod held_context_tests {
     #[tokio::test]
     async fn a_stuck_step_does_not_take_the_next_ones_with_it() {
         let (manager, sid) = world().await;
-        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
         s.step_budget = Duration::from_millis(100);
         s.stall_step = Some("context");
         let started = std::time::Instant::now();
@@ -41564,6 +41602,299 @@ mod held_context_tests {
             "the objective step still ran after the stuck one"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // ── Objective reminders on the agent engine: scoped to the session, bounded ──────
+
+    use super::super::post_stream::{OBJECTIVE_REMINDER_MARKER, OBJECTIVE_REMINDER_MAX_IN_A_ROW};
+    use crate::neo4j::models::{LinkedTaskInfo, TaskStatus};
+
+    /// [`world_on`] with the session's `spawned_by`.
+    async fn world_spawned(
+        mock: Arc<crate::neo4j::mock::MockGraphStore>,
+        spawned_by: Option<String>,
+    ) -> (ChatManager, String) {
+        let graph: Arc<dyn GraphStore> = mock;
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            test_config(),
+        );
+        let mut session = crate::test_helpers::test_chat_session(Some("held"));
+        session.spawned_by = spawned_by;
+        graph.create_chat_session(&session).await.unwrap();
+        (manager, session.id.to_string())
+    }
+
+    async fn agent_task(
+        mock: &crate::neo4j::mock::MockGraphStore,
+        status: TaskStatus,
+        title: &str,
+    ) -> Uuid {
+        let mut task = crate::test_helpers::test_task_titled(title);
+        task.status = status;
+        mock.create_task(Uuid::new_v4(), &task).await.unwrap();
+        task.id
+    }
+
+    async fn link(mock: &crate::neo4j::mock::MockGraphStore, sid: &str, task: Uuid) {
+        mock.session_links
+            .write()
+            .await
+            .entry(sid.parse().unwrap())
+            .or_default()
+            .linked_tasks
+            .push(LinkedTaskInfo {
+                id: task,
+                title: String::new(),
+                source: "auto".into(),
+            });
+    }
+
+    /// Reminders a turn of the agent engine queued.
+    async fn reminded(s: &ManagerTurnServices, sid: &str, outcome: &TurnOutcome) -> usize {
+        s.after_turn(sid, outcome)
+            .await
+            .hints
+            .iter()
+            .filter(|h| h.contains(OBJECTIVE_REMINDER_MARKER))
+            .count()
+    }
+
+    fn with_tools(tools: Vec<(&str, serde_json::Value)>) -> TurnOutcome {
+        TurnOutcome {
+            tools: tools.into_iter().map(|(t, i)| (t.to_string(), i)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn read_turn() -> TurnOutcome {
+        with_tools(vec![(
+            "Read",
+            serde_json::json!({"file_path": "src/lib.rs"}),
+        )])
+    }
+
+    /// (a) A session with no linked task is never reminded on the agent engine, though
+    /// its project has tasks to do; (b) a linked one sees only its own task.
+    #[tokio::test]
+    async fn the_agent_engine_reminds_a_session_of_its_own_tasks_only() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        agent_task(&mock, TaskStatus::InProgress, "Foreign work").await;
+        let (manager, unlinked) = world_spawned(mock.clone(), None).await;
+        let s = services(&manager, manager.agent_turn_state(&unlinked, false).await);
+        for _ in 0..3 {
+            assert_eq!(reminded(&s, &unlinked, &TurnOutcome::default()).await, 0);
+        }
+        let (manager, linked) = world_spawned(mock.clone(), None).await;
+        let mine = agent_task(&mock, TaskStatus::InProgress, "My work").await;
+        link(&mock, &linked, mine).await;
+        let s = services(&manager, manager.agent_turn_state(&linked, false).await);
+        let after = s.after_turn(&linked, &TurnOutcome::default()).await;
+        let hint = after
+            .hints
+            .iter()
+            .find(|h| h.contains(OBJECTIVE_REMINDER_MARKER))
+            .expect("a reminder");
+        assert!(
+            hint.contains("My work [in_progress]") && !hint.contains("Foreign work"),
+            "{hint}"
+        );
+    }
+
+    /// (d) reminder → Read → end, repeated: at most the cap. Calls that change nothing in
+    /// the store — a failed or same-status `task update`, an update of a task not linked
+    /// to the session, `git commit --dry-run`, a commit a hook refused — rearm nothing;
+    /// (e) a real status change of a linked task does.
+    #[tokio::test]
+    async fn the_agent_engine_rearms_only_on_a_change_in_the_store() {
+        use serde_json::json;
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_spawned(mock.clone(), None).await;
+        let mine = agent_task(&mock, TaskStatus::InProgress, "My work").await;
+        let foreign = agent_task(&mock, TaskStatus::Pending, "Not mine").await;
+        link(&mock, &sid, mine).await;
+        let s = services(&manager, manager.agent_turn_state(&sid, false).await);
+        let mut total = 0;
+        for _ in 0..6 {
+            total += reminded(&s, &sid, &TurnOutcome::default()).await;
+            total += reminded(&s, &sid, &read_turn()).await;
+        }
+        assert_eq!(total as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+
+        let update = |task: Uuid, status: &str| {
+            (
+                "mcp__project-orchestrator__task",
+                json!({"action": "update", "task_id": task.to_string(), "status": status}),
+            )
+        };
+        // A failed update (the store refused it: unchanged) and a same-status update.
+        total += reminded(&s, &sid, &with_tools(vec![update(mine, "completed")])).await;
+        total += reminded(&s, &sid, &with_tools(vec![update(mine, "in_progress")])).await;
+        // An update of a task that is not this session's, really applied.
+        mock.tasks.write().await.get_mut(&foreign).unwrap().status = TaskStatus::Completed;
+        total += reminded(&s, &sid, &with_tools(vec![update(foreign, "completed")])).await;
+        // A dry-run commit, a commit refused by its hook: nothing recorded.
+        total += reminded(
+            &s,
+            &sid,
+            &with_tools(vec![(
+                "Bash",
+                json!({"command": "git commit --dry-run -m x"}),
+            )]),
+        )
+        .await;
+        total += reminded(
+            &s,
+            &sid,
+            &with_tools(vec![("Bash", json!({"command": "git commit -m x"}))]),
+        )
+        .await;
+        for _ in 0..3 {
+            total += reminded(&s, &sid, &TurnOutcome::default()).await;
+        }
+        assert_eq!(
+            total as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW,
+            "no call that left the store unchanged rearmed the reminders"
+        );
+
+        // The positive case: a step of the linked task really completed in the store.
+        let step = crate::test_helpers::test_step(1, "the step");
+        mock.create_step(mine, &step).await.unwrap();
+        reminded(&s, &sid, &read_turn()).await; // the new step is seen, still pending
+        mock.steps.write().await.get_mut(&step.id).unwrap().status =
+            crate::neo4j::models::StepStatus::Completed;
+        assert_eq!(reminded(&s, &sid, &read_turn()).await, 0, "a working turn");
+        assert_eq!(
+            reminded(&s, &sid, &TurnOutcome::default()).await,
+            1,
+            "rearmed by the real change"
+        );
+    }
+
+    /// A session reopened (resume, restart, engine switch) starts with its reminders
+    /// spent: three reopenings in a row, without progress, add none to the first run's cap.
+    #[tokio::test]
+    async fn the_agent_engine_never_rearms_on_a_reopening() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_spawned(mock.clone(), None).await;
+        let mine = agent_task(&mock, TaskStatus::Pending, "My work").await;
+        link(&mock, &sid, mine).await;
+        let first = services(&manager, manager.agent_turn_state(&sid, false).await);
+        let mut total = 0;
+        for _ in 0..5 {
+            total += reminded(&first, &sid, &TurnOutcome::default()).await;
+        }
+        for _ in 0..3 {
+            let again = services(&manager, manager.agent_turn_state(&sid, true).await);
+            for _ in 0..5 {
+                total += reminded(&again, &sid, &TurnOutcome::default()).await;
+            }
+        }
+        assert_eq!(total as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+    }
+
+    /// Reopened on the agent engine, then real progress during its very first turn: the
+    /// reference was read at the reopening, so the progress is seen and rearms.
+    #[tokio::test]
+    async fn the_agent_engine_sees_progress_in_the_first_turn_after_a_reopening() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_spawned(mock.clone(), None).await;
+        let done_soon = agent_task(&mock, TaskStatus::InProgress, "Done soon").await;
+        let next = agent_task(&mock, TaskStatus::Pending, "Next").await;
+        link(&mock, &sid, done_soon).await;
+        link(&mock, &sid, next).await;
+        let s = services(&manager, manager.agent_turn_state(&sid, true).await);
+        mock.tasks.write().await.get_mut(&done_soon).unwrap().status = TaskStatus::Completed;
+        assert_eq!(reminded(&s, &sid, &read_turn()).await, 0);
+        assert_eq!(
+            reminded(&s, &sid, &TurnOutcome::default()).await,
+            1,
+            "the first turn's progress rearmed it"
+        );
+    }
+
+    /// One rule for both engines (`tracks_own_objectives`): a session with ANY
+    /// `spawned_by` does not track objectives, fresh or reopened; one nobody spawned does.
+    #[tokio::test]
+    async fn no_spawned_session_tracks_objectives_on_either_engine() {
+        use crate::chat::types::SpawnedBy;
+        let (run, task, plan, parent) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let origins = vec![
+            SpawnedBy::Runner {
+                run_id: run,
+                task_id: task,
+                parent_session_id: None,
+            }
+            .to_json_string(),
+            SpawnedBy::Pipeline {
+                run_id: run,
+                task_id: task,
+                wave: 1,
+                parent_session_id: None,
+            }
+            .to_json_string(),
+            SpawnedBy::Gate {
+                run_id: run,
+                task_id: task,
+                gate_name: "g".into(),
+                attempt: 1,
+                parent_session_id: None,
+            }
+            .to_json_string(),
+            SpawnedBy::Trigger {
+                trigger_id: run,
+                run_id: None,
+                task_id: None,
+            }
+            .to_json_string(),
+            SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: None,
+            }
+            .to_json_string(),
+            SpawnedBy::Delegation {
+                plan_id: plan,
+                task_id: task,
+                parent_session_id: Some(parent),
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+            r#"{"type":"protocol_runner"}"#.to_string(),
+        ];
+        for origin in origins {
+            let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+            let (manager, sid) = world_spawned(mock, Some(origin.clone())).await;
+            for reopened in [false, true] {
+                assert!(
+                    !manager
+                        .agent_turn_state(&sid, reopened)
+                        .await
+                        .objectives
+                        .enabled,
+                    "agent engine, {origin}, reopened={reopened}"
+                );
+            }
+            // The Claude Code engine's two opening sites read the same rule.
+            assert!(!tracks_own_objectives(true), "Claude Code engine, {origin}");
+        }
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_spawned(mock, None).await;
+        for reopened in [false, true] {
+            assert!(
+                manager
+                    .agent_turn_state(&sid, reopened)
+                    .await
+                    .objectives
+                    .enabled
+            );
+        }
+        assert!(tracks_own_objectives(false));
     }
 }
 

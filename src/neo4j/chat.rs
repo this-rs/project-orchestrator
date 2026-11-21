@@ -2992,9 +2992,12 @@ impl Neo4jClient {
             if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
                 if let Some(arr) = tasks_val.as_array() {
                     for t in arr {
-                        if let (Some(id_str), Some(title)) = (
+                        // A task's title is optional (`TaskNode::title`): a task without
+                        // one stays linked (empty title), never dropped — the objective
+                        // reminder shows it by its description.
+                        if let (Some(id_str), title) = (
                             t.get("id").and_then(|v| v.as_str()),
-                            t.get("title").and_then(|v| v.as_str()),
+                            t.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                         ) {
                             if let Ok(id) = id_str.parse::<Uuid>() {
                                 let source = t
