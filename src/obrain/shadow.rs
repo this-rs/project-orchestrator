@@ -300,7 +300,7 @@ impl ObrainGraphStore {
                 }
                 let mut vues = Vec::new();
                 for s in aretes_de(db, na, Direction::Outgoing, SYNAPSE)? {
-                    if genre_de(db, s.vers) != Some(Genre::Note) {
+                    if genre_de(db, s.vers)? != Some(Genre::Note) {
                         continue;
                     }
                     if projet_brut(db, s.vers)?.as_deref() != Some(pid.as_str()) {
@@ -468,7 +468,7 @@ impl ObrainGraphStore {
                             continue;
                         }
                         for s in aretes_de(w.db, noeud, Direction::Outgoing, SYNAPSE)? {
-                            if genre_de(w.db, s.vers) != Some(Genre::Note)
+                            if genre_de(w.db, s.vers)? != Some(Genre::Note)
                                 || projet_brut(w.db, s.vers)?.as_deref() != Some(pa.as_str())
                             {
                                 continue;

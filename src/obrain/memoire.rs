@@ -794,7 +794,7 @@ fn a_une_arete(
         if &*e.edge_type != type_ {
             continue;
         }
-        if genres.is_empty() || genre_de(db, voisin).is_some_and(|g| genres.contains(&g)) {
+        if genres.is_empty() || genre_de(db, voisin)?.is_some_and(|g| genres.contains(&g)) {
             return Ok(true);
         }
     }
