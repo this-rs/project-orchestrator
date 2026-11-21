@@ -45,8 +45,8 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G1 | containment | la branche contient `origin/main` | CI, Lint & Format | vert sur la consolidation après la descente #1253 |
 | G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
-| G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) aux 18 modules `obrain_` (86 tests). **Trou** : les 28 contrôles transverses (`all_checks!`) ne tournent que sur Neo4j et le mock |
-| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
+| G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 28 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 15 autres restent à couvrir sur obrain |
+| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. Le job exécute les tests unitaires `obrain::` avec la feature, sauf deux tests dépendant de fenêtres temporelles : `auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et `commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`. À synchroniser de façon déterministe avant de les réactiver |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | **non automatisé** | **non fait** ; le migrateur réel est hors dépôt (attendu avant la bascule) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
@@ -130,16 +130,21 @@ qui vérifie la correspondance valeur → variant, et non que le variant constru
 
 ### G4 — conformité des stores
 `tests/store_conformance.rs` exécute les contrôles par domaine (`*_checks!`) sur Neo4j, le
-mock et obrain ; les 28 contrôles transverses de `all_checks!` ne tournent que sur Neo4j et le
-mock (aucune jambe obrain), et `note_checks` n'a pas de jambe mock. Les
+mock et obrain. Parmi les 28 contrôles transverses de `all_checks!`, 13 tournent aussi sur
+obrain : quatre dans `obrain_protocol`, cinq dans `obrain_ingress` et quatre dans
+`obrain_transverse`. Les 15 autres n'ont pas de jambe obrain ; `note_checks` n'a pas de jambe mock. Les
 divergences connues sont listées dans `EXPECTED_DIVERGENCES` ; le test échoue si une
 divergence listée est corrigée (« now conforms »), ce qui force à retirer l'entrée.
 - Jambe Neo4j : job **Integration Tests**, avec un service Neo4j et `HARNESS_NEO4J_REQUIRED=1`
   (un Neo4j absent est un échec, pas un saut).
-- Jambe obrain : job **Obrain backend**. Le filtre CI ne retenait que `obrain_project::`
-  (10 tests, 241 filtrés) ; il retient désormais les 18 modules `obrain_` (86 tests), et
-  aucun test `mock_` ni `neo4j_`.
+- Jambe obrain : job **Obrain backend**. Le filtre CI retient les modules `obrain_`,
+  dont `obrain_transverse`, et aucun test `mock_` ni `neo4j_`.
 - En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
+
+### G5 — tests unitaires obrain
+Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`.
+Deux tests sensibles à l'ordonnancement restent exclus et sont nommés dans le tableau
+ci-dessus ; leur stabilisation est nécessaire avant leur réactivation en CI.
 
 ## Portes manuelles ou non faites
 
