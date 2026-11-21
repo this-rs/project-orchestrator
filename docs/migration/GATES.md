@@ -141,6 +141,11 @@ divergence listée est corrigée (« now conforms »), ce qui force à retirer l
   dont `obrain_transverse`, et aucun test `mock_` ni `neo4j_`.
 - En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
 
+### G5 — tests unitaires obrain
+Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`.
+Deux tests sensibles à l'ordonnancement restent exclus et sont nommés dans le tableau
+ci-dessus ; leur stabilisation est nécessaire avant leur réactivation en CI.
+
 ## Portes manuelles ou non faites
 
 ### G6 — parité de lecture (LECTURE-NATIVE)
