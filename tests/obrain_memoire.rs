@@ -376,9 +376,7 @@ async fn shadow_rewards_move_the_shadow_weight_only_and_clamp_it() {
     assert_eq!(ac.len(), 1);
     assert_eq!(nombre(&ac[0], "shadow_weight"), 0.0, "clamped at zero");
     // The cross-project edge was never touched.
-    assert!(arete_brute(&base, a, d, "SYNAPSE").await[0]
-        .get("shadow_weight")
-        .is_none());
+    assert!(!arete_brute(&base, a, d, "SYNAPSE").await[0].contains_key("shadow_weight"));
 }
 
 /// `decay_shadow_synapses`: `w · 2^(-Δt / half_life)` on the shadow weight (legacy weight to
@@ -650,9 +648,7 @@ async fn an_unreadable_shadow_clock_refuses_the_pass_and_writes_nothing() {
     assert!(format!("{e:#}").contains("illisible"), "{e:#}");
     store.close().await.unwrap();
     // Nothing written, not even on the readable edge.
-    assert!(arete_brute(&base, c, d, "SYNAPSE").await[0]
-        .get("shadow_weight")
-        .is_none());
+    assert!(!arete_brute(&base, c, d, "SYNAPSE").await[0].contains_key("shadow_weight"));
 }
 
 fn une_trace(session: Uuid, projet: Uuid, secs: i64, notes: &[Uuid]) -> SynapseShadowTrace {
@@ -997,7 +993,7 @@ async fn the_forgetting_pass_decays_by_elapsed_time_provenance_and_protection() 
     // Never decayed by a pass: stamped, weight kept.
     let sans = w(4, 5).await;
     assert!(proche(nombre(&sans, "weight"), 0.5));
-    assert!(sans.get("decayed_at").is_some());
+    assert!(sans.contains_key("decayed_at"));
     // 100 days: ~0, lifted to the protection floor by the three reinforcements.
     assert!(proche(nombre(&w(0, 2).await, "weight"), 0.15));
     // A second pass right after changes (almost) nothing.
@@ -1097,9 +1093,9 @@ async fn the_archive_takes_the_weakest_edges_first_under_the_cap() {
         assert_eq!(f.len(), 1);
         assert!(proche(nombre(&f[0], "weight"), w), "the weight it had");
         assert_eq!(f[0]["forgotten_reason"].as_str(), Some("decay"));
-        assert!(f[0].get("forgotten_at").is_some());
+        assert!(f[0].contains_key("forgotten_at"));
         assert_eq!(f[0]["source"].as_str(), Some("cosine"), "provenance kept");
-        assert!(f[0].get("created_at").is_some());
+        assert!(f[0].contains_key("created_at"));
     }
     // The others stay.
     for (x, y) in [(1, 0), (3, 2), (3, 4), (5, 0)] {
@@ -1289,9 +1285,7 @@ async fn two_forgotten_edges_on_an_archived_pair_refuse_the_pass() {
         0.001
     ));
     assert!(
-        arete_brute(&base, n[1], n[0], "SYNAPSE").await[0]
-            .get("decayed_at")
-            .is_none(),
+        !arete_brute(&base, n[1], n[0], "SYNAPSE").await[0].contains_key("decayed_at"),
         "nothing written"
     );
 }
@@ -2059,7 +2053,7 @@ async fn the_audit_finds_the_four_kinds_of_gap_and_counts_every_relationship() {
     let r = store.audit_knowledge_gaps(p.id).await.unwrap();
     // `n2` and `n3` have no LINKED_TO (the other project's note is out).
     assert_eq!(r.orphan_notes_total, 2);
-    let mut paires = vec![
+    let mut paires = [
         (n2.id.to_string(), "x".repeat(80)),
         (n3.id.to_string(), "c".to_string()),
     ];

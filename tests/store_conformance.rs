@@ -6638,10 +6638,7 @@ pub mod conformance {
             NoteStatus::Active,
             "another project"
         );
-        assert_eq!(
-            store.archive_unconfirmed_auto_observed(None).await.unwrap() >= 1,
-            true
-        );
+        assert!(store.archive_unconfirmed_auto_observed(None).await.unwrap() >= 1);
         assert_eq!(statut(auto[2].id).await, NoteStatus::Archived);
         for n in auto.iter().chain([&confirmee, &humaine]) {
             store.delete_note(n.id).await.unwrap();

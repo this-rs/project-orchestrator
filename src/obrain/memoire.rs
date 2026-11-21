@@ -308,7 +308,7 @@ impl ObrainGraphStore {
                     };
                     let touche = super::date_valeur(v, cle)
                         .map_err(|e| anyhow!("{methode} : arête {:?} : {e}", a.id))?;
-                    if !touche.is_some_and(|t| t < limite) {
+                    if touche.is_none_or(|t| t >= limite) {
                         continue;
                     }
                     candidats.push((k, sources[l.de].id, id_du_noeud(w.db, a.vers)?));
@@ -453,6 +453,9 @@ impl ObrainGraphStore {
 // ============================================================================
 // The lifecycle sweep, and the notes the heuristic wrote
 // ============================================================================
+
+/// `(status, note_type, importance)` as the base holds them.
+type Forme = (String, String, String);
 
 /// The authors the heuristic detectors sign with.
 const DETECTEURS: [&str; 2] = ["system/observation-detector", "system/rfc-detector"];
@@ -637,7 +640,7 @@ impl ObrainGraphStore {
         self.lire(|db, etat| {
             refus_si_notes_en_quarantaine(etat, "auto_observed_report")?;
             // (status, note_type, importance) → (notes, total size)
-            let mut groupes: BTreeMap<(String, String, String), (i64, i64)> = BTreeMap::new();
+            let mut groupes: BTreeMap<Forme, (i64, i64)> = BTreeMap::new();
             for (n, noeud) in etat.notes.toutes_avec_noeud() {
                 if projet.is_some() && n.project_id != projet {
                     continue;
@@ -660,8 +663,7 @@ impl ObrainGraphStore {
                 e.0 += 1;
                 e.1 += n.content.chars().count() as i64;
             }
-            let mut lignes: Vec<((String, String, String), (i64, i64))> =
-                groupes.into_iter().collect();
+            let mut lignes: Vec<(Forme, (i64, i64))> = groupes.into_iter().collect();
             // `ORDER BY notes DESC, status, note_type, importance`: BTreeMap already gave the
             // three strings ascending; the sort is stable.
             lignes.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));

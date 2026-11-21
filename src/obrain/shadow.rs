@@ -391,13 +391,7 @@ impl ObrainGraphStore {
                             sans_doublon(w.db, x, y, SYNAPSE)?;
                             if let Some(s) = entre(w.db, x, y, SYNAPSE)?.into_iter().next() {
                                 let p = poids_d_ombre(&s)? + delta;
-                                let borne = if p > 1.0 {
-                                    1.0
-                                } else if p < 0.0 {
-                                    0.0
-                                } else {
-                                    p
-                                };
+                                let borne = p.clamp(0.0, 1.0);
                                 a_faire.push((s, borne));
                             }
                         }
@@ -630,7 +624,7 @@ impl ObrainGraphStore {
                     };
                     (f.noeud, f.valeur.trace.rewarded.clone())
                 };
-                if deja.iter().any(|k| *k == cle) {
+                if deja.contains(&cle) {
                     return Ok(false);
                 }
                 let mut nouvelle = deja;
