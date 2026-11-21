@@ -68,10 +68,15 @@
 //! sequence of engine writes under `ecritures`: a cut leaves a prefix of them, the
 //! store refuses everything until reopened (`indetermine`), and each property of the
 //! prefix is valid on its own (a weight stays in range, a counter only grows). The
-//! property that carries the meaning is written last (the weight of a reinforcement,
-//! the energy of a boost, the accumulator of a persona's rate limit). The decay pass
-//! writes the energy THEN its stamp: a cut leaves the old stamp, so the next pass decays
-//! again from it and never loses a decay.
+//! property a reinforcement carries the meaning of (the weight) is written last.
+//!
+//! ONE rule for what is counted: a cut may LOSE an effect, never apply it twice or past its
+//! bound. So the stamp or the counter that bounds an effect is written BEFORE the value it
+//! guards: `energy_updated_at` before `energy` (a cut loses one decay, the next pass starts
+//! from the new stamp; the reverse would decay the same days twice, and the floor could
+//! fix 0.0 for good), `energy_boost_accumulated` before `energy` (a cut loses one boost,
+//! never exceeds the cap), the counters of an edge before its weight. Archived `FORGOTTEN`
+//! edges are deleted AFTER the live edges exist: a cut keeps the archive.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -271,19 +276,19 @@ fn sans_doublon(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<
     Ok(())
 }
 
-fn etiquettes(db: &ObrainDB, noeud: NodeId) -> Vec<String> {
-    db.get_node_labels(noeud).unwrap_or_default()
-}
-
-fn genre_de(db: &ObrainDB, noeud: NodeId) -> Option<Genre> {
-    let l = etiquettes(db, noeud);
-    if l.iter().any(|e| &**e == "Note") {
+/// The kind of a node: `None` for a node that is neither a note nor a decision. A node the
+/// engine cannot give the labels of (a dangling edge) is an error, never a skipped neighbour.
+fn genre_de(db: &ObrainDB, noeud: NodeId) -> Result<Option<Genre>> {
+    let l = db.get_node_labels(noeud).ok_or_else(|| {
+        anyhow!("nœud {noeud:?} voisin d'une arête SYNAPSE mais illisible (arête pendante)")
+    })?;
+    Ok(if l.iter().any(|e| &**e == "Note") {
         Some(Genre::Note)
     } else if l.iter().any(|e| &**e == "Decision") {
         Some(Genre::Decision)
     } else {
         None
-    }
+    })
 }
 
 /// The `id` property of a node, as a UUID: an error when it is absent or unreadable.
@@ -389,25 +394,57 @@ fn supprimer_arete(w: &mut Ecriture<'_>, id: EdgeId, methode: &str) -> Result<()
     Ok(())
 }
 
-/// The weight a revived edge starts from: the one it had when archived, never under the
-/// forget threshold. The archive rows go away (`FOREACH (x IN stale | DELETE x)`).
-fn reveiller(w: &mut Ecriture<'_>, a: NodeId, b: NodeId, methode: &str) -> Result<f64> {
-    let f1 = entre(w.db, a, b, OUBLIE)?;
-    let f2 = entre(w.db, b, a, OUBLIE)?;
+/// What reviving a pair reads, BEFORE any write: the weight the pair starts from (the one an
+/// archived edge had, never under the forget threshold) and the archive rows to delete once
+/// the live edges exist (`FOREACH (x IN stale | DELETE x)`).
+fn lire_reveil(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<(f64, Vec<EdgeId>)> {
+    let f1 = entre(db, a, b, OUBLIE)?;
+    let f2 = entre(db, b, a, OUBLIE)?;
     let archive = match (f1.first(), f2.first()) {
         (Some(x), _) if x.get("weight").is_some() => x.nombre("weight")?,
         (_, Some(y)) => y.nombre("weight")?,
         _ => None,
     }
     .unwrap_or(0.5);
-    for s in f1.iter().chain(f2.iter()) {
-        supprimer_arete(w, s.id, methode)?;
-    }
-    Ok(if archive < PLANCHER_REVIVAL {
+    let depart = if archive < PLANCHER_REVIVAL {
         PLANCHER_REVIVAL
     } else {
         archive
-    })
+    };
+    Ok((depart, f1.iter().chain(f2.iter()).map(|x| x.id).collect()))
+}
+
+/// Delete the archive rows of a revived pair: LAST, after the live edges, so that a cut
+/// leaves the archive (and a retry revives it) rather than neither.
+fn oublier_archives(w: &mut Ecriture<'_>, stale: &[EdgeId], methode: &str) -> Result<()> {
+    for id in stale {
+        supprimer_arete(w, *id, methode)?;
+    }
+    Ok(())
+}
+
+/// Everything a write on the edges of a pair reads, validated BEFORE the first engine write
+/// (an error inside `ecritures` would make the whole store indeterminate): every weight
+/// readable, the counter a number, `source` a string, the archived weight a number.
+fn valider_pair(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<()> {
+    for (x, y) in [(a, b), (b, a)] {
+        for e in entre(db, x, y, SYNAPSE)? {
+            e.poids()?;
+            e.nombre("reinforcement_count")?;
+            if let Some(v) = e.get("source") {
+                if v.as_str().is_none() {
+                    bail!(
+                        "arête {SYNAPSE} {:?} → {:?} : `source` n'est pas une chaîne ({v:?}) ; \
+                         refusé plutôt que réécrit",
+                        e.de,
+                        e.vers
+                    );
+                }
+            }
+        }
+    }
+    lire_reveil(db, a, b)?;
+    Ok(())
 }
 
 /// The per-pair checks done before any write: no parallel `SYNAPSE` or `FORGOTTEN` edge.
@@ -419,6 +456,9 @@ fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId, avec_oubli: bool) -> R
         if avec_oubli {
             sans_doublon(db, x, y, OUBLIE)?;
         }
+    }
+    if avec_oubli {
+        valider_pair(db, a, b)?;
     }
     Ok(())
 }
@@ -571,7 +611,7 @@ impl ObrainGraphStore {
             let mut poids: BTreeMap<u64, f64> = BTreeMap::new();
             for a in incidentes(db, n)? {
                 let autre = if a.de == n { a.vers } else { a.de };
-                if genre_de(db, autre) != Some(Genre::Note) {
+                if genre_de(db, autre)? != Some(Genre::Note) {
                     continue;
                 }
                 let p = a.poids()?;
@@ -623,7 +663,7 @@ impl ObrainGraphStore {
                     // (p:Project)-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
                     for (_, noeud) in etat.notes.du_projet(pid) {
                         for a in aretes_de(db, noeud, Direction::Outgoing, SYNAPSE)? {
-                            if genre_de(db, a.vers) == Some(Genre::Note) {
+                            if genre_de(db, a.vers)? == Some(Genre::Note) {
                                 v.push(a.poids()?);
                             }
                         }
@@ -746,7 +786,7 @@ impl ObrainGraphStore {
                 let n = paires.len();
                 ecritures(w, |w| {
                     for (a, b) in &paires {
-                        let depart = reveiller(w, *a, *b, "reinforce_synapses")?;
+                        let (depart, stale) = lire_reveil(w.db, *a, *b)?;
                         let now = maintenant();
                         for (de, vers) in [(*a, *b), (*b, *a)] {
                             fusionner(
@@ -787,6 +827,7 @@ impl ObrainGraphStore {
                                 },
                             )?;
                         }
+                        oublier_archives(w, &stale, "reinforce_synapses")?;
                     }
                     Ok(())
                 })?;
@@ -823,7 +864,7 @@ impl ObrainGraphStore {
                 let n = paires.len();
                 ecritures(w, |w| {
                     for (a, b) in &paires {
-                        let depart = reveiller(w, *a, *b, "coactivate_session")?;
+                        let (depart, stale) = lire_reveil(w.db, *a, *b)?;
                         let now = maintenant();
                         for (k, (de, vers)) in [(*a, *b), (*b, *a)].into_iter().enumerate() {
                             let provenance = |mut v: Vec<(&'static str, Value)>| {
@@ -865,6 +906,7 @@ impl ObrainGraphStore {
                                 Ok(v)
                             })?;
                         }
+                        oublier_archives(w, &stale, "coactivate_session")?;
                     }
                     Ok(())
                 })?;
@@ -970,7 +1012,7 @@ impl ObrainGraphStore {
             let mut lignes: BTreeSet<(Uuid, u64, &'static str)> = BTreeSet::new();
             for a in incidentes(db, b.noeud)? {
                 let autre = if a.de == b.noeud { a.vers } else { a.de };
-                let Some(genre) = genre_de(db, autre) else {
+                let Some(genre) = genre_de(db, autre)? else {
                     continue;
                 };
                 lignes.insert((id_du_noeud(db, autre)?, a.poids()?.to_bits(), genre.nom()));
@@ -1096,7 +1138,10 @@ impl ObrainGraphStore {
                     },
                     None => entite,
                 };
-                v.push((note.to_string(), "unknown".to_string(), id));
+                // Neo4j drops a row with an empty id or entity id.
+                if !id.is_empty() {
+                    v.push((note.to_string(), "unknown".to_string(), id));
+                }
             }
             v.sort();
             Ok(v)
@@ -1155,14 +1200,14 @@ impl ObrainGraphStore {
                 let mut mises_a_jour = 0usize;
                 ecritures(w, |w| {
                     for (id, avant, apres) in &a_faire {
-                        // The energy first, the stamp last: a cut between the two leaves the
-                        // old stamp, so the next pass decays from it again (never loses a decay).
-                        let mut p = Vec::new();
+                        // The stamp first, the energy last (the one rule, see the header): a
+                        // cut between the two loses this decay, the next pass takes it from
+                        // the new stamp; it can never decay the same days twice.
+                        let mut p = vec![("energy_updated_at", Value::from(now.to_rfc3339()))];
                         if (avant - apres).abs() > 0.001 {
                             p.push(("energy", Value::from(*apres)));
                             mises_a_jour += 1;
                         }
-                        p.push(("energy_updated_at", Value::from(now.to_rfc3339())));
                         if let Some(e) = note::poser_proprietes_de_note(w, *id, p)? {
                             publiees.push(e);
                         }
@@ -1482,6 +1527,10 @@ impl ObrainGraphStore {
                 let energie = e.persona.energy;
                 let proprietes = vec![
                     ("updated_at", Value::from(Utc::now().to_rfc3339())),
+                    // The accumulator BEFORE the energy: a cut charges a boost that was not
+                    // given (a boost lost), and can never give a boost that is not charged
+                    // (the cap exceeded).
+                    ("energy_boost_accumulated", Value::from(accumule + boost)),
                     (
                         "energy",
                         Value::from(if energie + boost > 1.0 {
@@ -1490,8 +1539,6 @@ impl ObrainGraphStore {
                             energie + boost
                         }),
                     ),
-                    // The accumulator last: it is what bounds the next boost.
-                    ("energy_boost_accumulated", Value::from(accumule + boost)),
                 ];
                 ecritures(w, |w| {
                     persona::ecrire_proprietes_de_persona(w, persona_id, proprietes)
