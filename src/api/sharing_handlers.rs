@@ -434,11 +434,15 @@ pub async fn retract_sharing(
 
     // If note_id was provided, also set consent to ExplicitDeny
     if let Some(note_id) = body.note_id {
-        let _ = state
+        // Not ignored: a retraction answered `retracted: true` while the note kept
+        // its previous consent would be a lie. The tombstone and the event above are
+        // idempotent to retry.
+        state
             .orchestrator
             .neo4j()
             .update_sharing_consent(note_id, &SharingConsent::ExplicitDeny)
-            .await;
+            .await
+            .map_err(AppError::Internal)?;
     }
 
     Ok(Json(serde_json::json!({

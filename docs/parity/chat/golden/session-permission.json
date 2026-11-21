@@ -1,0 +1,18 @@
+[
+  {"$client": "user_message", "content": "Renomme foo.txt en bar.txt puis ajoute une ligne à README.md."},
+  {"type": "user_message", "content": "Renomme foo.txt en bar.txt puis ajoute une ligne à README.md.", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_use", "id": "<tool-call-1>", "tool": "Bash", "input": {"command": "mv foo.txt bar.txt"}, "category": "command", "canonical": "bash", "seq": 0, "created_at": "<ts>"},
+  {"type": "permission_request", "id": "<tool-call-1>", "tool": "Bash", "input": {"command": "mv foo.txt bar.txt"}, "tool_use_id": "<tool-call-1>", "always": true, "category": "command", "canonical": "bash", "seq": 0, "created_at": "<ts>"},
+  {"$client": "permission_response", "id": "<tool-call-1>", "allow": true, "scope": "once"},
+  {"type": "permission_decision", "id": "<tool-call-1>", "allow": true, "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_result", "id": "<tool-call-1>", "result": {"stdout": "", "stderr": "", "exitCode": 0}, "is_error": false, "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_timing", "id": "<tool-call-1>", "called_at": "<ts>", "started_at": "<ts>", "permission_requested_at": "<ts>", "permission_resolved_at": "<ts>", "permission_outcome": "allowed", "run_started_at": "<ts>", "ended_at": "<ts>", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_use", "id": "<tool-call-2>", "tool": "Edit", "input": {"file_path": "README.md", "old_string": "intro", "new_string": "intro + ligne"}, "category": "edit", "canonical": "edit", "seq": 0, "created_at": "<ts>"},
+  {"type": "permission_request", "id": "<tool-call-2>", "tool": "Edit", "input": {"file_path": "README.md", "old_string": "intro", "new_string": "intro + ligne"}, "tool_use_id": "<tool-call-2>", "category": "edit", "canonical": "edit", "seq": 0, "created_at": "<ts>"},
+  {"$client": "permission_response", "id": "<tool-call-2>", "allow": false, "scope": "once"},
+  {"type": "permission_decision", "id": "<tool-call-2>", "allow": false, "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_result", "id": "<tool-call-2>", "result": {"error": "Permission denied by user"}, "is_error": true, "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_timing", "id": "<tool-call-2>", "called_at": "<ts>", "started_at": "<ts>", "permission_requested_at": "<ts>", "permission_resolved_at": "<ts>", "permission_outcome": "denied", "ended_at": "<ts>", "seq": 0, "created_at": "<ts>"},
+  {"type": "assistant_text", "content": "Renommage fait ; README.md non modifié (refusé).", "seq": 0, "created_at": "<ts>"},
+  {"type": "result", "session_id": "<session>", "duration_ms": "<dur>", "cost_usd": "<cost>", "subtype": "success", "is_error": false, "num_turns": 1, "usage": "<usage>", "model": "<model>", "stop_reason": "completed", "seq": 0, "created_at": "<ts>"}
+]

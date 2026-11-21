@@ -135,7 +135,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $project_id})-[:HAS_MILESTONE]->(m:Milestone)
             RETURN m
-            ORDER BY m.target_date ASC, m.created_at ASC
+            ORDER BY m.target_date ASC, m.created_at ASC, m.id ASC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -366,7 +366,7 @@ impl Neo4jClient {
                    COALESCE(first_plan.id, '') AS plan_id,
                    COALESCE(first_plan.title, '') AS plan_title,
                    COALESCE(first_plan.status, '') AS plan_status
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("milestone_id", milestone_id.to_string());
@@ -487,7 +487,7 @@ impl Neo4jClient {
             UNWIND tasks AS t
             WITH DISTINCT t
             RETURN t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("id", milestone_id.to_string());
@@ -551,7 +551,7 @@ impl Neo4jClient {
             MATCH (p:Project {{id: $project_id}})-[:HAS_MILESTONE]->(m:Milestone)
             {}
             RETURN m
-            ORDER BY {} {}
+            ORDER BY {} {}, m.id
             SKIP {}
             LIMIT {}
             "#,

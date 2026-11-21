@@ -4,7 +4,9 @@ use crate::neo4j::traits::*;
 
 pub(crate) mod agent_execution;
 mod alert;
-mod analytics;
+// `pub(crate)`: the store contract names types of this module by path, and a backend outside
+// `neo4j/` (src/obrain/) has to be able to write those signatures.
+pub(crate) mod analytics;
 pub(crate) mod batch;
 pub mod beliefs;
 mod chat;
@@ -35,12 +37,16 @@ pub mod models;
 mod neighborhood;
 mod note;
 pub mod path_migration;
-mod persona;
+// `pub(crate)`: the store contract names types of this module by path, and a backend outside
+// `neo4j/` (src/obrain/) has to be able to write those signatures.
+pub(crate) mod persona;
 pub mod plan;
 mod plan_run;
 mod profile;
 mod project;
-mod protocol;
+// `pub(crate)`: the store contract names types of this module by path, and a backend outside
+// `neo4j/` (src/obrain/) has to be able to write those signatures.
+pub(crate) mod protocol;
 pub(crate) mod reasoning;
 mod registry;
 mod release;

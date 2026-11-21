@@ -126,7 +126,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:Task {id: $task_id})-[:RESOLVED_BY]->(c:Commit)
             RETURN c
-            ORDER BY c.timestamp DESC
+            ORDER BY c.timestamp DESC, c.hash DESC
             "#,
         )
         .param("task_id", task_id.to_string());
@@ -148,7 +148,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Plan {id: $plan_id})-[:RESULTED_IN]->(c:Commit)
             RETURN c
-            ORDER BY c.timestamp DESC
+            ORDER BY c.timestamp DESC, c.hash DESC
             "#,
         )
         .param("plan_id", plan_id.to_string());
@@ -268,7 +268,7 @@ impl Neo4jClient {
                    c.timestamp AS timestamp,
                    r.additions AS additions,
                    r.deletions AS deletions
-            ORDER BY c.timestamp DESC
+            ORDER BY c.timestamp DESC, c.hash DESC
             LIMIT $limit
             "#,
         )
@@ -355,7 +355,7 @@ impl Neo4jClient {
             r#"
             MATCH (f1:File)-[r:CO_CHANGED]-(f2:File)
             WHERE r.project_id = $project_id AND f1.path < f2.path
-            WITH r ORDER BY r.count DESC
+            WITH r ORDER BY r.count DESC, f1.path, f2.path
             SKIP $max_relations
             DELETE r
             "#,
@@ -540,7 +540,7 @@ impl Neo4jClient {
                    r.score AS score,
                    r.depth AS depth,
                    r.via AS via
-            ORDER BY r.score DESC
+            ORDER BY r.score DESC, f2.path
             LIMIT $limit
             "#,
         )
@@ -584,7 +584,7 @@ impl Neo4jClient {
                    f2.path AS file_b,
                    r.count AS count,
                    toString(r.last_at) AS last_at
-            ORDER BY r.count DESC
+            ORDER BY r.count DESC, f1.path, f2.path
             LIMIT $limit
             "#,
         )
@@ -648,7 +648,7 @@ impl Neo4jClient {
             RETURN f2.path AS path,
                    r.count AS count,
                    toString(r.last_at) AS last_at
-            ORDER BY r.count DESC
+            ORDER BY r.count DESC, f2.path
             LIMIT $limit
             "#,
         )

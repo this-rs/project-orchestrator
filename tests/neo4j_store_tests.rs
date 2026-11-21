@@ -2518,4 +2518,15 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     )
     .await
     .unwrap();
+    // The two bare `Project` nodes (id and slug only) must not outlive the test: `list_projects`
+    // decodes every Project of the instance and fails as a whole on one without a `name`
+    // (« The property does not exist »), so a leftover breaks every later suite that lists
+    // projects on the same Neo4j — found by the project conformance checks.
+    raw.run(
+        query("MATCH (p:Project) WHERE p.id IN [$a, $b] DETACH DELETE p")
+            .param("a", synced.to_string())
+            .param("b", unsynced.to_string()),
+    )
+    .await
+    .unwrap();
 }

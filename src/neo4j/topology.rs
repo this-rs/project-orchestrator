@@ -89,7 +89,7 @@ impl Neo4jClient {
             r#"
             MATCH (r:TopologyRule {project_id: $project_id})
             RETURN r
-            ORDER BY r.rule_type, r.source_pattern
+            ORDER BY r.rule_type, r.source_pattern, r.id ASC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -257,7 +257,7 @@ impl Neo4jClient {
             WITH f, size([(f)-[:IMPORTS]->(x:File) | x]) AS fan_out
             WHERE fan_out > $threshold
             RETURN f.path AS violator, fan_out
-            ORDER BY fan_out DESC
+            ORDER BY fan_out DESC, f.path DESC
             LIMIT 100
             "#,
         )
@@ -315,7 +315,7 @@ impl Neo4jClient {
             WHERE f.path =~ $source_regex
             WITH f, length(path) AS cycle_len
             RETURN DISTINCT f.path AS violator, min(cycle_len) AS shortest_cycle
-            ORDER BY shortest_cycle ASC
+            ORDER BY shortest_cycle ASC, f.path ASC
             LIMIT 10
             "#,
         )
@@ -379,7 +379,7 @@ impl Neo4jClient {
             WITH s.path AS source_path, t.path AS target_path, length(p) AS dist
             WHERE dist < $threshold
             RETURN source_path, target_path, dist
-            ORDER BY dist ASC
+            ORDER BY dist ASC, source_path ASC, target_path ASC
             LIMIT 50
             "#,
         )

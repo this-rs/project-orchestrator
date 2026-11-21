@@ -302,7 +302,7 @@ impl Neo4jClient {
                     r#"
                     MATCH (s:ChatSession {{project_slug: $slug}})
                     WHERE true{detached_filter}
-                    RETURN s ORDER BY s.updated_at DESC
+                    RETURN s ORDER BY s.updated_at DESC, s.id DESC
                     SKIP $offset LIMIT $limit
                     "#,
                 ))
@@ -325,7 +325,7 @@ impl Neo4jClient {
                     MATCH (s:ChatSession)
                     WHERE (s.workspace_slug = $ws
                        OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)){detached_filter}
-                    RETURN s ORDER BY s.updated_at DESC
+                    RETURN s ORDER BY s.updated_at DESC, s.id DESC
                     SKIP $offset LIMIT $limit
                     "#,
                 ))
@@ -350,7 +350,7 @@ impl Neo4jClient {
                     r#"
                     MATCH (s:ChatSession)
                     WHERE true{detached_filter}
-                    RETURN s ORDER BY s.updated_at DESC
+                    RETURN s ORDER BY s.updated_at DESC, s.id DESC
                     SKIP $offset LIMIT $limit
                     "#,
                 ))
@@ -914,7 +914,7 @@ impl Neo4jClient {
                      YIELD node AS e, score \
                      WHERE e.project_id = $pid AND (e)-[:EPISODE_OF]->(:ChatSession) \
                      RETURN e.payload AS payload, score \
-                     ORDER BY score DESC LIMIT $limit",
+                     ORDER BY score DESC, e.id DESC LIMIT $limit",
                 )
                 .param("k", k)
                 .param("embedding", embedding.to_vec())
@@ -1653,7 +1653,7 @@ impl Neo4jClient {
             .execute(
                 query(
                     "MATCH (e:SessionEpisode {project_id: $pid})-[:EPISODE_OF]->(:ChatSession) \
-                     RETURN e.payload AS payload ORDER BY e.collected_at DESC LIMIT $limit",
+                     RETURN e.payload AS payload ORDER BY e.collected_at DESC, e.id DESC LIMIT $limit",
                 )
                 .param("pid", project_id.to_string())
                 .param("limit", limit as i64),
@@ -1687,7 +1687,7 @@ impl Neo4jClient {
                    AND s.spawned_by IS NOT NULL
                    AND s.spawned_by <> ''
                    AND s.spawned_by CONTAINS $parent_id)
-            RETURN s ORDER BY s.created_at ASC
+            RETURN s ORDER BY s.created_at ASC, s.id ASC
             "#,
         )
         .param("parent_id", parent_id.to_string());
@@ -1861,7 +1861,7 @@ impl Neo4jClient {
                    CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].task_id ELSE null END AS task_id,
                    depth,
                    child.created_at AS created_at
-            ORDER BY depth ASC, child.created_at ASC
+            ORDER BY depth ASC, child.created_at ASC, child.id ASC
             "#,
         )
         .param("id", session_id.to_string());
@@ -1917,7 +1917,7 @@ impl Neo4jClient {
             MATCH path = (s:ChatSession {id: $id})-[:SPAWNED_BY*0..10]->(root:ChatSession)
             WHERE NOT (root)-[:SPAWNED_BY]->()
             RETURN root.id AS root_id
-            ORDER BY length(path) DESC
+            ORDER BY length(path) DESC, root.id DESC
             LIMIT 1
             "#,
         )
@@ -1949,7 +1949,7 @@ impl Neo4jClient {
                    r.type AS spawn_type,
                    r.task_id AS task_id,
                    child.created_at AS created_at
-            ORDER BY child.created_at ASC
+            ORDER BY child.created_at ASC, child.id ASC
             "#,
         )
         .param("run_id", run_id.to_string());
@@ -2002,7 +2002,7 @@ impl Neo4jClient {
                    s.model AS model,
                    s.spawned_by AS spawned_by_json,
                    s.created_at AS created_at
-            ORDER BY s.created_at ASC
+            ORDER BY s.created_at ASC, s.id ASC
             "#,
         )
         .param("run_id", run_id.to_string());
@@ -2551,7 +2551,7 @@ impl Neo4jClient {
                    WHEN e:Enum THEN e.file_path
                    ELSE null
               END AS file_path
-            ORDER BY r.mention_count DESC
+            ORDER BY r.mention_count DESC, COALESCE(e.id, e.path) DESC
             "#
         } else {
             r#"
@@ -2577,7 +2577,7 @@ impl Neo4jClient {
                    WHEN e:Enum THEN e.file_path
                    ELSE null
               END AS file_path
-            ORDER BY r.mention_count DESC
+            ORDER BY r.mention_count DESC, COALESCE(e.id, e.path) DESC
             "#
         };
 
@@ -2612,14 +2612,14 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:HAS_CHAT_SESSION]->(s:ChatSession)
-            WITH s ORDER BY s.created_at DESC LIMIT $max_sessions
+            WITH s ORDER BY s.created_at DESC, s.id DESC LIMIT $max_sessions
             MATCH (s)-[:DISCUSSED]->(f:File)
             WITH DISTINCT f
             MATCH (f)-[cc:CO_CHANGED]->(f2:File)
             WHERE cc.count >= 2
             AND NOT f2 = f
             WITH f2.path AS path, max(cc.count) AS count, max(toString(cc.last_at)) AS last_at
-            ORDER BY count DESC
+            ORDER BY count DESC, path DESC
             LIMIT $max_results
             RETURN path, count, last_at
             "#,
@@ -2667,7 +2667,7 @@ impl Neo4jClient {
                 WHERE e.event_type IN ['user_message', 'assistant_text']
                 WITH s, collect(e.data) AS messages
                 RETURN s.id AS session_id, messages
-                ORDER BY s.created_at ASC
+                ORDER BY s.created_at ASC, s.id ASC
                 SKIP $offset
                 LIMIT $limit
                 "#,
@@ -2794,7 +2794,7 @@ impl Neo4jClient {
                     cs.total_cost_usd AS total_cost_usd,
                     toString(cs.created_at) AS created_at,
                     [(cs)-[:SPAWNED_BY]->(p:ChatSession) | p.id][0] AS parent_id
-             ORDER BY cs.updated_at DESC
+             ORDER BY cs.updated_at DESC, cs.id DESC
              LIMIT $lim",
         )
         .param("pid", pid.clone())
@@ -2878,7 +2878,7 @@ impl Neo4jClient {
              WHERE cs.id IN $session_ids
              WITH cs, d, target,
                   labels(target) AS target_labels
-             ORDER BY d.mention_count DESC
+             ORDER BY d.mention_count DESC, COALESCE(target.id, target.path, target.name) DESC
              WITH cs,
                   collect({
                     entity_type: target_labels[0],
@@ -3088,7 +3088,7 @@ impl Neo4jClient {
 
             MATCH (s:ChatSession {id: sid})
             RETURN s, source
-            ORDER BY s.created_at DESC
+            ORDER BY s.created_at DESC, s.id DESC
             "#,
         )
         .param("plan_id", plan_id.to_string());
@@ -3133,7 +3133,7 @@ impl Neo4jClient {
 
             MATCH (s:ChatSession {id: sid})
             RETURN s, source
-            ORDER BY s.created_at DESC
+            ORDER BY s.created_at DESC, s.id DESC
             "#,
         )
         .param("task_id", task_id.to_string());

@@ -499,8 +499,7 @@ pub async fn get_rfc(
                             .orchestrator
                             .neo4j()
                             .get_protocol_states(run.protocol_id)
-                            .await
-                            .unwrap_or_default();
+                            .await?;
                         let state_name_map: std::collections::HashMap<Uuid, String> =
                             states.iter().map(|s| (s.id, s.name.clone())).collect();
 

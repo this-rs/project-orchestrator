@@ -165,7 +165,7 @@ impl Neo4jClient {
             r#"
             MATCH (w:Workspace)
             RETURN w
-            ORDER BY w.name
+            ORDER BY w.name, w.id ASC
             "#,
         );
 
@@ -357,7 +357,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project)-[:BELONGS_TO_WORKSPACE]->(w:Workspace {id: $workspace_id})
             RETURN p
-            ORDER BY p.name
+            ORDER BY p.name, p.id ASC
             "#,
         )
         .param("workspace_id", workspace_id.to_string());
@@ -531,7 +531,7 @@ impl Neo4jClient {
             r#"
             MATCH (w:Workspace {id: $workspace_id})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
             RETURN wm
-            ORDER BY wm.target_date, wm.title
+            ORDER BY wm.target_date, wm.title, wm.id ASC
             "#,
         )
         .param("workspace_id", workspace_id.to_string());
@@ -584,7 +584,7 @@ impl Neo4jClient {
             MATCH (w:Workspace {{id: $workspace_id}})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
             {}
             RETURN wm
-            ORDER BY wm.target_date, wm.title
+            ORDER BY wm.target_date, wm.title, wm.id ASC
             SKIP {}
             LIMIT {}
             "#,
@@ -622,7 +622,7 @@ impl Neo4jClient {
             MATCH (w:Workspace)-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
             {}
             RETURN wm, w.id AS workspace_id, w.name AS workspace_name, w.slug AS workspace_slug
-            ORDER BY wm.target_date, wm.title
+            ORDER BY wm.target_date, wm.title, wm.id ASC
             SKIP {}
             LIMIT {}
             "#,
@@ -885,7 +885,7 @@ impl Neo4jClient {
             RETURN t, COALESCE(pl.id, '') AS plan_id,
                    COALESCE(pl.title, '') AS plan_title,
                    COALESCE(pl.status, '') AS plan_status
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("milestone_id", milestone_id.to_string());
@@ -1118,7 +1118,7 @@ impl Neo4jClient {
             r#"
             MATCH (w:Workspace {id: $workspace_id})-[:HAS_RESOURCE]->(r:Resource)
             RETURN r
-            ORDER BY r.name
+            ORDER BY r.name, r.id ASC
             "#,
         )
         .param("workspace_id", workspace_id.to_string());
@@ -1463,7 +1463,7 @@ impl Neo4jClient {
             r#"
             MATCH (w:Workspace {id: $workspace_id})-[:HAS_COMPONENT]->(c:Component)
             RETURN c
-            ORDER BY c.name
+            ORDER BY c.name, c.id ASC
             "#,
         )
         .param("workspace_id", workspace_id.to_string());

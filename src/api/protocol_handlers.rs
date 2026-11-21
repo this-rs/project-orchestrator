@@ -76,6 +76,21 @@ fn map_fire_transition_error(e: anyhow::Error) -> AppError {
     }
 }
 
+/// Map an error of `engine::start_run` to the HTTP response. The concurrency
+/// refusal is a 409 wherever it comes from: from the engine's own guard (outer
+/// message) or from the store's, which the engine wraps in a context — so the
+/// WHOLE chain is searched for it, not only the outer message.
+fn map_start_run_error(e: anyhow::Error) -> AppError {
+    let msg = e.to_string();
+    if msg.contains("not found") {
+        AppError::NotFound(msg)
+    } else if format!("{e:#}").contains("concurrent run") {
+        AppError::Conflict(format!("{e:#}"))
+    } else {
+        AppError::Internal(e)
+    }
+}
+
 // ============================================================================
 // Query Parameters
 // ============================================================================
@@ -1168,16 +1183,7 @@ pub async fn start_run(
         None, // manual trigger
     )
     .await
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            AppError::NotFound(msg)
-        } else if msg.contains("concurrent run") {
-            AppError::Conflict(msg)
-        } else {
-            AppError::Internal(e)
-        }
-    })?;
+    .map_err(map_start_run_error)?;
 
     // Emit event
     state.event_bus.emit_created(
@@ -2361,6 +2367,20 @@ mod tests {
             AppError::Conflict(msg) => assert!(msg.contains("OptimisticLockError")),
             other => panic!("Expected Conflict, got {:?}", other),
         }
+    }
+
+    /// The store's concurrency refusal arrives wrapped in the engine's context: it
+    /// is still a 409, not a 500.
+    #[test]
+    fn a_concurrent_run_refused_by_the_store_is_a_conflict() {
+        let e = anyhow::anyhow!("Skipped: concurrent run already running for protocol p")
+            .context("Failed to create protocol run");
+        match map_start_run_error(e) {
+            AppError::Conflict(msg) => assert!(msg.contains("concurrent run"), "{msg}"),
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+        let e = anyhow::anyhow!("Protocol p not found");
+        assert!(matches!(map_start_run_error(e), AppError::NotFound(_)));
     }
 
     #[test]

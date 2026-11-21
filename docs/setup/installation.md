@@ -156,6 +156,8 @@ This detects your Claude Code installation and adds the MCP server configuration
 | `WORKSPACE_PATH` | `.` | Default workspace for syncing |
 | `RUST_LOG` | `info,project_orchestrator=debug` | Log level filter (see [env_logger syntax](https://docs.rs/env_logger)) |
 | `NATS_URL` | _(none)_ | NATS server URL (e.g., `nats://localhost:4222`) |
+| `EVENTS_TRANSPORT` | `nats` | Chat transport: `nats`, `journal` or `memory` |
+| `EVENTS_JOURNAL_PATH` | `chat-journal.log` | Journal file path (journal transport only) |
 | `SERVE_FRONTEND` | `false` | Serve embedded frontend (requires `embedded-frontend` feature) |
 | `FRONTEND_PATH` | _(none)_ | Path to external frontend build directory |
 
@@ -214,6 +216,10 @@ meilisearch:
 
 nats:
   url: "nats://localhost:4222"  # optional — enables multi-instance sync
+
+events:
+  transport: "nats"  # nats | journal | memory — which transport carries chat events
+  # journal_path: "chat-journal.log"  # where the journal transport writes
 
 chat:
   default_model: "claude-opus-4-6"

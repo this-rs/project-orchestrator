@@ -47,7 +47,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::provider::errors::OpenFailure;
-use crate::events::{NatsEmitter, RelayFailure, Subject};
+use crate::events::{ChatTransport, RelayFailure, Subject};
 
 /// How long one cancel may take, on the owner and locally, before it is reported
 /// as `owner_timeout` (shorter than the asker's 10 s, so a slow provider is
@@ -269,7 +269,7 @@ impl CancelRelayError {
 /// Asks the owner over NATS and returns its answer as the owner's caller would
 /// have had it, or the typed reason there is none.
 pub async fn relay<T: DeserializeOwned>(
-    nats: &NatsEmitter,
+    nats: &dyn ChatTransport,
     subject: String,
     mut payload: Value,
     kind: CancelKind,
@@ -319,7 +319,7 @@ pub async fn bounded<T>(kind: CancelKind, work: impl Future<Output = Result<T>>)
 /// publishes the answer on `reply_to` in the asker's format. Spawned per request by
 /// the listeners, so one slow cancel never holds the next one.
 pub async fn answer<T, F>(
-    nats: &NatsEmitter,
+    nats: &dyn ChatTransport,
     reply_to: Subject,
     asker_v2: bool,
     kind: CancelKind,
@@ -339,7 +339,7 @@ pub async fn answer<T, F>(
 
 /// Publishes one answer on its reply subject (nothing when the asker cannot read it).
 pub async fn publish<T: Serialize>(
-    nats: &NatsEmitter,
+    nats: &dyn ChatTransport,
     reply_to: Subject,
     asker_v2: bool,
     reply: &CancelReply<T>,
@@ -407,6 +407,7 @@ pub fn task_id_of(payload: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::chat::manager::CancelTaskResult;
+    use crate::events::NatsEmitter;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 

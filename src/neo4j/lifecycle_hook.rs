@@ -89,7 +89,7 @@ impl Neo4jClient {
                     MATCH (h:LifecycleHook)
                     WHERE h.project_id = $project_id OR h.project_id = ''
                     RETURN h
-                    ORDER BY h.priority ASC
+                    ORDER BY h.priority ASC, h.id ASC
                 "#;
                 let q = query(cypher).param("project_id", pid.to_string());
                 (cypher, q)
@@ -98,7 +98,7 @@ impl Neo4jClient {
                 let cypher = r#"
                     MATCH (h:LifecycleHook)
                     RETURN h
-                    ORDER BY h.priority ASC
+                    ORDER BY h.priority ASC, h.id ASC
                 "#;
                 let q = query(cypher);
                 (cypher, q)
@@ -213,7 +213,7 @@ impl Neo4jClient {
                   AND h.enabled = true
                   AND (h.project_id = $project_id OR h.project_id = '')
                 RETURN h
-                ORDER BY h.priority ASC
+                ORDER BY h.priority ASC, h.id ASC
             "#
             }
             None => {
@@ -224,7 +224,7 @@ impl Neo4jClient {
                   AND h.enabled = true
                   AND h.project_id = ''
                 RETURN h
-                ORDER BY h.priority ASC
+                ORDER BY h.priority ASC, h.id ASC
             "#
             }
         };

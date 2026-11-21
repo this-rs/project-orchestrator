@@ -90,7 +90,7 @@ pub(crate) struct OobListenerDeps {
     pub search: Arc<dyn SearchStore>,
     /// The blobs of the attached documents (the images a turn sends inline).
     pub documents: crate::documents::store::DocumentStore,
-    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+    pub nats: Option<Arc<dyn crate::events::ChatTransport>>,
 }
 
 /// Where the turns and the OOB listener are in the CLI's output, counted in `result`s.

@@ -160,7 +160,7 @@ impl Neo4jClient {
         };
 
         let cypher = format!(
-            "MATCH (t:EventTrigger){} RETURN t ORDER BY t.created_at DESC",
+            "MATCH (t:EventTrigger){} RETURN t ORDER BY t.created_at DESC, t.id DESC",
             where_str
         );
 

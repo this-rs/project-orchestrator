@@ -274,7 +274,7 @@ impl GraphSampler {
                 "MATCH (p:Project {{slug: $slug}})-[:HAS_FILE]->(f:File)
                  WITH f, coalesce(f.pagerank, 0.0) AS pr
                  RETURN f.id AS node_id, pr
-                 ORDER BY pr DESC
+                 ORDER BY pr DESC, f.path DESC
                  LIMIT {count}"
             )
         } else {
@@ -282,7 +282,7 @@ impl GraphSampler {
                 "MATCH (f:File)
                  WITH f, coalesce(f.pagerank, 0.0) AS pr
                  RETURN f.id AS node_id, pr
-                 ORDER BY pr DESC
+                 ORDER BY pr DESC, f.path DESC
                  LIMIT {count}"
             )
         };
