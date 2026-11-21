@@ -239,6 +239,11 @@ fn read_ranges<T: Send + 'static>(
             process.clone(),
             tx.clone(),
         );
+        // KNOWN LIMIT: the `JoinHandle` is dropped, not awaited. A panic inside a
+        // reader (e.g. a panicking `BoltTime` conversion in `conv.rs`) closes
+        // that reader early and TRUNCATES the read silently — the channel just
+        // delivers fewer results. The fingerprint and the per-type counts still
+        // catch a truncated copy, but the panic itself is never named.
         tokio::spawn(async move {
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -269,13 +274,17 @@ fn read_ranges<T: Send + 'static>(
 struct Names(std::sync::Mutex<Vec<String>>);
 
 impl Names {
-    fn index(&self, name: &str) -> u16 {
+    /// Intern a name to a compact `u16` index, refusing (not truncating) past
+    /// 65 535 distinct labels or relationship types.
+    fn index(&self, name: &str) -> Result<u16> {
         let mut v = self.0.lock().unwrap();
         if let Some(i) = v.iter().position(|n| n == name) {
-            return i as u16;
+            return u16::try_from(i)
+                .map_err(|_| anyhow::anyhow!("more than 65 535 distinct labels/types"));
         }
         v.push(name.to_string());
-        (v.len() - 1) as u16
+        u16::try_from(v.len() - 1)
+            .map_err(|_| anyhow::anyhow!("more than 65 535 distinct labels/types"))
     }
     fn list(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
@@ -291,6 +300,17 @@ struct RelRead {
     dst: i64,
     kind: u16,
     props: Props,
+}
+
+/// The named losses that must fail the copy, checked as early as they are known:
+/// a refused loss (`named_zone`, `local_datetime`, …) is detected during the
+/// property read, minutes in, not after the hours the write would have taken.
+/// The final gate stays in [`Neo4jToObrain::copy`].
+fn check_no_refusal(losses: &Losses) -> Result<()> {
+    if let Some(why) = losses.refusal() {
+        anyhow::bail!("the copy would lose information — {why}");
+    }
+    Ok(())
 }
 
 /// The copy proper: the source `graph` into the empty directory `dest`. Returns
@@ -331,7 +351,7 @@ async fn copy_into(
                     ls.len(),
                     ls
                 );
-                v.push((row.get::<i64>("i")?, l2.index(&ls[0])));
+                v.push((row.get::<i64>("i")?, l2.index(&ls[0])?));
             }
             Ok(v)
         },
@@ -364,7 +384,7 @@ async fn copy_into(
                     id: row.get("i")?,
                     src: row.get("s")?,
                     dst: row.get("d")?,
-                    kind: t2.index(&row.get::<String>("t")?),
+                    kind: t2.index(&row.get::<String>("t")?)?,
                     props: props_of(row, &mut losses)?,
                 });
             }
@@ -384,11 +404,17 @@ async fn copy_into(
             let (v, l) = r?;
             rels.extend(v);
             losses.add(&l);
+            check_no_refusal(&losses)?;
         }
     }
     rels.sort_unstable_by_key(|r| r.id);
     let type_names = types.list();
-    let slot = |id: i64| node_ids.binary_search(&id).ok().map(|k| k as u32 + 1);
+    let slot = |id: i64| {
+        node_ids
+            .binary_search(&id)
+            .ok()
+            .and_then(|k| u32::try_from(k).ok()?.checked_add(1))
+    };
     let (mut src, mut dst, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
     let mut rel_props: Vec<Props> = Vec::with_capacity(rels.len());
     for r in rels {
@@ -474,10 +500,11 @@ async fn copy_into(
         let mut prints: BTreeMap<String, Print> = BTreeMap::new();
         for (i, props) in packet.iter().enumerate() {
             let name = &ln2[lk2[first + i] as usize];
-            prints
-                .entry(name.clone())
-                .or_default()
-                .add(node_print(name, props));
+            prints.entry(name.clone()).or_default().add(node_print(
+                name,
+                (first + i + 1) as u64,
+                props,
+            ));
         }
         Ok((first as u32 + 1, packet, losses, prints))
     });
@@ -486,6 +513,7 @@ async fn copy_into(
         while let Some(r) = rx.recv().await {
             let (first, packet, l, prints) = r?;
             losses.add(&l);
+            check_no_refusal(&losses)?;
             for (name, p) in prints {
                 expected.nodes.entry(name).or_default().add(p);
             }
@@ -504,11 +532,11 @@ async fn copy_into(
         first += batch;
     }
 
-    // Phase F — durability, PO marker.
+    // Phase F — durability (checkpoint and close). The PO marker is NOT written
+    // here: it goes in only after the read-back and the fingerprint comparison.
     let w = Arc::try_unwrap(writer)
         .map_err(|_| anyhow::anyhow!("internal: the target writer is still shared"))?;
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || w.finish(&dest)).await??;
+    tokio::task::spawn_blocking(move || w.finish()).await??;
     Ok((expected, n_nodes, n_links, losses))
 }
 
@@ -530,21 +558,29 @@ impl Migrator for Neo4jToObrain {
         let graph = self.connect().await?;
         let (expected, nodes, links, losses) =
             copy_into(&graph, &self.tuning, self.before_properties.as_ref(), dest).await?;
+        // `copy_into` already bails at the first named loss (see
+        // `check_no_refusal`); this is the final gate, kept explicit.
         if let Some(why) = losses.refusal() {
             anyhow::bail!("the copy would lose information — {why}");
         }
         if losses != Losses::default() {
-            tracing::info!(?losses, "storage migration: documented lossless narrowings");
+            tracing::info!(?losses, "storage migration: documented narrowings");
         }
         if let Some(hook) = &self.after_write {
             hook(dest)?;
         }
         let dest = dest.to_path_buf();
-        let read =
-            tokio::task::spawn_blocking(move || target::read_back(&dest, nodes, links)).await??;
+        let read_dest = dest.clone();
+        let read = tokio::task::spawn_blocking(move || target::read_back(&read_dest, nodes, links))
+            .await??;
         if let Some(why) = expected.first_difference(&read) {
             anyhow::bail!("content fingerprint mismatch after the copy — {why}");
         }
+        // The base is PO's only once the content fingerprint agrees: the marker
+        // is written (atomically) AFTER verification, so a copy interrupted
+        // before this point leaves a base without the marker, and the direct
+        // open (`storage.backend = obrain` without `migration.from`) refuses it.
+        tokio::task::spawn_blocking(move || crate::obrain::write_base_marker(&dest)).await??;
         tracing::info!(
             nodes,
             links,

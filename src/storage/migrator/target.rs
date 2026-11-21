@@ -84,33 +84,136 @@ impl Prints {
     }
 }
 
-/// One entity's hash: the kind, the ends (relationships) and the properties,
-/// whatever the order they are given in.
+/// Feed a hasher the canonical bytes of a `Value`: a discriminant byte per
+/// variant, then the full payload. `Debug` is deliberately NOT used: its
+/// rendering abbreviates `Vector` (`[first; dims]`) and `Bytes`
+/// (`[first byte; len]`), which would compare an embedding of 1536 f32 on its
+/// first element alone (four bytes). Variable-length payloads are
+/// length-prefixed so concatenation is unambiguous.
+fn hash_value(h: &mut impl std::hash::Hasher, v: &Value) {
+    match v {
+        Value::Null => h.write_u8(0),
+        Value::Bool(b) => {
+            h.write_u8(1);
+            h.write_u8(u8::from(*b));
+        }
+        Value::Int64(i) => {
+            h.write_u8(2);
+            h.write_i64(*i);
+        }
+        Value::Float64(f) => {
+            h.write_u8(3);
+            h.write_u64(f.to_bits());
+        }
+        Value::String(s) => {
+            h.write_u8(4);
+            h.write_u64(s.len() as u64);
+            h.write(s.as_bytes());
+        }
+        Value::Bytes(b) => {
+            h.write_u8(5);
+            h.write_u64(b.len() as u64);
+            h.write(b);
+        }
+        Value::Timestamp(t) => {
+            h.write_u8(6);
+            h.write_i64(t.as_nanos());
+        }
+        Value::Date(d) => {
+            h.write_u8(7);
+            h.write_i32(d.as_days());
+        }
+        Value::Time(t) => {
+            h.write_u8(8);
+            h.write_u64(t.as_nanos());
+            match t.offset_seconds() {
+                None => h.write_u8(0),
+                Some(off) => {
+                    h.write_u8(1);
+                    h.write_i32(off);
+                }
+            }
+        }
+        Value::Duration(d) => {
+            h.write_u8(9);
+            h.write_i64(d.months());
+            h.write_i64(d.days());
+            h.write_i64(d.nanos());
+        }
+        Value::ZonedDatetime(z) => {
+            h.write_u8(10);
+            h.write_i64(z.as_timestamp().as_nanos());
+            h.write_i32(z.offset_seconds());
+        }
+        Value::List(l) => {
+            h.write_u8(11);
+            h.write_u64(l.len() as u64);
+            for e in l.iter() {
+                hash_value(h, e);
+            }
+        }
+        Value::Map(m) => {
+            h.write_u8(12);
+            h.write_u64(m.len() as u64);
+            for (k, val) in m.iter() {
+                h.write_u64(k.as_str().len() as u64);
+                h.write(k.as_str().as_bytes());
+                hash_value(h, val);
+            }
+        }
+        Value::Vector(v) => {
+            h.write_u8(13);
+            h.write_u64(v.len() as u64);
+            for x in v.iter() {
+                h.write_u32(x.to_bits());
+            }
+        }
+        Value::Path { nodes, edges } => {
+            h.write_u8(14);
+            h.write_u64(nodes.len() as u64);
+            for n in nodes.iter() {
+                hash_value(h, n);
+            }
+            h.write_u64(edges.len() as u64);
+            for e in edges.iter() {
+                hash_value(h, e);
+            }
+        }
+    }
+}
+
+/// One entity's hash: the kind, the slot (nodes) or the ends (relationships)
+/// and the properties, whatever the order they are given in. The slot binds a
+/// node's properties to THAT node, so two nodes of the same label cannot
+/// exchange their properties without the hash changing.
 fn entity_hash<'a>(
     name: &str,
     ends: Option<(u64, u64)>,
+    slot: Option<u64>,
     props: impl Iterator<Item = (&'a str, &'a Value)>,
 ) -> (u64, u64) {
     let (mut count, mut sum) = (0u64, 0u64);
     for (k, v) in props {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         k.hash(&mut h);
-        // `Debug` of a `Value` is deterministic (maps are ordered) and covers
-        // the variant, so an Int64 never equals a Float64 of the same number.
-        format!("{v:?}").hash(&mut h);
+        hash_value(&mut h, v);
         sum = sum.wrapping_add(h.finish());
         count += 1;
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut h);
     ends.hash(&mut h);
+    slot.hash(&mut h);
     sum.hash(&mut h);
     (count, h.finish())
 }
 
-/// Fingerprint of one node as the SOURCE side will write it.
-pub fn node_print(label: &str, props: &Props) -> Print {
-    let (properties, hash) = entity_hash(label, None, props.iter().map(|(k, v)| (*k, v)));
+/// Fingerprint of one node as the SOURCE side will write it. `slot` is the
+/// 1-based node slot: it binds the node's properties to that node (see
+/// [`entity_hash`]).
+pub fn node_print(label: &str, slot: u64, props: &Props) -> Print {
+    let (properties, hash) =
+        entity_hash(label, None, Some(slot), props.iter().map(|(k, v)| (*k, v)));
     Print {
         entities: 1,
         properties,
@@ -124,6 +227,7 @@ pub fn edge_print(edge_type: &str, src: u32, dst: u32, props: &Props) -> Print {
     let (properties, hash) = entity_hash(
         edge_type,
         Some((u64::from(src), u64::from(dst))),
+        None,
         props.iter().map(|(k, v)| (*k, v)),
     );
     Print {
@@ -181,20 +285,17 @@ impl TargetWriter {
             .map_err(|e| anyhow::anyhow!("bulk_import_edge_props(slot {first}): {e}"))
     }
 
-    /// Checkpoint and close, then write the marker that makes the directory a
-    /// PO base (`crate::obrain::MARQUEUR_PO`): without it PO refuses to open a
-    /// base it did not create.
-    pub fn finish(self, dest: &Path) -> Result<()> {
+    /// Checkpoint and close the base. The PO base marker is NOT written here:
+    /// it goes in only after the copy is read back and verified (see
+    /// [`crate::obrain::write_base_marker`]), so a base written but not yet
+    /// verified is never marked PO and the direct open refuses to serve it.
+    pub fn finish(self) -> Result<()> {
         self.db
             .checkpoint()
             .map_err(|e| anyhow::anyhow!("checkpoint: {e}"))?;
         self.db.close().map_err(|e| anyhow::anyhow!("close: {e}"))?;
         drop(self.db);
-        std::fs::write(
-            dest.join(crate::obrain::MARQUEUR_PO),
-            crate::obrain::SCHEMA_PO,
-        )
-        .with_context(|| format!("writing the PO base marker in {}", dest.display()))
+        Ok(())
     }
 }
 
@@ -229,6 +330,7 @@ pub fn read_back(dest: &Path, nodes: u64, links: u64) -> Result<Prints> {
         let (properties, hash) = entity_hash(
             node.labels[0].as_str(),
             None,
+            Some(slot),
             props.iter().map(|(k, v)| (*k, *v)),
         );
         prints
@@ -254,6 +356,7 @@ pub fn read_back(dest: &Path, nodes: u64, links: u64) -> Result<Prints> {
         let (properties, hash) = entity_hash(
             edge.edge_type.as_str(),
             Some((edge.src.0, edge.dst.0)),
+            None,
             props.iter().map(|(k, v)| (*k, *v)),
         );
         prints
@@ -318,13 +421,13 @@ mod tests {
         w.structure(&labels, &src, &dst, &types).unwrap();
         w.node_props(1, &node_props).unwrap();
         w.edge_props(1, &edge_props).unwrap();
-        w.finish(dest).unwrap();
+        w.finish().unwrap();
         let mut p = Prints::default();
-        for (l, props) in labels.iter().zip(&node_props) {
+        for (i, (l, props)) in labels.iter().zip(&node_props).enumerate() {
             p.nodes
                 .entry(l.to_string())
                 .or_default()
-                .add(node_print(l, props));
+                .add(node_print(l, (i + 1) as u64, props));
         }
         for (i, props) in edge_props.iter().enumerate() {
             p.relationships
@@ -345,7 +448,9 @@ mod tests {
         assert_eq!(got.nodes["Project"].entities, 2);
         assert_eq!(got.nodes["Project"].properties, 3);
         assert_eq!(got.relationships["HAS_TASK"].properties, 1);
-        assert!(dest.join(crate::obrain::MARQUEUR_PO).is_file());
+        // The copy itself does not mark the base PO: the marker goes in only
+        // after the read-back and the fingerprint comparison (see `copy`).
+        assert!(!dest.join(crate::obrain::MARQUEUR_PO).exists());
     }
 
     #[test]
@@ -367,6 +472,7 @@ mod tests {
         // The source claims a different value for one Project property.
         let altered = node_print(
             "Project",
+            1,
             &vec![
                 ("name", Value::String("a".into())),
                 ("n", Value::Int64(255)),
@@ -374,6 +480,7 @@ mod tests {
         );
         let honest = node_print(
             "Project",
+            1,
             &vec![("name", Value::String("a".into())), ("n", Value::Int64(-1))],
         );
         let p = expected.nodes.get_mut("Project").unwrap();
@@ -406,5 +513,78 @@ mod tests {
             edge_print("T", 1, 2, &vec![]).hash,
             edge_print("T", 2, 1, &vec![]).hash
         );
+    }
+
+    #[test]
+    fn a_changed_embedding_element_past_the_first_changes_the_fingerprint() {
+        // `Debug` abbreviates `Vector` to `[first; dims]`: with the canonical
+        // serialization, changing element 2 of a 3-element embedding must change
+        // the fingerprint (before, only the first element was compared).
+        let emb = |c: f32| Value::Vector(std::sync::Arc::from(vec![1.0f32, 2.0, c]));
+        let a = node_print("Node", 1, &vec![("embedding", emb(3.0))]);
+        let b = node_print("Node", 1, &vec![("embedding", emb(9.0))]);
+        assert_ne!(a.hash, b.hash);
+        let mut left = Prints::default();
+        left.nodes.entry("Node".into()).or_default().add(a);
+        let mut right = Prints::default();
+        right.nodes.entry("Node".into()).or_default().add(b);
+        let why = left.first_difference(&right).unwrap();
+        assert!(why.contains("fingerprint"), "{why}");
+    }
+
+    #[test]
+    fn bytes_past_the_first_byte_change_the_fingerprint() {
+        // `Debug` abbreviates `Bytes` to `[first; len]`: the canonical
+        // serialization must see every byte, not just the first.
+        let bytes = |x: u8| Value::Bytes(std::sync::Arc::from(vec![0u8, x, 9u8]));
+        assert_ne!(
+            node_print("T", 1, &vec![("b", bytes(1))]).hash,
+            node_print("T", 1, &vec![("b", bytes(2))]).hash
+        );
+    }
+
+    #[test]
+    fn swapping_properties_between_two_nodes_of_the_same_label_is_a_mismatch() {
+        // The slot binds a node's properties to that node: two nodes of the same
+        // label with the same number of properties cannot exchange them without
+        // the fingerprint changing.
+        let a = node_print(
+            "Node",
+            1,
+            &vec![("x", Value::Int64(1)), ("y", Value::Int64(2))],
+        );
+        let b = node_print(
+            "Node",
+            2,
+            &vec![("x", Value::Int64(3)), ("y", Value::Int64(4))],
+        );
+        let mut before = Prints::default();
+        before.nodes.entry("Node".into()).or_default().add(a);
+        before.nodes.entry("Node".into()).or_default().add(b);
+        let sa = node_print(
+            "Node",
+            1,
+            &vec![("x", Value::Int64(3)), ("y", Value::Int64(4))],
+        );
+        let sb = node_print(
+            "Node",
+            2,
+            &vec![("x", Value::Int64(1)), ("y", Value::Int64(2))],
+        );
+        let mut after = Prints::default();
+        after.nodes.entry("Node".into()).or_default().add(sa);
+        after.nodes.entry("Node".into()).or_default().add(sb);
+        let why = before.first_difference(&after).unwrap();
+        assert!(why.contains("fingerprint"), "{why}");
+    }
+
+    #[test]
+    fn the_copy_does_not_mark_the_base_po_before_verification() {
+        let d = dir();
+        let dest = d.path().join("base");
+        write(&dest);
+        // `finish` checkpoints and closes but does NOT write the marker: it goes
+        // in after the read-back and the fingerprint comparison (see `copy`).
+        assert!(!dest.join(crate::obrain::MARQUEUR_PO).exists());
     }
 }

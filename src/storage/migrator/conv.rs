@@ -15,8 +15,11 @@ use std::sync::Arc;
 /// What the conversion could not keep identically, by cause.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Losses {
-    /// A datetime whose nanoseconds are not a multiple of 1 000: obrain's
-    /// `ZonedDatetime` is in microseconds.
+    /// A datetime whose nanoseconds are not a multiple of 1 000, truncated to
+    /// the microsecond: obrain's `ZonedDatetime` stores microseconds. An
+    /// ACCEPTED, documented loss — PO writes its own dates at nanosecond
+    /// precision (`to_rfc3339()`), so on a Linux runner almost every node
+    /// carries one. It is counted and reported, but it does NOT refuse the copy.
     pub sub_microsecond: u64,
     /// A datetime carrying a zone NAME (`[Europe/Paris]`): obrain keeps the offset only.
     pub named_zone: u64,
@@ -30,17 +33,16 @@ pub struct Losses {
 
 impl Losses {
     /// The named cause that must fail the copy, `None` when nothing was lost.
-    /// Every counter but `inexact_vector` is a real loss: sub-microsecond
-    /// precision, the NAME of a zone, the "local" nature of a datetime, a value
-    /// with no equivalent. `inexact_vector` loses nothing (the exact floats are
-    /// kept, as a list rather than an f32 vector) and is only logged.
+    /// A real loss is refused: the NAME of a zone, the "local" nature of a
+    /// datetime, a value with no equivalent. Two narrowings are accepted and
+    /// only counted/logged: `inexact_vector` loses nothing (the exact floats
+    /// are kept, as a list rather than an f32 vector), and `sub_microsecond`
+    /// truncates a datetime to the microsecond — obrain stores no finer, and
+    /// refusing it would make the real base (PO writes dates at nanosecond
+    /// precision) unmigrable.
     pub fn refusal(&self) -> Option<String> {
         let mut causes = Vec::new();
         for (n, what) in [
-            (
-                self.sub_microsecond,
-                "datetime(s) with sub-microsecond precision (obrain keeps microseconds)",
-            ),
             (
                 self.named_zone,
                 "datetime(s) carrying a zone NAME (obrain keeps the offset only)",
@@ -234,11 +236,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(inexact.refusal(), None, "an exact list loses nothing");
-        for l in [
+        // `sub_microsecond` is the ONE accepted truncation (to the microsecond):
+        // counted and reported, but it does NOT refuse — PO writes its own dates
+        // at nanosecond precision, and refusing would make the real base
+        // unmigrable.
+        assert_eq!(
             Losses {
-                sub_microsecond: 1,
+                sub_microsecond: 7,
                 ..Default::default()
-            },
+            }
+            .refusal(),
+            None,
+            "microsecond truncation is accepted"
+        );
+        for l in [
             Losses {
                 named_zone: 1,
                 ..Default::default()
@@ -253,6 +264,28 @@ mod tests {
             },
         ] {
             assert!(l.refusal().is_some(), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn a_nanosecond_datetime_is_truncated_to_the_microsecond_and_not_refused() {
+        // PO writes its own dates at nanosecond precision (`to_rfc3339()`); on a
+        // Linux runner `Utc::now()` is nanosecond, so the real base carries
+        // sub-microsecond datetimes. The copy must truncate, count, and NOT
+        // refuse — otherwise the real base is unmigrable.
+        let dt =
+            chrono::DateTime::parse_from_rfc3339("2026-11-20T10:00:00.123456789+01:00").unwrap();
+        let mut l = Losses::default();
+        let v = zoned(dt, &mut l).unwrap();
+        assert_eq!(l.refusal(), None, "sub-microsecond is an accepted loss");
+        assert_eq!(l.sub_microsecond, 1, "it is still counted");
+        match v {
+            Value::ZonedDatetime(z) => {
+                let nanos = dt.timestamp_nanos_opt().unwrap();
+                assert_eq!(z.as_timestamp().as_nanos(), nanos - (nanos % 1000));
+                assert_eq!(z.offset_seconds(), 3600);
+            }
+            other => panic!("expected a ZonedDatetime, got {other:?}"),
         }
     }
 
