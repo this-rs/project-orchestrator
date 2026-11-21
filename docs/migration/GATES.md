@@ -25,7 +25,7 @@ signalaient sans bloquer.
   **sur le SHA de tête de la PR** ;
 - `enforce_admins: true` — le blocage s'applique aussi à l'orchestrateur, qui est la seule
   identité qui fusionne : sans ce réglage, la protection ne gênerait personne ;
-- pull request obligatoire ; force-push et suppression de branche interdits.
+- pull request obligatoire, mais **zéro approbation exigée** (`required_approving_review_count: 0`, pas de code owners) : la PR est le passage obligé, pas une revue ; force-push et suppression de branche interdits.
 
 Effet vérifié le jour même : une PR dont un de ces quatre checks n'a pas conclu passe en
 `mergeStateStatus: BLOCKED`, et une PR verte sur son SHA de tête passe `CLEAN`.
