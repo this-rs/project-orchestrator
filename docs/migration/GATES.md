@@ -48,10 +48,10 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) aux 18 modules `obrain_` (86 tests). **Trou** : les 28 contrôles transverses (`all_checks!`) ne tournent que sur Neo4j et le mock |
 | G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
-| G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | **non automatisé** | **non fait** ; le migrateur réel est hors dépôt (attendu avant la bascule) |
+| G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration, datetimes comptées | CI : Obrain backend (tests `migrator`) + **non automatisé** pour la copie réelle | **en cours** (PR #1256) : migrateur réel dans le dépôt, empreinte et comptes vérifiés, quarantaine PO vérifiée à l'ouverture de la copie ; datetimes tronquées COMPTÉES et enregistrées dans le marqueur mais **pas sans perte** (décision en attente) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
 | G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **non conçu** |
-| G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` (branche de #1248) | implémenté et testé sur #1248, **non fusionné** |
+| G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` (fusionné par #1248) | **sélection de la source** implémentée et testée (migrateur factice). Les écritures faites sur obrain après la bascule ne sont ni recopiées ni réconciliées : **elles sont perdues** pour la source. Cette perte est annoncée (message + marqueur) mais non testée sur données réelles. Pas de test de bout en bout avec le vrai migrateur. **Porte rouge** tant qu'une stratégie explicite pour les écritures post-bascule n'est pas choisie |
 | G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) |
 
 ## Détail des portes automatisées
@@ -150,9 +150,28 @@ vaut plus : elle portait sur une branche où les dates étaient mal lues.
 
 ### G7 — oracle de copie
 Copie jetable, comptes par type égaux, empreinte par label égale, zéro nœud en quarantaine,
-dates relues à la microseconde. C'est la porte que demande #1246. La spécification
-`obrain-migration-spec.md` est **hors dépôt** (à la racine du dossier de travail) ; le
-migrateur réel aussi (tâche `MIGRATEUR-REEL`, reportée jusqu'à la fin de la migration).
+dates relues à la microseconde. C'est la porte que demande #1246.
+
+**État au 21/11/2026 (PR #1256, branche `obrain/migrateur-reel`)** : le migrateur réel
+(`storage::migrator::Neo4jToObrain`, feature `obrain-backend`) est dans le dépôt.
+
+Ce qui est vérifié :
+- comptes par type source vs cible (refus si différents) ;
+- empreinte par label (hash Mérkle sur les propriétés, refus si divergence) ;
+- quarantaine PO : la copie est ouverte par `ObrainGraphStore::open` après l'empreinte
+  — refusée si l'ouverture met un nœud en quarantaine (test : un nœud Plan sans statut
+  passe les comptes et l'empreinte mais PO le met en quarantaine → refus nommé) ;
+- dérive de la source : les comptes source sont relus APRÈS la copie et refusés s'ils
+  ont bougé (détecte un écrivain externe pendant la copie).
+
+Ce qui n'est **pas** sans perte :
+- les datetimes avec des nanosecondes non multiples de 1000 sont tronquées à la
+  microseconde (obrain ne stocke pas plus fin). Le compte des troncatures est enregistré
+  dans le marqueur `DONE_MARKER` (champ `narrowings.sub_microsecond_datetimes`) et
+  tracé dans les logs. Un prototype de compagnon `<clé>__nanos` démontre l'aller-retour
+  exact en test, mais il n'est **pas branché** en production.
+- **Décision en attente** : accepter la troncature ou la résoudre sans perte. Tant que
+  cette décision n'est pas prise, la porte est **rouge**.
 
 ### G8 — performance
 Barre de `CONSOLIDATION.md`. Mesurée le 20/11 à 100 k et 1 M documents sur SearchStore, avec
@@ -165,8 +184,26 @@ consolidation) : ouverture 0,6 s → 7 s, filtre par projet 0,4 ms → 8,9 ms, s
 La porte de justesse décisive avant la bascule. Non conçue.
 
 ### G10 — retour arrière
-Sur la branche de #1248 (`src/storage/migrate.rs`, absent de la consolidation) : rollback par
-configuration, source jamais modifiée, testé. Non fusionné.
+Fusionné par #1248 (`src/storage/migrate.rs`, `src/storage/mod.rs`).
+
+**Sélection de la source** par variable de configuration : implémentée et testée avec un
+migrateur factice. La source n'est jamais modifiée par PO (par construction du trait
+`Migrator`).
+
+**Écritures post-bascule** : les écritures faites sur obrain après la bascule ne sont ni
+recopiées ni réconciliées vers Neo4j — elles sont **perdues** pour la source. Cette perte
+est annoncée dans le message de rollback et par un marqueur (`.po-migration-rolled-back`),
+refusée en rollback sans `from` si la cible contient des données, mais :
+- **non détectée** par comparaison de contenu ;
+- **non testée** sur des données réelles (aucun test ne crée d'écriture après la bascule
+  pour vérifier qu'elle manque côté source) ;
+- pas de test de bout en bout avec le vrai migrateur.
+
+**Porte rouge** tant qu'une des conditions suivantes n'est pas remplie :
+- une stratégie explicite pour les écritures post-bascule (décision écrite d'accepter leur
+  perte, ou recopie vers Neo4j), avec un test qui écrit après la bascule puis fait le
+  rollback ; OU
+- un test de bout en bout du rollback avec le vrai migrateur.
 
 ### G11 — stabilité des tests
 `kill9_during_creations…` échoue au hasard, de deux façons mesurées : le garde-fou de timing
