@@ -418,7 +418,10 @@ impl ObrainGraphStore {
                         props.insert("forgotten_at".into(), maintenant.clone());
                         props.insert("forgotten_reason".into(), Value::from("decay"));
                         // Created whole BEFORE the synapse goes: a cut leaves both.
+                        // L'arête n'existe pas encore : il n'y a pas d'arête sur laquelle
+                        // poser une propriété, c'est une création complète.
                         w.etape()?;
+                        // hors-poser: création d'arête entière, jamais une propriété posée sur une arête existante.
                         w.db.create_edge_with_props(a.de, a.vers, OUBLIE, props);
                         for vieux in &anciens[n] {
                             supprimer_arete(w, vieux.id, methode)?;
