@@ -1188,6 +1188,27 @@ mod with_the_feature {
     const ENV_KILL9: &str = "OBRAIN_PO_TEST_ENFANT_KILL9";
     const ENV_PLAFOND: &str = "OBRAIN_PO_TEST_ENFANT_PLAFOND";
 
+    /// Kills (and reaps) the child on every exit path, a failed assertion included:
+    /// `std::process::Child` does not kill on drop, and a suspended child waits forever.
+    struct GardeEnfant(std::process::Child);
+    impl std::ops::Deref for GardeEnfant {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for GardeEnfant {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for GardeEnfant {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     fn lancer_enfant(
         cas: &str,
         env: &str,
@@ -1286,6 +1307,7 @@ mod with_the_feature {
         if let Ok(dir) = std::env::var(ENV_KILL9) {
             let dir = std::path::PathBuf::from(dir);
             let mode = std::env::var("OBRAIN_PO_TEST_ENFANT_MODE").unwrap();
+            let suspendu = std::env::var("OBRAIN_PO_TEST_ENFANT_SUSPENDU").as_deref() == Ok("1");
             let durabilite = if mode == "wal" {
                 Durabilite::Wal
             } else {
@@ -1320,6 +1342,23 @@ mod with_the_feature {
                 p.description = Some(description_du_test(p.id, i, mode == "wal"));
                 let long = p.description.as_ref().unwrap().len() > 256;
                 i += 1;
+                // The suspended round: stop INSIDE the sixth creation, once its draft
+                // marker is durable and before any property, and wait there to be
+                // killed. The kill then lands inside a creation by construction, not
+                // by timing. The failed creation is not acknowledged, so it is not logged.
+                if suspendu && i == 6 {
+                    store.interrompre_au_prochain(Interruption::ApresLeMarqueur);
+                    let err = store.create_project(&p).await.unwrap_err();
+                    assert!(
+                        format!("{err:#}").contains("interruption injectée"),
+                        "{err:#}"
+                    );
+                    std::fs::write(dir.join("suspendu.tmp"), i.to_string()).unwrap();
+                    std::fs::rename(dir.join("suspendu.tmp"), dir.join("suspendu")).unwrap();
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                }
                 store.create_project(&p).await.unwrap();
                 log.write_all(format!("{}\t{}\n", p.id, i - 1).as_bytes())
                     .unwrap();
@@ -1366,31 +1405,45 @@ mod with_the_feature {
         let (mut long_vers_court, mut court_vers_long) = (0usize, 0usize);
         for tour in 0..TOURS {
             let mode = if tour % 2 == 0 { "wal" } else { "aucune" };
+            // Round 0 is the suspended round: its kill lands inside a creation, by
+            // construction. The others kill at a time-based point, as before.
+            let suspendu = tour == 0;
             let acquittes = dir.path().join(format!("acquittes-{mode}"));
             let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
             let avant = compte();
             // Where this round's updates start in the update log.
             let debut_maj = std::fs::metadata(dir.path().join("maj-wal")).map_or(0, |m| m.len());
-            let mut child = lancer_enfant(
+            let mut child = GardeEnfant(lancer_enfant(
                 "with_the_feature::kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen",
                 ENV_KILL9,
                 dir.path(),
-                &[("OBRAIN_PO_TEST_ENFANT_MODE", mode)],
-            );
-            // Wait until the child is creating (loudly: a child that never gets there
-            // is a failure, not a round that silently kills nothing), then a delay that
-            // varies per round so the kill lands at different points of a creation.
-            for _ in 0..2400 {
-                if compte() >= avant + 5 {
-                    break;
+                &[
+                    ("OBRAIN_PO_TEST_ENFANT_MODE", mode),
+                    ("OBRAIN_PO_TEST_ENFANT_SUSPENDU", if suspendu { "1" } else { "0" }),
+                ],
+            ));
+            if suspendu {
+                attendre(
+                    &dir.path().join("suspendu"),
+                    "its suspension inside a creation",
+                )
+                .await;
+            } else {
+                // Wait until the child is creating (loudly: a child that never gets there
+                // is a failure, not a round that silently kills nothing), then a delay that
+                // varies per round so the kill lands at different points of a creation.
+                for _ in 0..2400 {
+                    if compte() >= avant + 5 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(
+                    compte() >= avant + 5,
+                    "round {tour} ({mode}): the child acknowledged no creation in 60 s"
+                );
+                tokio::time::sleep(Duration::from_micros(1_500 * (tour as u64 % 9 + 1))).await;
             }
-            assert!(
-                compte() >= avant + 5,
-                "round {tour} ({mode}): the child acknowledged no creation in 60 s"
-            );
-            tokio::time::sleep(Duration::from_micros(1_500 * (tour as u64 % 9 + 1))).await;
             child.kill().unwrap();
             child.wait().unwrap();
 
@@ -1404,6 +1457,13 @@ mod with_the_feature {
                 "round {tour} ({mode}): a creation killed half-way must be REPAIRED, never \
                  quarantined: {rapport:?}"
             );
+            if suspendu {
+                assert!(
+                    rapport.brouillons_supprimes >= 1,
+                    "round {tour} ({mode}): killed inside a creation (its draft marker durable), \
+                     the draft must be found and deleted at the reopen: {rapport:?}"
+                );
+            }
 
             if mode == "wal" {
                 // Each value the child wrote and acknowledged — a project's

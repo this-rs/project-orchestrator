@@ -524,8 +524,9 @@ fn reconstruire_genre<D: Document>(
         }
         let texte = doc.texte();
         if texte_ecrit.as_deref() != Some(texte.as_str()) {
-            // hors-poser: open-time repair of a derived property, made durable by the
-            // flush that follows any non-empty opening report (`ouvrir`).
+            // Open-time repair of a derived property, made durable by the flush that
+            // follows any non-empty opening report (`ouvrir`).
+            // hors-poser: derived text, rebuilt at open (see above).
             db.set_node_property(noeud, TEXTE, Value::from(texte));
             rapport.recherches_reparees += 1;
         }
