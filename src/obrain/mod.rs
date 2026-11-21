@@ -253,6 +253,16 @@ pub(crate) fn date_optionnelle(
     }
 }
 
+/// True when the node holds a date property that is PRESENT but unreadable.
+/// [`date_optionnelle`] reads such a value as absent; a read-modify-write caller
+/// must then leave the stored raw value alone, never remove or overwrite it
+/// because it "read as absent".
+pub(crate) fn date_brute_illisible(db: &ObrainDB, noeud: NodeId, cle: &str) -> bool {
+    db.get_node(noeud)
+        .and_then(|n| n.get_property(cle).cloned())
+        .is_some_and(|v| date_valeur(&v, cle).is_err())
+}
+
 /// The value-level half of [`date_propriete`], for the callers that already hold
 /// the `Value` (an open-time index scan, for instance).
 pub(crate) fn date_valeur(v: &Value, cle: &str) -> Result<Option<DateTime<Utc>>> {

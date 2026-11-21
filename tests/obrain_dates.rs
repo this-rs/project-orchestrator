@@ -206,3 +206,107 @@ async fn a_tombstone_with_an_unreadable_issued_at_stays_a_revocation() {
     assert_eq!(tombes.len(), 1);
     assert_eq!(tombes[0].issued_at, chrono::DateTime::UNIX_EPOCH);
 }
+
+/// A read-modify-write must not erase what it read as absent only because it was
+/// unreadable: `update_persona` on another field leaves the raw `last_activated`.
+#[tokio::test]
+async fn update_persona_keeps_an_unreadable_last_activated_as_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    open(&base).await.close().await.unwrap();
+    let id = Uuid::new_v4();
+    write_foreign(&base, move |db| {
+        db.create_node_with_props(
+            &["Persona"],
+            vec![
+                ("id", Value::from(id.to_string())),
+                ("name", Value::from("pe")),
+                ("status", Value::from("active")),
+                ("energy", Value::from(0.5)),
+                ("created_at", zoned(quand())),
+                ("last_activated", illisible()),
+            ],
+        );
+    })
+    .await;
+    let store = open(&base).await;
+    let mut p = store.get_persona(id).await.unwrap().expect("servie");
+    assert!(p.last_activated.is_none());
+    p.description = "autre champ".into();
+    store.update_persona(&p).await.unwrap();
+    store.close().await.unwrap();
+
+    let base2 = base.clone();
+    let brut = tokio::task::spawn_blocking(move || {
+        let db = obrain_engine::ObrainDB::open(&base2).unwrap();
+        let n = db.store().nodes_by_label("Persona")[0];
+        let v = db
+            .get_node(n)
+            .unwrap()
+            .get_property("last_activated")
+            .cloned();
+        db.close().unwrap();
+        v
+    })
+    .await
+    .unwrap();
+    assert_eq!(brut, Some(illisible()), "la valeur brute a été effacée");
+}
+
+/// `interrupt_task` does not replace an unreadable stored `interrupted_at` by "now".
+#[tokio::test]
+async fn interrupt_task_keeps_an_unreadable_interrupted_at_as_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    open(&base).await.close().await.unwrap();
+    let (plan, tid) = (Uuid::new_v4(), Uuid::new_v4());
+    write_foreign(&base, move |db| {
+        let n_plan = db.create_node_with_props(
+            &["Plan"],
+            vec![
+                ("id", Value::from(plan.to_string())),
+                ("title", Value::from("pl")),
+                ("description", Value::from("d")),
+                ("status", Value::from("Draft")),
+                ("created_at", Value::from(quand().to_rfc3339())),
+                ("created_by", Value::from("t")),
+                ("priority", Value::from(1i64)),
+            ],
+        );
+        let n_t = db.create_node_with_props(
+            &["Task"],
+            vec![
+                ("id", Value::from(tid.to_string())),
+                ("description", Value::from("t")),
+                ("status", Value::from("Interrupted")),
+                ("created_at", zoned(quand())),
+                ("interrupted_at", illisible()),
+            ],
+        );
+        db.create_edge(n_plan, n_t, "HAS_TASK");
+    })
+    .await;
+    let store = open(&base).await;
+    assert!(
+        store.rapport_d_ouverture().en_quarantaine.is_empty(),
+        "{:?}",
+        store.rapport_d_ouverture()
+    );
+    store.interrupt_task(tid, "encore").await.unwrap();
+    store.close().await.unwrap();
+    let base2 = base.clone();
+    let brut = tokio::task::spawn_blocking(move || {
+        let db = obrain_engine::ObrainDB::open(&base2).unwrap();
+        let n = db.store().nodes_by_label("Task")[0];
+        let v = db
+            .get_node(n)
+            .unwrap()
+            .get_property("interrupted_at")
+            .cloned();
+        db.close().unwrap();
+        v
+    })
+    .await
+    .unwrap();
+    assert_eq!(brut, Some(illisible()), "interrupted_at illisible remplacé");
+}

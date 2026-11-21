@@ -1188,6 +1188,27 @@ mod with_the_feature {
     const ENV_KILL9: &str = "OBRAIN_PO_TEST_ENFANT_KILL9";
     const ENV_PLAFOND: &str = "OBRAIN_PO_TEST_ENFANT_PLAFOND";
 
+    /// Kills (and reaps) the child on every exit path, a failed assertion included:
+    /// `std::process::Child` does not kill on drop, and a suspended child waits forever.
+    struct GardeEnfant(std::process::Child);
+    impl std::ops::Deref for GardeEnfant {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for GardeEnfant {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for GardeEnfant {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     fn lancer_enfant(
         cas: &str,
         env: &str,
@@ -1392,7 +1413,7 @@ mod with_the_feature {
             let avant = compte();
             // Where this round's updates start in the update log.
             let debut_maj = std::fs::metadata(dir.path().join("maj-wal")).map_or(0, |m| m.len());
-            let mut child = lancer_enfant(
+            let mut child = GardeEnfant(lancer_enfant(
                 "with_the_feature::kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen",
                 ENV_KILL9,
                 dir.path(),
@@ -1400,7 +1421,7 @@ mod with_the_feature {
                     ("OBRAIN_PO_TEST_ENFANT_MODE", mode),
                     ("OBRAIN_PO_TEST_ENFANT_SUSPENDU", if suspendu { "1" } else { "0" }),
                 ],
-            );
+            ));
             if suspendu {
                 attendre(
                     &dir.path().join("suspendu"),

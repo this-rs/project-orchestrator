@@ -790,6 +790,9 @@ impl PersonaStore for ObrainGraphStore {
                 }
                 match p.last_activated {
                     Some(d) => fixes.push(("last_activated", Value::from(d.to_rfc3339()))),
+                    // Read as absent because it is UNREADABLE: the raw value is
+                    // kept, an update never removes what it did not read as absent.
+                    None if super::date_brute_illisible(w.db, noeud, "last_activated") => {}
                     None => a_retirer.push("last_activated"),
                 }
                 fixes.push(("updated_at", Value::from(Utc::now().to_rfc3339())));

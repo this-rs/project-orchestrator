@@ -1217,6 +1217,20 @@ impl ObrainGraphStore {
     where
         F: FnOnce(&TaskNode) -> Result<Option<Vec<(&'static str, Option<Value>)>>> + Send + 'static,
     {
+        self.tache_ecrire_brut(task_id, move |t, _| champs(t)).await
+    }
+
+    /// As [`Self::tache_ecrire`], the closure also told whether a date property is
+    /// stored but unreadable (read as absent): it must not overwrite that raw value.
+    pub(super) async fn tache_ecrire_brut<F>(&self, task_id: Uuid, champs: F) -> Result<bool>
+    where
+        F: FnOnce(
+                &TaskNode,
+                &dyn Fn(&str) -> bool,
+            ) -> Result<Option<Vec<(&'static str, Option<Value>)>>>
+            + Send
+            + 'static,
+    {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
@@ -1225,7 +1239,9 @@ impl ObrainGraphStore {
                     let Some(e) = etat.taches.tache(task_id)? else {
                         return Ok(false);
                     };
-                    match champs(&e.tache)? {
+                    let (db, n) = (w.db, e.noeud);
+                    let illisible = move |cle: &str| super::date_brute_illisible(db, n, cle);
+                    match champs(&e.tache, &illisible)? {
                         Some(c) => (e.noeud, c),
                         None => return Ok(false),
                     }
@@ -1268,7 +1284,7 @@ impl ObrainGraphStore {
 
     pub(super) async fn tache_interrompre(&self, task_id: Uuid, reason: &str) -> Result<bool> {
         let raison = reason.to_owned();
-        self.tache_ecrire(task_id, move |t| {
+        self.tache_ecrire_brut(task_id, move |t, illisible| {
             if !matches!(
                 t.status,
                 TaskStatus::Pending
@@ -1279,16 +1295,17 @@ impl ObrainGraphStore {
                 return Ok(None);
             }
             let now = maintenant();
-            let depuis = match t.interrupted_at {
-                Some(d) => Value::from(d.to_rfc3339()),
-                None => now.clone(),
-            };
-            Ok(Some(vec![
-                ("status", Some(Value::from("Interrupted"))),
-                ("interrupted_at", Some(depuis)),
-                ("interrupted_reason", Some(Value::from(raison))),
-                ("updated_at", Some(now)),
-            ]))
+            let mut champs = vec![("status", Some(Value::from("Interrupted")))];
+            match t.interrupted_at {
+                Some(d) => champs.push(("interrupted_at", Some(Value::from(d.to_rfc3339())))),
+                // Unreadable stored value, read as absent: kept as it is, not
+                // replaced by "now" (the interruption date is not invented).
+                None if illisible("interrupted_at") => {}
+                None => champs.push(("interrupted_at", Some(now.clone()))),
+            }
+            champs.push(("interrupted_reason", Some(Value::from(raison))));
+            champs.push(("updated_at", Some(now)));
+            Ok(Some(champs))
         })
         .await
     }
