@@ -1142,18 +1142,7 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::vector_search_files",
     "AnalyticsStore::vector_search_functions",
     "AnalyticsStore::get_project_decisions_for_graph",
-    "AnalyticsStore::decay_synapses",
-    "AnalyticsStore::shadow_synapse_edges",
-    "AnalyticsStore::reward_shadow_synapses",
-    "AnalyticsStore::decay_shadow_synapses",
-    "AnalyticsStore::record_synapse_shadow_trace",
-    "AnalyticsStore::list_synapse_shadow_traces",
-    "AnalyticsStore::get_synapse_shadow_trace",
-    "AnalyticsStore::claim_shadow_trace_reward",
     "AnalyticsStore::shadow_trace_closures",
-    "AnalyticsStore::consolidate_memory",
-    "AnalyticsStore::auto_observed_report",
-    "AnalyticsStore::archive_unconfirmed_auto_observed",
     "AnalyticsStore::compute_homeostasis",
     "AnalyticsStore::compute_structural_drift",
     "AnalyticsStore::get_pm_graph_data",
@@ -1188,9 +1177,6 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::batch_upsert_processes",
     "AnalyticsStore::batch_create_step_relationships",
     "AnalyticsStore::delete_project_processes",
-    "AnalyticsStore::rescope_protocol",
-    "AnalyticsStore::ensure_project_canonical_paths",
-    "AnalyticsStore::decay_project_synapses",
     "AnalyticsStore::auto_scope_to_feature_graphs",
     "AnalyticsStore::compute_adaptive_thresholds",
     "AnalyticsStore::auto_grow_file_knows",
@@ -1210,7 +1196,6 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::find_isomorphic_groups",
     "AnalyticsStore::has_context_cards",
     "AnalyticsStore::get_note_embeddings_for_project",
-    "AnalyticsStore::audit_knowledge_gaps",
     "AnalyticsStore::list_project_symbols",
     "AnalyticsStore::get_project_inheritance_edges",
     "AnalyticsStore::get_project_constraints",
@@ -1710,16 +1695,16 @@ impl AnalyticsStore for ObrainGraphStore {
         &self,
         project_id: Option<Uuid>,
     ) -> Result<Vec<serde_json::Value>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::auto_observed_report").into())
+        self.memoire_observees_rapport(project_id).await
     }
     async fn archive_unconfirmed_auto_observed(&self, project_id: Option<Uuid>) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::archive_unconfirmed_auto_observed").into())
+        self.memoire_observees_archiver(project_id).await
     }
     async fn rescope_protocol(&self, protocol_id: Uuid, project_id: Option<Uuid>) -> Result<()> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::rescope_protocol").into())
+        self.protocole_rescoper(protocol_id, project_id).await
     }
     async fn ensure_project_canonical_paths(&self) -> Result<(usize, usize)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::ensure_project_canonical_paths").into())
+        self.chemins_canoniques_assurer().await
     }
     async fn get_deep_maintenance_times(
         &self,
@@ -1769,7 +1754,7 @@ impl AnalyticsStore for ObrainGraphStore {
         &self,
         policy: &crate::neurons::forgetting::DecayPolicy,
     ) -> Result<crate::neurons::forgetting::PassReport> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::decay_synapses").into())
+        self.synapses_oublier(policy, None).await
     }
     async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
         self.cicatrices_appliquer(node_ids, increment).await
@@ -1778,7 +1763,7 @@ impl AnalyticsStore for ObrainGraphStore {
         self.cicatrices_guerir(node_id).await
     }
     async fn consolidate_memory(&self) -> Result<(usize, usize)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::consolidate_memory").into())
+        self.memoire_consolider().await
     }
     async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize> {
         self.energie_initialiser(project_id).await
@@ -1822,7 +1807,7 @@ impl AnalyticsStore for ObrainGraphStore {
         _project_id: Uuid,
         policy: &crate::neurons::forgetting::DecayPolicy,
     ) -> Result<crate::neurons::forgetting::PassReport> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::decay_project_synapses").into())
+        self.synapses_oublier(policy, Some(_project_id)).await
     }
     async fn weaken_node_synapses(
         &self,
@@ -1864,7 +1849,7 @@ impl AnalyticsStore for ObrainGraphStore {
         project_id: Uuid,
         from: &[Uuid],
     ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::shadow_synapse_edges").into())
+        self.ombre_aretes(project_id, from).await
     }
     async fn reward_shadow_synapses(
         &self,
@@ -1873,7 +1858,7 @@ impl AnalyticsStore for ObrainGraphStore {
         delta: f64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::reward_shadow_synapses").into())
+        self.ombre_recompenser(project_id, pairs, delta, now).await
     }
     async fn decay_shadow_synapses(
         &self,
@@ -1881,29 +1866,29 @@ impl AnalyticsStore for ObrainGraphStore {
         half_life_days: f64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::decay_shadow_synapses").into())
+        self.ombre_oublier(scope, half_life_days, now).await
     }
     async fn record_synapse_shadow_trace(
         &self,
         trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
         keep: usize,
     ) -> Result<()> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::record_synapse_shadow_trace").into())
+        self.ombre_enregistrer(trace, keep).await
     }
     async fn list_synapse_shadow_traces(
         &self,
         filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
     ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::list_synapse_shadow_traces").into())
+        self.ombre_lister(filter).await
     }
     async fn get_synapse_shadow_trace(
         &self,
         id: Uuid,
     ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_synapse_shadow_trace").into())
+        self.ombre_lire(id).await
     }
     async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::claim_shadow_trace_reward").into())
+        self.ombre_reclamer(trace_id, key).await
     }
     async fn shadow_trace_closures(
         &self,
@@ -1952,6 +1937,9 @@ impl AnalyticsStore for ObrainGraphStore {
         project_id: Uuid,
         limit: usize,
     ) -> Result<Vec<NoteEmbeddingPoint>> {
+        // Refused, with its reason: a note's embedding can be neither written nor read back on
+        // this backend (`NoteStore::set_note_embedding` / `get_note_embedding` refuse: obrain does
+        // not journal a vector), so an empty list could not be told from lost embeddings.
         Err(crate::obrain::NonPorte("AnalyticsStore::get_note_embeddings_for_project").into())
     }
 
@@ -2159,7 +2147,7 @@ impl AnalyticsStore for ObrainGraphStore {
         Err(crate::obrain::NonPorte("AnalyticsStore::find_isomorphic_groups").into())
     }
     async fn audit_knowledge_gaps(&self, project_id: Uuid) -> Result<AuditGapsReport> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::audit_knowledge_gaps").into())
+        self.memoire_lacunes(project_id).await
     }
 
     // ---- sub-lot A8 ----
@@ -2239,7 +2227,7 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
-        assert_eq!(REFUSEES.len(), 96);
+        assert_eq!(REFUSEES.len(), 81);
     }
 
     /// The reserved keys of `trigger::cle_reservee` never collide on a value that
