@@ -85,8 +85,8 @@ use super::{decision, note, persona, project, Ecriture, Etat, ObrainGraphStore};
 use crate::neo4j::models::DecisionNode;
 use crate::notes::{Note, PROJECT_DORMANT_AFTER_DAYS};
 
-const SYNAPSE: &str = "SYNAPSE";
-const OUBLIE: &str = "FORGOTTEN";
+pub(super) const SYNAPSE: &str = "SYNAPSE";
+pub(super) const OUBLIE: &str = "FORGOTTEN";
 /// What a revived archived edge never starts under: `DecayPolicy::default().forget_threshold`.
 const PLANCHER_REVIVAL: f64 = 0.02;
 /// The property of a `Project` node that holds when its deep maintenance last ran.
@@ -97,7 +97,7 @@ const PROJET_DEEP: &str = "last_deep_maintenance_at";
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Genre {
+pub(super) enum Genre {
     Note,
     Decision,
 }
@@ -118,7 +118,7 @@ struct Bout {
 }
 
 /// A note this backend holds: refused when its node was quarantined at open.
-fn noeud_de_note(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<NodeId>> {
+pub(super) fn noeud_de_note(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<NodeId>> {
     if etat.notes.est_reservee(id) {
         bail!(
             "{methode} de la note {id} refusé : un nœud Note de cet id est sur disque, illisible \
@@ -128,7 +128,7 @@ fn noeud_de_note(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<NodeId>>
     Ok(etat.notes.noeud_de(id))
 }
 
-fn noeud_de_decision(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<NodeId>> {
+pub(super) fn noeud_de_decision(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<NodeId>> {
     if etat.decisions.est_reservee(id) {
         bail!(
             "{methode} de la décision {id} refusé : un nœud Decision de cet id est sur disque, \
@@ -154,20 +154,20 @@ fn bout(etat: &Etat, id: Uuid, methode: &str) -> Result<Option<Bout>> {
 
 /// One edge as the engine holds it: its ends and a copy of its properties.
 #[derive(Clone, Debug)]
-struct Arete {
-    id: EdgeId,
-    de: NodeId,
-    vers: NodeId,
-    p: HashMap<String, Value>,
+pub(super) struct Arete {
+    pub(super) id: EdgeId,
+    pub(super) de: NodeId,
+    pub(super) vers: NodeId,
+    pub(super) p: HashMap<String, Value>,
 }
 
 impl Arete {
-    fn get(&self, cle: &str) -> Option<&Value> {
+    pub(super) fn get(&self, cle: &str) -> Option<&Value> {
         self.p.get(cle).filter(|v| !matches!(v, Value::Null))
     }
 
     /// The weight: a number, or an error (never a default).
-    fn poids(&self) -> Result<f64> {
+    pub(super) fn poids(&self) -> Result<f64> {
         match self.get("weight") {
             None => bail!(
                 "arête {SYNAPSE} {:?} → {:?} sans propriété `weight`",
@@ -188,7 +188,7 @@ impl Arete {
     }
 
     /// An optional number property: absent is `None`, a non-number is an error.
-    fn nombre(&self, cle: &str) -> Result<Option<f64>> {
+    pub(super) fn nombre(&self, cle: &str) -> Result<Option<f64>> {
         match self.get(cle) {
             None => Ok(None),
             Some(v) => v
@@ -201,12 +201,12 @@ impl Arete {
         }
     }
 
-    fn texte(&self, cle: &str) -> Option<&str> {
+    pub(super) fn texte(&self, cle: &str) -> Option<&str> {
         self.get(cle).and_then(Value::as_str)
     }
 }
 
-fn lire_arete(db: &ObrainDB, id: EdgeId) -> Result<Arete> {
+pub(super) fn lire_arete(db: &ObrainDB, id: EdgeId) -> Result<Arete> {
     let e = db
         .get_edge(id)
         .ok_or_else(|| anyhow!("arête {id:?} listée par le moteur mais illisible"))?;
@@ -222,7 +222,12 @@ fn lire_arete(db: &ObrainDB, id: EdgeId) -> Result<Arete> {
 }
 
 /// The edges of `type_` leaving `noeud` (`Outgoing`) or arriving at it (`Incoming`).
-fn aretes_de(db: &ObrainDB, noeud: NodeId, sens: Direction, type_: &str) -> Result<Vec<Arete>> {
+pub(super) fn aretes_de(
+    db: &ObrainDB,
+    noeud: NodeId,
+    sens: Direction,
+    type_: &str,
+) -> Result<Vec<Arete>> {
     let mut v = Vec::new();
     for (_, id) in db.store().edges_from(noeud, sens) {
         let Some(e) = db.get_edge(id) else {
@@ -236,7 +241,7 @@ fn aretes_de(db: &ObrainDB, noeud: NodeId, sens: Direction, type_: &str) -> Resu
 }
 
 /// Every `SYNAPSE` edge touching `noeud`, in both directions, each once.
-fn incidentes(db: &ObrainDB, noeud: NodeId) -> Result<Vec<Arete>> {
+pub(super) fn incidentes(db: &ObrainDB, noeud: NodeId) -> Result<Vec<Arete>> {
     let mut vues: HashSet<EdgeId> = HashSet::new();
     let mut v = Vec::new();
     for sens in [Direction::Outgoing, Direction::Incoming] {
@@ -250,7 +255,7 @@ fn incidentes(db: &ObrainDB, noeud: NodeId) -> Result<Vec<Arete>> {
 }
 
 /// The edges of `type_` from `de` to `vers`.
-fn entre(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<Vec<Arete>> {
+pub(super) fn entre(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<Vec<Arete>> {
     Ok(aretes_de(db, de, Direction::Outgoing, type_)?
         .into_iter()
         .filter(|a| a.vers == vers)
@@ -258,7 +263,7 @@ fn entre(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<Vec<Are
 }
 
 /// Refuse, before any write, a pair that carries parallel edges of `type_` in one direction.
-fn sans_doublon(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<()> {
+pub(super) fn sans_doublon(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<()> {
     let n = entre(db, de, vers, type_)?.len();
     if n > 1 {
         bail!(
@@ -269,11 +274,11 @@ fn sans_doublon(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str) -> Result<
     Ok(())
 }
 
-fn etiquettes(db: &ObrainDB, noeud: NodeId) -> Vec<String> {
+pub(super) fn etiquettes(db: &ObrainDB, noeud: NodeId) -> Vec<String> {
     db.get_node_labels(noeud).unwrap_or_default()
 }
 
-fn genre_de(db: &ObrainDB, noeud: NodeId) -> Option<Genre> {
+pub(super) fn genre_de(db: &ObrainDB, noeud: NodeId) -> Option<Genre> {
     let l = etiquettes(db, noeud);
     if l.iter().any(|e| &**e == "Note") {
         Some(Genre::Note)
@@ -285,7 +290,7 @@ fn genre_de(db: &ObrainDB, noeud: NodeId) -> Option<Genre> {
 }
 
 /// The `id` property of a node, as a UUID: an error when it is absent or unreadable.
-fn id_du_noeud(db: &ObrainDB, noeud: NodeId) -> Result<Uuid> {
+pub(super) fn id_du_noeud(db: &ObrainDB, noeud: NodeId) -> Result<Uuid> {
     db.get_node(noeud)
         .and_then(|n| {
             n.get_property("id")
@@ -297,7 +302,7 @@ fn id_du_noeud(db: &ObrainDB, noeud: NodeId) -> Result<Uuid> {
 }
 
 /// A property of a node, as the engine holds it (never from an index).
-fn propriete(db: &ObrainDB, noeud: NodeId, cle: &str) -> Result<Option<Value>> {
+pub(super) fn propriete(db: &ObrainDB, noeud: NodeId, cle: &str) -> Result<Option<Value>> {
     let n = db
         .get_node(noeud)
         .ok_or_else(|| anyhow!("nœud {noeud:?} indexé mais absent de la base"))?;
@@ -306,7 +311,7 @@ fn propriete(db: &ObrainDB, noeud: NodeId, cle: &str) -> Result<Option<Value>> {
         .cloned())
 }
 
-fn nombre_du_noeud(db: &ObrainDB, noeud: NodeId, cle: &str) -> Result<Option<f64>> {
+pub(super) fn nombre_du_noeud(db: &ObrainDB, noeud: NodeId, cle: &str) -> Result<Option<f64>> {
     match propriete(db, noeud, cle)? {
         None => Ok(None),
         Some(v) => v
@@ -329,15 +334,15 @@ fn projet_du_noeud(db: &ObrainDB, noeud: NodeId) -> Result<Option<String>> {
     }
 }
 
-fn maintenant() -> String {
+pub(super) fn maintenant() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-fn instant(d: DateTime<Utc>) -> Value {
+pub(super) fn instant(d: DateTime<Utc>) -> Value {
     Value::from(d.to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
-fn fini(valeur: f64, nom: &str) -> Result<()> {
+pub(super) fn fini(valeur: f64, nom: &str) -> Result<()> {
     if !valeur.is_finite() {
         bail!("`{nom}` non fini ({valeur}) refusé : Neo4j le stockerait ; divergence assumée");
     }
@@ -372,7 +377,7 @@ fn fusionner(
     Ok(())
 }
 
-fn supprimer_arete(w: &mut Ecriture<'_>, id: EdgeId, methode: &str) -> Result<()> {
+pub(super) fn supprimer_arete(w: &mut Ecriture<'_>, id: EdgeId, methode: &str) -> Result<()> {
     w.etape()?;
     let supprimee = !w.suppression_d_arete_refusee() && w.db.delete_edge(id);
     if !supprimee {
@@ -424,7 +429,7 @@ fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<()> {
 /// The projects with no human activity (code sync nor chat session) for
 /// [`PROJECT_DORMANT_AFTER_DAYS`] days: their energy is frozen. As Neo4j's
 /// `dormant_project_ids`, from the project and chat indexes.
-fn projets_endormis(etat: &Etat, now: DateTime<Utc>) -> Result<HashSet<Uuid>> {
+pub(super) fn projets_endormis(etat: &Etat, now: DateTime<Utc>) -> Result<HashSet<Uuid>> {
     let n = etat.chat.sessions_en_quarantaine();
     if n > 0 {
         bail!(
@@ -448,7 +453,7 @@ fn projets_endormis(etat: &Etat, now: DateTime<Utc>) -> Result<HashSet<Uuid>> {
     Ok(v)
 }
 
-fn refus_si_notes_en_quarantaine(etat: &Etat, methode: &str) -> Result<()> {
+pub(super) fn refus_si_notes_en_quarantaine(etat: &Etat, methode: &str) -> Result<()> {
     let n = etat.notes.en_quarantaine();
     if n > 0 {
         bail!(
@@ -459,7 +464,7 @@ fn refus_si_notes_en_quarantaine(etat: &Etat, methode: &str) -> Result<()> {
     Ok(())
 }
 
-fn statut_brut_actif(db: &ObrainDB, noeud: NodeId) -> Result<bool> {
+pub(super) fn statut_brut_actif(db: &ObrainDB, noeud: NodeId) -> Result<bool> {
     Ok(propriete(db, noeud, "status")?
         .as_ref()
         .and_then(Value::as_str)

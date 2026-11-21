@@ -1587,18 +1587,6 @@ async fn what_is_not_ported_still_refuses_by_name() {
         }};
     }
     refuse!(
-        store.decay_synapses(&Default::default()),
-        "AnalyticsStore::decay_synapses"
-    );
-    refuse!(
-        store.decay_project_synapses(id, &Default::default()),
-        "AnalyticsStore::decay_project_synapses"
-    );
-    refuse!(
-        store.consolidate_memory(),
-        "AnalyticsStore::consolidate_memory"
-    );
-    refuse!(
         store.get_project_synapse_edges(id),
         "AnalyticsStore::get_project_synapse_edges"
     );
@@ -1635,13 +1623,13 @@ async fn what_is_not_ported_still_refuses_by_name() {
             "{nom} must not be refused"
         );
     }
-    assert_eq!(refusees_analytics().len(), 96);
+    assert_eq!(refusees_analytics().len(), 81);
     assert_eq!(
         servent
             .iter()
             .filter(|m| m.starts_with("AnalyticsStore::"))
             .count(),
-        49,
-        "25 (A1) + 1 (`run_data_migrations`) + 23"
+        64,
+        "25 (A1) + 1 (`run_data_migrations`) + 23 (A2) + 15 (`tests/obrain_memoire.rs`)"
     );
 }

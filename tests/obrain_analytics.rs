@@ -713,8 +713,8 @@ async fn the_other_sub_lots_refuse_by_name() {
         }};
     }
     refuse!(
-        store.consolidate_memory(),
-        "AnalyticsStore::consolidate_memory"
+        store.get_note_embeddings_for_project(id, 10),
+        "AnalyticsStore::get_note_embeddings_for_project"
     );
     refuse!(
         store.get_project_import_edges(id),
@@ -725,16 +725,8 @@ async fn the_other_sub_lots_refuse_by_name() {
         "AnalyticsStore::compute_churn_scores"
     );
     refuse!(
-        store.decay_synapses(&Default::default()),
-        "AnalyticsStore::decay_synapses"
-    );
-    refuse!(
-        store.decay_project_synapses(id, &Default::default()),
-        "AnalyticsStore::decay_project_synapses"
-    );
-    refuse!(
-        store.ensure_project_canonical_paths(),
-        "AnalyticsStore::ensure_project_canonical_paths"
+        store.shadow_trace_closures(chrono::Utc::now(), 10),
+        "AnalyticsStore::shadow_trace_closures"
     );
     refuse!(
         store.has_context_cards("p"),
@@ -745,7 +737,7 @@ async fn the_other_sub_lots_refuse_by_name() {
         store.causal_walk("Note", "x", 2),
         "AnalyticsStore::causal_walk"
     );
-    assert_eq!(refusees_analytics().len(), 96);
+    assert_eq!(refusees_analytics().len(), 81);
     assert!(refusees_analytics()
         .iter()
         .all(|m| m.starts_with("AnalyticsStore::")));
@@ -756,9 +748,9 @@ async fn the_other_sub_lots_refuse_by_name() {
         .filter(|m| m.starts_with("AnalyticsStore::"))
         .count();
     assert_eq!(
-        n, 49,
-        "25 (A1) + 23 (A2, `tests/obrain_neural.rs`) serve and `run_data_migrations` answers its \
-         no-migration"
+        n, 64,
+        "25 (A1) + 23 (A2, `tests/obrain_neural.rs`) + 15 (memory and maintenance, \
+         `tests/obrain_memoire.rs`) serve and `run_data_migrations` answers its no-migration"
     );
     // The one that cannot refuse says what it is.
     assert!(store.run_data_migrations().await.is_empty());

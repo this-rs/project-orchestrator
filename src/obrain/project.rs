@@ -96,7 +96,9 @@ use uuid::Uuid;
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
-use crate::neo4j::file_uid::{canonical_root, declared_root_of, PathPolicy};
+use crate::neo4j::file_uid::{
+    canonical_path_update, canonical_root, declared_root_of, try_canonical_root, PathPolicy,
+};
 use crate::neo4j::models::{ProjectNode, ProjectProfile};
 use crate::neo4j::traits::ProjectStore;
 
@@ -338,6 +340,113 @@ fn trio_de_chemins(racine: String) -> [(&'static str, Value); 3] {
         ("canonical_path", Value::from(canonical_root(Some(&racine)))),
         ("root_path", Value::from(racine)),
     ]
+}
+
+impl ObrainGraphStore {
+    /// `ensure_project_canonical_paths`: fill (or repair) `canonical_path` and `declared_path` of
+    /// the projects that predate them, from `root_path`. Idempotent: only a project whose value is
+    /// missing or differs from the resolved one is written. Returns `(scanned, updated)`.
+    ///
+    /// As `Neo4jClient::ensure_project_canonical_paths`, with these named differences:
+    ///
+    /// - a write that fails REFUSES (Neo4j counts it out and goes on: `if … .is_ok()`);
+    /// - a project node the index does not serve (quarantined at open) refuses the call, since it
+    ///   would be scanned and skipped without a word; a stored path that is not a string refuses
+    ///   (Neo4j reads it as empty and rewrites it);
+    /// - the filesystem is consulted under the writer lock (the call is a boot repair, and the
+    ///   roots must be read in the state the write sees).
+    ///
+    /// `declared_path` is written FIRST, then `canonical_path`: a cut leaves the declared root
+    /// right and the canonical one as it was, which the next call completes (and which opening
+    /// does not take for a torn trio: it never overwrites a stored `canonical_path` with the
+    /// declared fallback, which is exactly what a root unresolvable at that boot must not do).
+    pub(super) async fn chemins_canoniques_assurer(&self) -> Result<(usize, usize)> {
+        self.ecrire(
+            || (),
+            move |(), w: &mut Ecriture<'_>| {
+                let mut a_faire: Vec<(Uuid, NodeId, Option<String>, Option<String>)> = Vec::new();
+                let mut scannes = 0usize;
+                {
+                    let etat = w.index()?;
+                    let sur_disque = w.db.store().nodes_by_label(LABEL).len();
+                    if sur_disque != etat.projets.par_id.len() {
+                        bail!(
+                            "ensure_project_canonical_paths : {} nœud(s) Project que ce backend \
+                             ne sert pas (quarantaine à l'ouverture) : le parcours les manquerait",
+                            sur_disque.saturating_sub(etat.projets.par_id.len())
+                        );
+                    }
+                    let mut projets: Vec<(&Uuid, &Entree)> = etat.projets.par_id.iter().collect();
+                    projets.sort_by_key(|(id, _)| **id);
+                    for (id, e) in projets {
+                        let declare = e.projet.root_path.clone();
+                        if declare.is_empty() {
+                            continue;
+                        }
+                        scannes += 1;
+                        let get = noeud_lisible(w.db, e.noeud)?;
+                        let brut = |cle: &str| -> Result<String> {
+                            match get(cle) {
+                                None => Ok(String::new()),
+                                Some(v) => v.as_str().map(str::to_string).ok_or_else(|| {
+                                    anyhow!("projet {id} : `{cle}` n'est pas une chaîne ({v:?})")
+                                }),
+                            }
+                        };
+                        let stocke = brut("canonical_path")?;
+                        let stocke_declare = brut("declared_path")?;
+                        // The normalized declared root: the only form the Cypher side reads.
+                        let normalise = declared_root_of(&declare);
+                        let maj_declare = (!normalise.is_empty() && normalise != stocke_declare)
+                            .then_some(normalise);
+                        // A root that cannot be resolved at THIS boot never overwrites a value
+                        // computed when it could.
+                        let resolu = try_canonical_root(Some(&declare));
+                        if resolu.is_none() && !stocke.is_empty() {
+                            tracing::warn!(
+                                project = %id,
+                                declared = %declare,
+                                stored = %stocke,
+                                "Project root cannot be resolved at this boot: canonical_path kept as stored"
+                            );
+                        }
+                        let maj_canonique =
+                            canonical_path_update(&stocke, resolu.as_deref(), &declare);
+                        if maj_declare.is_some() || maj_canonique.is_some() {
+                            a_faire.push((*id, e.noeud, maj_declare, maj_canonique));
+                        }
+                    }
+                }
+                let mut entrees: Vec<(Uuid, Entree)> = Vec::new();
+                let modifies = a_faire.len();
+                super::task::ecritures(w, |w| {
+                    for (id, noeud, declare, canonique) in a_faire {
+                        if let Some(d) = declare {
+                            w.etape()?;
+                            w.poser(noeud, "declared_path", Value::from(d));
+                            #[cfg(any(test, feature = "mock-store"))]
+                            w.point(Interruption::ApresLeChemin(1))?;
+                        }
+                        if let Some(c) = canonique {
+                            w.etape()?;
+                            w.poser(noeud, "canonical_path", Value::from(c));
+                            #[cfg(any(test, feature = "mock-store"))]
+                            w.point(Interruption::ApresLeChemin(2))?;
+                        }
+                        entrees.push((id, w.apres_ecriture(Entree::decoder(w.db, noeud))?));
+                    }
+                    Ok(())
+                })?;
+                w.rendre_durable()?;
+                let mut etat = w.index_mut()?;
+                for (id, e) in entrees {
+                    etat.projets.par_id.insert(id, e);
+                }
+                Ok((scannes, modifies))
+            },
+        )
+        .await
+    }
 }
 
 #[async_trait]

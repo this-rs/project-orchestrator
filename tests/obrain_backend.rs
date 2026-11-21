@@ -2149,11 +2149,6 @@ mod with_the_feature {
             not_ported(store.propagate_structural_links(id).await),
             NonPorte("NoteStore::propagate_structural_links")
         );
-        // Defaulted by the contract to `Ok((0, 0))`: refused all the same.
-        assert_eq!(
-            not_ported(store.ensure_project_canonical_paths().await),
-            NonPorte("AnalyticsStore::ensure_project_canonical_paths")
-        );
         // The default of `GraphStore` answers `Ok({})` for an empty `ids` — the
         // silent empty result this backend must never give. It is written by
         // hand and refuses, with an empty list as with any other.

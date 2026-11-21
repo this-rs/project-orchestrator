@@ -1,7 +1,7 @@
 # Cliquet de la migration Neo4j → obrain : traits de contrat portés (le compilateur en fait foi,
 # via le test the_migration_ratchet_is_exactly_the_set_of_ported_traits).
 # Ne fait que grossir. Au 20/11/2026 : 22 / 22 portés ; AnalyticsStore est un port PARTIEL
-# (sous-lots A1, PR #1250, et A2 : couche neuronale des notes) et SearchStore est porté sans atteindre la barre de performance (G8).
+# (sous-lots A1, PR #1250, A2 : couche neuronale des notes, et mémoire-maintenance : synapses fantômes, passes d'oubli, maintenance) et SearchStore est porté sans atteindre la barre de performance (G8).
 AnalyticsStore
 AuthStore
 ChatStore

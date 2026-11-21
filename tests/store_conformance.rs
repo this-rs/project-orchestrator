@@ -6457,6 +6457,230 @@ pub mod conformance {
         }
         store.delete_project(p.id, &p.name).await.ok();
     }
+
+    // ------------------------------------------------------------------
+    // Analytics, the memory layer and its maintenance: the shadow traces, the notes the
+    // heuristic wrote, the scope of a protocol. What the stores agree on (what is specific
+    // to obrain is in `tests/obrain_memoire.rs`).
+    // ------------------------------------------------------------------
+
+    fn a_shadow_trace(
+        session: Uuid,
+        project: Uuid,
+        secs: i64,
+        notes: &[Uuid],
+    ) -> project_orchestrator::neurons::synaptic_shadow::SynapseShadowTrace {
+        use project_orchestrator::neurons::synaptic_shadow::{
+            ShadowSeed, ShadowSelection, StopReason, SynapseShadowTrace,
+        };
+        let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        SynapseShadowTrace {
+            id: Uuid::new_v4(),
+            schema_version: 1,
+            layer_version: "conformance".into(),
+            session_id: session,
+            project_id: project,
+            requested_mode: Default::default(),
+            effective_mode: Default::default(),
+            session_started_at: t0,
+            created_at: t0 + Duration::seconds(secs),
+            seeds: vec![ShadowSeed {
+                note_id: notes[0],
+                affinity: 0.5,
+            }],
+            selected: notes
+                .iter()
+                .map(|n| ShadowSelection {
+                    note_id: *n,
+                    score: 0.7,
+                    hops: 1,
+                    via: None,
+                    tokens: 10,
+                    explored: false,
+                    created_at: None,
+                })
+                .collect(),
+            tokens_used: 10 * notes.len(),
+            token_budget: 1200,
+            stopped_by: StopReason::Exhausted,
+            weights_fingerprint: "w".into(),
+            config_fingerprint: "c".into(),
+            edges_read: 1,
+            rewarded: vec![],
+        }
+    }
+
+    /// The shadow traces: recorded and read back, the latest `keep` of a session kept, listed by
+    /// session (oldest first) and by note (latest first, limited), a reward claimed once.
+    pub async fn check_memory_shadow_traces(store: &dyn GraphStore) {
+        use project_orchestrator::neurons::synaptic_shadow::ShadowTraceFilter;
+        let (s1, s2, pid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (n1, n2) = (Uuid::new_v4(), Uuid::new_v4());
+        let t = [
+            a_shadow_trace(s1, pid, 10, &[n1]),
+            a_shadow_trace(s1, pid, 20, &[n1, n2]),
+            a_shadow_trace(s1, pid, 30, &[n2]),
+            a_shadow_trace(s1, pid, 40, &[n1]),
+            a_shadow_trace(s2, pid, 5, &[n1]),
+        ];
+        for x in &t {
+            store.record_synapse_shadow_trace(x, 3).await.unwrap();
+        }
+        assert!(store
+            .get_synapse_shadow_trace(t[0].id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_synapse_shadow_trace(t[1].id)
+                .await
+                .unwrap()
+                .map(|x| x.id),
+            Some(t[1].id)
+        );
+        let ids = |v: Vec<project_orchestrator::neurons::synaptic_shadow::SynapseShadowTrace>| {
+            v.into_iter().map(|x| x.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(store
+                .list_synapse_shadow_traces(&ShadowTraceFilter::Session(s1))
+                .await
+                .unwrap()),
+            vec![t[1].id, t[2].id, t[3].id]
+        );
+        assert_eq!(
+            ids(store
+                .list_synapse_shadow_traces(&ShadowTraceFilter::ContainingNote {
+                    note_id: n1,
+                    limit: 2
+                })
+                .await
+                .unwrap()),
+            vec![t[3].id, t[1].id]
+        );
+        assert!(store
+            .claim_shadow_trace_reward(t[2].id, "task_closure")
+            .await
+            .unwrap());
+        assert!(!store
+            .claim_shadow_trace_reward(t[2].id, "task_closure")
+            .await
+            .unwrap());
+        assert!(!store
+            .claim_shadow_trace_reward(Uuid::new_v4(), "task_closure")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_synapse_shadow_trace(t[2].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .rewarded,
+            vec!["task_closure".to_string()]
+        );
+    }
+
+    /// The notes the heuristic wrote: counted by shape (one shape here, so the order of the
+    /// groups is not in question), archived when active and unconfirmed, by scope.
+    pub async fn check_memory_auto_observed(store: &dyn GraphStore) {
+        let (p, q) = (a_project("auto-p"), a_project("auto-q"));
+        store.create_project(&p).await.unwrap();
+        store.create_project(&q).await.unwrap();
+        let mk = |project: Uuid, by: &str, content: &str| {
+            let mut n = a_note(Some(project), content);
+            n.created_by = by.to_string();
+            n
+        };
+        let auto = [
+            mk(p.id, "system/observation-detector", "0123456789"),
+            mk(p.id, "system/rfc-detector", "012345678901234567890"),
+            mk(q.id, "system/observation-detector", "ailleurs"),
+        ];
+        let mut confirmee = mk(p.id, "system/observation-detector", "confirmee");
+        confirmee.human_confirmed_at = Some(Utc::now());
+        let humaine = mk(p.id, "person", "humaine");
+        for n in auto.iter().chain([&confirmee, &humaine]) {
+            store.create_note(n).await.unwrap();
+        }
+        let r = store.auto_observed_report(Some(p.id)).await.unwrap();
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0]["notes"], 3);
+        assert_eq!(r[0]["status"], "active");
+        // (10 + 21 + 9) / 3, truncated.
+        assert_eq!(r[0]["avg_size"], 13);
+        assert!(store
+            .auto_observed_report(Some(Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .archive_unconfirmed_auto_observed(Some(p.id))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .archive_unconfirmed_auto_observed(Some(p.id))
+                .await
+                .unwrap(),
+            0
+        );
+        let statut = |id: Uuid| async move { store.get_note(id).await.unwrap().unwrap().status };
+        assert_eq!(statut(auto[0].id).await, NoteStatus::Archived);
+        assert_eq!(statut(confirmee.id).await, NoteStatus::Active);
+        assert_eq!(statut(humaine.id).await, NoteStatus::Active);
+        assert_eq!(
+            statut(auto[2].id).await,
+            NoteStatus::Active,
+            "another project"
+        );
+        assert_eq!(
+            store.archive_unconfirmed_auto_observed(None).await.unwrap() >= 1,
+            true
+        );
+        assert_eq!(statut(auto[2].id).await, NoteStatus::Archived);
+        for n in auto.iter().chain([&confirmee, &humaine]) {
+            store.delete_note(n.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+        store.delete_project(q.id, &q.name).await.ok();
+    }
+
+    /// `rescope_protocol` attaches a protocol to a project, then makes it transverse.
+    pub async fn check_memory_rescope_protocol(store: &dyn GraphStore) {
+        let (p, q) = (a_project("rescope-p"), a_project("rescope-q"));
+        store.create_project(&p).await.unwrap();
+        store.create_project(&q).await.unwrap();
+        let proto = Protocol::new(Some(p.id), "rescope protocol", Uuid::new_v4());
+        store.upsert_protocol(&proto).await.unwrap();
+        store.rescope_protocol(proto.id, Some(q.id)).await.unwrap();
+        assert_eq!(
+            store
+                .get_protocol(proto.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .project_id,
+            Some(q.id)
+        );
+        store.rescope_protocol(proto.id, None).await.unwrap();
+        assert_eq!(
+            store
+                .get_protocol(proto.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .project_id,
+            None
+        );
+        store.delete_protocol(proto.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+        store.delete_project(q.id, &q.name).await.ok();
+    }
 }
 
 // ======================================================================
@@ -8352,6 +8576,27 @@ neural_checks!(mock_neural, MockFactory);
 neural_checks!(neo4j_neural, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 neural_checks!(obrain_neural, ObrainFactory);
+
+/// The memory layer and its maintenance (`AnalyticsStore`): shadow traces, auto-observed notes,
+/// the scope of a protocol.
+macro_rules! memoire_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_memory_shadow_traces,
+                check_memory_auto_observed,
+                check_memory_rescope_protocol
+            ]
+        );
+    };
+}
+
+memoire_checks!(mock_memoire, MockFactory);
+memoire_checks!(neo4j_memoire, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+memoire_checks!(obrain_memoire, ObrainFactory);
 
 analytics_checks!(mock_analytics, MockFactory);
 analytics_checks!(neo4j_analytics, Neo4jFactory);
