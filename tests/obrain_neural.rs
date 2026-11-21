@@ -1668,6 +1668,21 @@ async fn a_boost_cut_at_every_write_keeps_a_valid_energy() {
         let store = open(&base).await;
         let e = store.get_note(note.id).await.unwrap().unwrap().energy;
         assert!(proche(e, 0.4) || proche(e, 0.7), "k={k}: {e}");
+        store.close().await.unwrap();
+        // The energy is written LAST: a note with the new energy carries both stamps.
+        let stamps = base_brute(&base, |db| {
+            let n = db.store().nodes_by_label("Note")[0];
+            let node = db.get_node(n).unwrap();
+            (
+                node.get_property("last_activated").is_some(),
+                node.get_property("energy_updated_at").is_some(),
+            )
+        })
+        .await;
+        if proche(e, 0.7) {
+            assert!(stamps.1, "k={k}: new energy without its stamp");
+        }
+        let store = open(&base).await;
         store.boost_energy(note.id, 0.3).await.unwrap();
     }
     // The cut reached the writes before the first k that goes through: at least three.
