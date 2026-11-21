@@ -182,8 +182,7 @@ fn props_of(row: &Row, losses: &mut Losses) -> Result<Props> {
         Ok(other) => anyhow::bail!("the properties of a row are not a map ({other:?})"),
         Err(e) => anyhow::bail!("the properties of a row cannot be read: {e}"),
     };
-    let mut props = Props::new();
-    props.reserve(map.value.len());
+    let mut props = Props::with_capacity(map.value.len());
     for (k, v) in &map.value {
         let value = import_value(k.value.as_str(), v, losses)
             .map_err(|e| anyhow::anyhow!("property '{}': {e}", k.value))?;
