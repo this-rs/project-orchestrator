@@ -779,6 +779,14 @@ jobs:
       - name: Run the task-and-step and date portage tests
         run: cargo test --features obrain-backend --test obrain_taches --test obrain_dates
 
+      # Unit tests inside src/obrain are not included by the integration-test
+      # binaries above, nor by the default-feature unit test job. The auth test
+      # depends on wall-clock scheduling; re-enable it after stabilizing it.
+      - name: Run the obrain library unit tests
+        run: |
+          cargo test --features obrain-backend --lib obrain:: -- \
+            --skip obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou
+
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
   # ==========================================================================
