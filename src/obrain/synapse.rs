@@ -48,6 +48,19 @@
 //!   could carry them, and the count a `MERGE` would then answer is not reproduced.
 //!   The same for a doubled `FORGOTTEN` edge on a pair that `reinforce_synapses`
 //!   revives. The reads answer what is there.
+//! - **A `source` that is not a string, and a `path` that is not a string, refuse.**
+//!   `reinforce_synapses` / `coactivate_session` would otherwise read the `source` as
+//!   absent and rewrite it `coactivation`; `get_project_note_entity_links` would otherwise
+//!   answer the id in place of an unreadable `path`. Both are refused by name, before any
+//!   write.
+//! - **A coactivation's provenance is bounded** (`rule`, `measure`, `at`: 4096 bytes each):
+//!   `AccountableProvenance` bounds nothing, and the edge is created in one small record.
+//! - **An unreadable chat session blocks `update_energy_scores`, as a CHOICE.** The dormant
+//!   projects (energy frozen) are computed from the last chat activity of each project; a
+//!   session that cannot be read could belong to any project and make it look dormant, so
+//!   it would be frozen without a word. The whole pass refuses until the session is fixed,
+//!   rather than guess a project for it. A decay pass is a maintenance that can wait; a
+//!   silently frozen project cannot be told from a healthy one.
 //! - **Non-finite numbers refuse** (`boost`, `increment`, `half_life`, a weight):
 //!   Neo4j would store them. `update_energy_scores` refuses a `half_life` that is not
 //!   strictly positive.
@@ -68,8 +81,15 @@
 //! sequence of engine writes under `ecritures`: a cut leaves a prefix of them, the
 //! store refuses everything until reopened (`indetermine`), and each property of the
 //! prefix is valid on its own (a weight stays in range, a counter only grows). The
-//! property that carries the meaning is written last (the weight of a reinforcement,
-//! the energy of a boost).
+//! property a reinforcement carries the meaning of (the weight) is written last.
+//!
+//! ONE rule for what is counted: a cut may LOSE an effect, never apply it twice or past its
+//! bound. So the stamp or the counter that bounds an effect is written BEFORE the value it
+//! guards: `energy_updated_at` before `energy` (a cut loses one decay, the next pass starts
+//! from the new stamp; the reverse would decay the same days twice, and the floor could
+//! fix 0.0 for good), `energy_boost_accumulated` before `energy` (a cut loses one boost,
+//! never exceeds the cap), the counters of an edge before its weight. Archived `FORGOTTEN`
+//! edges are deleted AFTER the live edges exist: a cut keeps the archive.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -87,6 +107,8 @@ use crate::notes::{Note, PROJECT_DORMANT_AFTER_DAYS};
 
 pub(super) const SYNAPSE: &str = "SYNAPSE";
 pub(super) const OUBLIE: &str = "FORGOTTEN";
+/// The longest `rule`, `measure` or `at` of a coactivation's provenance, in bytes.
+const BORNE_PROVENANCE: usize = 4096;
 /// What a revived archived edge never starts under: `DecayPolicy::default().forget_threshold`.
 const PLANCHER_REVIVAL: f64 = 0.02;
 /// The property of a `Project` node that holds when its deep maintenance last ran.
@@ -274,19 +296,19 @@ pub(super) fn sans_doublon(db: &ObrainDB, de: NodeId, vers: NodeId, type_: &str)
     Ok(())
 }
 
-pub(super) fn etiquettes(db: &ObrainDB, noeud: NodeId) -> Vec<String> {
-    db.get_node_labels(noeud).unwrap_or_default()
-}
-
-pub(super) fn genre_de(db: &ObrainDB, noeud: NodeId) -> Option<Genre> {
-    let l = etiquettes(db, noeud);
-    if l.iter().any(|e| &**e == "Note") {
+/// The kind of a node: `None` for a node that is neither a note nor a decision. A node the
+/// engine cannot give the labels of (a dangling edge) is an error, never a skipped neighbour.
+pub(super) fn genre_de(db: &ObrainDB, noeud: NodeId) -> Result<Option<Genre>> {
+    let l = db.get_node_labels(noeud).ok_or_else(|| {
+        anyhow!("nœud {noeud:?} voisin d'une arête SYNAPSE mais illisible (arête pendante)")
+    })?;
+    Ok(if l.iter().any(|e| &**e == "Note") {
         Some(Genre::Note)
     } else if l.iter().any(|e| &**e == "Decision") {
         Some(Genre::Decision)
     } else {
         None
-    }
+    })
 }
 
 /// The `id` property of a node, as a UUID: an error when it is absent or unreadable.
@@ -392,32 +414,71 @@ pub(super) fn supprimer_arete(w: &mut Ecriture<'_>, id: EdgeId, methode: &str) -
     Ok(())
 }
 
-/// The weight a revived edge starts from: the one it had when archived, never under the
-/// forget threshold. The archive rows go away (`FOREACH (x IN stale | DELETE x)`).
-fn reveiller(w: &mut Ecriture<'_>, a: NodeId, b: NodeId, methode: &str) -> Result<f64> {
-    let f1 = entre(w.db, a, b, OUBLIE)?;
-    let f2 = entre(w.db, b, a, OUBLIE)?;
+/// What reviving a pair reads, BEFORE any write: the weight the pair starts from (the one an
+/// archived edge had, never under the forget threshold) and the archive rows to delete once
+/// the live edges exist (`FOREACH (x IN stale | DELETE x)`).
+fn lire_reveil(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<(f64, Vec<EdgeId>)> {
+    let f1 = entre(db, a, b, OUBLIE)?;
+    let f2 = entre(db, b, a, OUBLIE)?;
     let archive = match (f1.first(), f2.first()) {
         (Some(x), _) if x.get("weight").is_some() => x.nombre("weight")?,
         (_, Some(y)) => y.nombre("weight")?,
         _ => None,
     }
     .unwrap_or(0.5);
-    for s in f1.iter().chain(f2.iter()) {
-        supprimer_arete(w, s.id, methode)?;
-    }
-    Ok(if archive < PLANCHER_REVIVAL {
+    let depart = if archive < PLANCHER_REVIVAL {
         PLANCHER_REVIVAL
     } else {
         archive
-    })
+    };
+    Ok((depart, f1.iter().chain(f2.iter()).map(|x| x.id).collect()))
+}
+
+/// Delete the archive rows of a revived pair: LAST, after the live edges, so that a cut
+/// leaves the archive (and a retry revives it) rather than neither.
+fn oublier_archives(w: &mut Ecriture<'_>, stale: &[EdgeId], methode: &str) -> Result<()> {
+    for id in stale {
+        supprimer_arete(w, *id, methode)?;
+    }
+    Ok(())
+}
+
+/// Everything a write on the edges of a pair reads, validated BEFORE the first engine write
+/// (an error inside `ecritures` would make the whole store indeterminate): every weight
+/// readable, the counter a number, `source` a string, the archived weight a number.
+fn valider_pair(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<()> {
+    for (x, y) in [(a, b), (b, a)] {
+        for e in entre(db, x, y, SYNAPSE)? {
+            e.poids()?;
+            e.nombre("reinforcement_count")?;
+            if let Some(v) = e.get("source") {
+                if v.as_str().is_none() {
+                    bail!(
+                        "arête {SYNAPSE} {:?} → {:?} : `source` n'est pas une chaîne ({v:?}) ; \
+                         refusé plutôt que réécrit",
+                        e.de,
+                        e.vers
+                    );
+                }
+            }
+        }
+    }
+    lire_reveil(db, a, b)?;
+    Ok(())
 }
 
 /// The per-pair checks done before any write: no parallel `SYNAPSE` or `FORGOTTEN` edge.
-fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId) -> Result<()> {
+/// `avec_oubli`: also the archived `FORGOTTEN` edges, for the writers that read them
+/// (a revival); `create_synapses` never reads them.
+fn pair_sans_doublon(db: &ObrainDB, a: NodeId, b: NodeId, avec_oubli: bool) -> Result<()> {
     for (x, y) in [(a, b), (b, a)] {
         sans_doublon(db, x, y, SYNAPSE)?;
-        sans_doublon(db, x, y, OUBLIE)?;
+        if avec_oubli {
+            sans_doublon(db, x, y, OUBLIE)?;
+        }
+    }
+    if avec_oubli {
+        valider_pair(db, a, b)?;
     }
     Ok(())
 }
@@ -530,7 +591,7 @@ impl ObrainGraphStore {
                     (src, cibles)
                 };
                 for (n, _) in &cibles {
-                    pair_sans_doublon(w.db, src, *n)?;
+                    pair_sans_doublon(w.db, src, *n, false)?;
                 }
                 let mut lignes = 0usize;
                 ecritures(w, |w| {
@@ -570,7 +631,7 @@ impl ObrainGraphStore {
             let mut poids: BTreeMap<u64, f64> = BTreeMap::new();
             for a in incidentes(db, n)? {
                 let autre = if a.de == n { a.vers } else { a.de };
-                if genre_de(db, autre) != Some(Genre::Note) {
+                if genre_de(db, autre)? != Some(Genre::Note) {
                     continue;
                 }
                 let p = a.poids()?;
@@ -622,7 +683,7 @@ impl ObrainGraphStore {
                     // (p:Project)-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
                     for (_, noeud) in etat.notes.du_projet(pid) {
                         for a in aretes_de(db, noeud, Direction::Outgoing, SYNAPSE)? {
-                            if genre_de(db, a.vers) == Some(Genre::Note) {
+                            if genre_de(db, a.vers)? == Some(Genre::Note) {
                                 v.push(a.poids()?);
                             }
                         }
@@ -745,7 +806,7 @@ impl ObrainGraphStore {
                 let n = paires.len();
                 ecritures(w, |w| {
                     for (a, b) in &paires {
-                        let depart = reveiller(w, *a, *b, "reinforce_synapses")?;
+                        let (depart, stale) = lire_reveil(w.db, *a, *b)?;
                         let now = maintenant();
                         for (de, vers) in [(*a, *b), (*b, *a)] {
                             fusionner(
@@ -786,6 +847,7 @@ impl ObrainGraphStore {
                                 },
                             )?;
                         }
+                        oublier_archives(w, &stale, "reinforce_synapses")?;
                     }
                     Ok(())
                 })?;
@@ -811,6 +873,17 @@ impl ObrainGraphStore {
         if notes.len() < 2 {
             return Ok(0);
         }
+        // `AccountableProvenance` proves the three are non-empty and bounds nothing; they are
+        // written in the one record that creates an edge, which must stay small.
+        for (nom, v) in [("rule", &regle), ("measure", &mesure), ("at", &date)] {
+            if v.len() > BORNE_PROVENANCE {
+                bail!(
+                    "coactivate_session : `{nom}` de la provenance fait {} octets, au plus \
+                     {BORNE_PROVENANCE} sont admis (la provenance est une courte déclaration)",
+                    v.len()
+                );
+            }
+        }
         let notes = notes.to_vec();
         self.ecrire(
             || (),
@@ -822,7 +895,7 @@ impl ObrainGraphStore {
                 let n = paires.len();
                 ecritures(w, |w| {
                     for (a, b) in &paires {
-                        let depart = reveiller(w, *a, *b, "coactivate_session")?;
+                        let (depart, stale) = lire_reveil(w.db, *a, *b)?;
                         let now = maintenant();
                         for (k, (de, vers)) in [(*a, *b), (*b, *a)].into_iter().enumerate() {
                             let provenance = |mut v: Vec<(&'static str, Value)>| {
@@ -864,6 +937,7 @@ impl ObrainGraphStore {
                                 Ok(v)
                             })?;
                         }
+                        oublier_archives(w, &stale, "coactivate_session")?;
                     }
                     Ok(())
                 })?;
@@ -903,7 +977,7 @@ impl ObrainGraphStore {
             }
         }
         for (a, b) in &paires {
-            pair_sans_doublon(w.db, *a, *b)?;
+            pair_sans_doublon(w.db, *a, *b, true)?;
         }
         Ok(paires)
     }
@@ -969,7 +1043,7 @@ impl ObrainGraphStore {
             let mut lignes: BTreeSet<(Uuid, u64, &'static str)> = BTreeSet::new();
             for a in incidentes(db, b.noeud)? {
                 let autre = if a.de == b.noeud { a.vers } else { a.de };
-                let Some(genre) = genre_de(db, autre) else {
+                let Some(genre) = genre_de(db, autre)? else {
                     continue;
                 };
                 lignes.insert((id_du_noeud(db, autre)?, a.poids()?.to_bits(), genre.nom()));
@@ -1074,15 +1148,32 @@ impl ObrainGraphStore {
         &self,
         projet: Uuid,
     ) -> Result<Vec<(String, String, String)>> {
-        self.lire(move |_, etat| {
+        self.lire(move |db, etat| {
             refus_si_notes_en_quarantaine(etat, "get_project_note_entity_links")?;
-            let mut v: Vec<(String, String, String)> = etat
-                .notes
-                .liens_du_projet(projet)?
-                .into_iter()
-                // A `Project` or a `Note` is none of the code entities the Cypher names.
-                .map(|(note, entite)| (note.to_string(), "unknown".to_string(), entite))
-                .collect();
+            let mut v: Vec<(String, String, String)> = Vec::new();
+            for (note, entite) in etat.notes.liens_du_projet(projet)? {
+                // `COALESCE(e.path, e.id, ...)`: the target's `path` property when it has
+                // one, else its id. The type is `unknown`: a `Project` or a `Note` is none of
+                // the code entities (File, Function, Struct, Trait, Enum) the Cypher names.
+                let cible = entite
+                    .parse::<Uuid>()
+                    .ok()
+                    .and_then(|u| etat.notes.noeud_de(u).or_else(|| etat.projets.noeud_de(u)));
+                let id = match cible {
+                    Some(n) => match propriete(db, n, "path")? {
+                        Some(p) => p
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("nœud {n:?} : `path` n'est pas une chaîne"))?,
+                        None => entite,
+                    },
+                    None => entite,
+                };
+                // Neo4j drops a row with an empty id or entity id.
+                if !id.is_empty() {
+                    v.push((note.to_string(), "unknown".to_string(), id));
+                }
+            }
             v.sort();
             Ok(v)
         })
@@ -1140,6 +1231,9 @@ impl ObrainGraphStore {
                 let mut mises_a_jour = 0usize;
                 ecritures(w, |w| {
                     for (id, avant, apres) in &a_faire {
+                        // The stamp first, the energy last (the one rule, see the header): a
+                        // cut between the two loses this decay, the next pass takes it from
+                        // the new stamp; it can never decay the same days twice.
                         let mut p = vec![("energy_updated_at", Value::from(now.to_rfc3339()))];
                         if (avant - apres).abs() > 0.001 {
                             p.push(("energy", Value::from(*apres)));
@@ -1187,9 +1281,9 @@ impl ObrainGraphStore {
                         w,
                         id,
                         vec![
-                            ("energy", Value::from(nouvelle)),
                             ("last_activated", Value::from(now.clone())),
                             ("energy_updated_at", Value::from(now.clone())),
+                            ("energy", Value::from(nouvelle)),
                         ],
                     )
                 })?;
@@ -1463,6 +1557,10 @@ impl ObrainGraphStore {
                 }
                 let energie = e.persona.energy;
                 let proprietes = vec![
+                    ("updated_at", Value::from(Utc::now().to_rfc3339())),
+                    // The accumulator BEFORE the energy: a cut charges a boost that was not
+                    // given (a boost lost), and can never give a boost that is not charged
+                    // (the cap exceeded).
                     ("energy_boost_accumulated", Value::from(accumule + boost)),
                     (
                         "energy",
@@ -1472,7 +1570,6 @@ impl ObrainGraphStore {
                             energie + boost
                         }),
                     ),
-                    ("updated_at", Value::from(Utc::now().to_rfc3339())),
                 ];
                 ecritures(w, |w| {
                     persona::ecrire_proprietes_de_persona(w, persona_id, proprietes)

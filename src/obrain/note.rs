@@ -821,7 +821,9 @@ impl IndexNotes {
             };
             if e.non_resolus > 0 {
                 bail!(
-                    "la note {id} a {} lien(s) LINKED_TO que ce backend ne résout pas (domaine                      non porté, cible absente ou arête en double) : la liste des liens du projet                      serait incomplète",
+                    "la note {id} a {} lien(s) LINKED_TO que ce backend ne résout pas (domaine non \
+                     porté, cible absente ou arête en double) : la liste des liens du projet \
+                     serait incomplète",
                     e.non_resolus
                 );
             }

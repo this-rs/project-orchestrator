@@ -1534,10 +1534,118 @@ async fn a_reinforcement_cut_at_every_write_leaves_a_readable_prefix() {
             s.iter().all(|x| proche(x.1, 0.5) || proche(x.1, 0.7)),
             "k={k}: a weight is the old or the new one, never a mix: {s:?}"
         );
+        store.close().await.unwrap();
+        // Every property of every edge, as the engine holds it. The weight is written LAST of
+        // an edge's properties: an edge whose weight is the new one carries ALL the new
+        // properties; one whose weight is the old one carries a prefix of them (counter and
+        // stamps new or still old) and nothing else (source and creation date never move).
+        let brutes = base_brute(&base, |db| aretes_brutes(db, "SYNAPSE")).await;
+        assert_eq!(brutes.len(), 2, "k={k}: no edge lost or added");
+        for e in &brutes {
+            let compte = e.2["reinforcement_count"].as_int64().unwrap();
+            assert_eq!(e.2["source"].as_str(), Some("coactivation"), "k={k}");
+            assert!(e.2.contains_key("created_at"), "k={k}");
+            if proche(poids(e), 0.7) {
+                assert_eq!(compte, 2, "k={k}: a new weight carries the new counter");
+                for c in ["last_reinforced_at", "decayed_at"] {
+                    assert!(e.2.contains_key(c), "k={k}: {c}");
+                }
+            } else {
+                assert!(proche(poids(e), 0.5), "k={k}: {}", poids(e));
+                assert!(compte == 1 || compte == 2, "k={k}: {compte}");
+            }
+        }
         // And the base keeps working: the next reinforcement goes through.
+        let store = open(&base).await;
         store.reinforce_synapses(&ids, 0.1).await.unwrap();
     }
     panic!("the cut never ran out of writes: raise the bound");
+}
+
+/// `rate_limited_energy_boost` cut at every engine write: the accumulator is written BEFORE the
+/// energy, so a cut may charge a boost that was not given (a boost lost) and can never leave
+/// an energy raised without its charge (the cap exceeded).
+#[tokio::test]
+async fn a_persona_boost_cut_at_every_write_never_exceeds_the_cap() {
+    let mut fin = None;
+    for k in 1..=6 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = une_persona(0.5, 0.0);
+        store.create_persona(&p).await.unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .rate_limited_energy_boost(p.id, 0.2, 0.5)
+            .await
+            .is_ok()
+        {
+            fin = Some(k);
+            break;
+        }
+        assert!(store.get_persona(p.id).await.is_err(), "k={k}: indéterminé");
+        drop(store);
+        let store = open(&base).await;
+        let l = store.get_persona(p.id).await.unwrap().unwrap();
+        assert!(
+            proche(l.energy, 0.5) || proche(l.energy, 0.7),
+            "k={k}: {l:?}"
+        );
+        assert!(
+            proche(l.energy_boost_accumulated, 0.0) || proche(l.energy_boost_accumulated, 0.2),
+            "k={k}: {l:?}"
+        );
+        if proche(l.energy, 0.7) {
+            assert!(
+                proche(l.energy_boost_accumulated, 0.2),
+                "k={k}: energy raised without its charge: {l:?}"
+            );
+        }
+    }
+    assert_eq!(fin, Some(4), "three engine writes");
+}
+
+/// `COALESCE(e.path, e.id)`: a target that carries a `path` property answers it.
+#[tokio::test]
+async fn an_entity_link_answers_the_target_path_when_it_has_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (p, n, q);
+    {
+        let store = open(&base).await;
+        p = projet_actif(&store).await;
+        q = projet_actif(&store).await;
+        n = des_notes(&store, Some(p.id), 1).await;
+        store
+            .link_note_to_entity(n[0].id, &EntityType::Project, &q.id.to_string(), None, None)
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+    let qid = q.id;
+    base_brute(&base, move |db| {
+        for x in db.store().nodes_by_label("Project") {
+            let id = db
+                .get_node(x)
+                .unwrap()
+                .get_property("id")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap();
+            if id == qid.to_string() {
+                db.set_node_property(x, "path", Value::from("src/lib.rs"));
+            }
+        }
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(
+        store.get_project_note_entity_links(p.id).await.unwrap(),
+        vec![(
+            n[0].id.to_string(),
+            "unknown".to_string(),
+            "src/lib.rs".to_string()
+        )]
+    );
 }
 
 /// A boost and a scar cut at every engine write: the note reads back, with an energy that is
@@ -1562,6 +1670,21 @@ async fn a_boost_cut_at_every_write_keeps_a_valid_energy() {
         let store = open(&base).await;
         let e = store.get_note(note.id).await.unwrap().unwrap().energy;
         assert!(proche(e, 0.4) || proche(e, 0.7), "k={k}: {e}");
+        store.close().await.unwrap();
+        // The energy is written LAST: a note with the new energy carries both stamps.
+        let stamps = base_brute(&base, |db| {
+            let n = db.store().nodes_by_label("Note")[0];
+            let node = db.get_node(n).unwrap();
+            (
+                node.get_property("last_activated").is_some(),
+                node.get_property("energy_updated_at").is_some(),
+            )
+        })
+        .await;
+        if proche(e, 0.7) {
+            assert!(stamps.1, "k={k}: new energy without its stamp");
+        }
+        let store = open(&base).await;
         store.boost_energy(note.id, 0.3).await.unwrap();
     }
     // The cut reached the writes before the first k that goes through: at least three.
@@ -1631,5 +1754,377 @@ async fn what_is_not_ported_still_refuses_by_name() {
             .count(),
         64,
         "25 (A1) + 1 (`run_data_migrations`) + 23 (A2) + 15 (`tests/obrain_memoire.rs`)"
+    );
+}
+
+/// `update_energy_scores` cut at every engine write: the stamp is written BEFORE the energy, so
+/// a cut loses this decay and the retry starts from the new stamp; the same days are never
+/// decayed twice (which would also let the 0.05 floor fix 0.0 for good).
+#[tokio::test]
+async fn an_energy_pass_cut_at_every_write_never_decays_the_same_days_twice() {
+    let mut fin = None;
+    for k in 1..=6 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let id;
+        {
+            let store = open(&base).await;
+            let p = projet_actif(&store).await;
+            id = une_note(&store, Some(p.id)).await.id;
+            store.close().await.unwrap();
+        }
+        let vieux = (Utc::now() - Duration::days(90)).to_rfc3339();
+        base_brute(&base, move |db| {
+            let n = db.store().nodes_by_label("Note")[0];
+            db.set_node_property(n, "energy_updated_at", Value::from(vieux));
+        })
+        .await;
+        let store = open(&base).await;
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.update_energy_scores(90.0).await.is_ok() {
+            fin = Some(k);
+            break;
+        }
+        assert!(store.get_note(id).await.is_err(), "k={k}: indéterminé");
+        drop(store);
+        let store = open(&base).await;
+        store.update_energy_scores(90.0).await.unwrap();
+        let e = store.get_note(id).await.unwrap().unwrap().energy;
+        assert!(
+            e >= (-1.0_f64).exp() - 2e-3,
+            "k={k}: 90 days decayed more than once: {e}"
+        );
+    }
+    assert_eq!(fin, Some(3), "two engine writes");
+}
+
+/// A resurrection cut at every engine write: the archived `FORGOTTEN` edge is deleted AFTER the
+/// live edges exist, so a cut never leaves neither; the retry finishes.
+#[tokio::test]
+async fn a_revival_cut_at_every_write_never_loses_the_archive() {
+    let mut fin = None;
+    for k in 1..=8 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (a, b);
+        {
+            let store = open(&base).await;
+            let p = projet_actif(&store).await;
+            let n = des_notes(&store, Some(p.id), 2).await;
+            (a, b) = (n[0].id, n[1].id);
+            store.close().await.unwrap();
+        }
+        base_brute(&base, move |db| {
+            let (na, nb) = (futures_noeud(db, a), futures_noeud(db, b));
+            db.create_edge_with_props(na, nb, "FORGOTTEN", [("weight", Value::from(0.6_f64))]);
+        })
+        .await;
+        let store = open(&base).await;
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store.reinforce_synapses(&[a, b], 0.1).await.is_ok() {
+            fin = Some(k);
+            break;
+        }
+        drop(store);
+        let (oubli, vivantes) = base_brute(&base, |db| {
+            (
+                aretes_brutes(db, "FORGOTTEN").len(),
+                aretes_brutes(db, "SYNAPSE").len(),
+            )
+        })
+        .await;
+        assert!(
+            oubli >= 1 || vivantes == 2,
+            "k={k}: the archive is gone and the live edges are not there ({oubli}, {vivantes})"
+        );
+        let store = open(&base).await;
+        store.reinforce_synapses(&[a, b], 0.1).await.unwrap();
+        let s = store.get_synapses(a).await.unwrap();
+        assert!(!s.is_empty(), "k={k}");
+    }
+    assert_eq!(fin, Some(4), "three engine writes");
+}
+
+fn futures_noeud(db: &obrain_engine::ObrainDB, id: Uuid) -> obrain_common::types::NodeId {
+    db.store()
+        .nodes_by_label("Note")
+        .into_iter()
+        .find(|n| {
+            db.get_node(*n).and_then(|x| {
+                x.get_property("id")
+                    .and_then(|v| v.as_str().map(str::to_string))
+            }) == Some(id.to_string())
+        })
+        .unwrap()
+}
+
+/// A `SYNAPSE` edge a migrated base left without `weight` (or with a `source` that is not a
+/// string) is refused BEFORE the first write: the store is not made indeterminate, the next
+/// call works, and nothing was rewritten.
+#[tokio::test]
+async fn an_unreadable_edge_refuses_a_reinforcement_without_breaking_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (p, a, b, c);
+    {
+        let store = open(&base).await;
+        p = projet_actif(&store).await;
+        let n = des_notes(&store, Some(p.id), 3).await;
+        (a, b, c) = (n[0].id, n[1].id, n[2].id);
+        // The faulty edge is on the LAST pair (b, c): the pairs (a, b) and (a, c) come first
+        // and must not be written either.
+        store.create_synapses(b, &[(c, 0.5)]).await.unwrap();
+        store.close().await.unwrap();
+    }
+    base_brute(&base, move |db| {
+        let nb = futures_noeud(db, b);
+        let (_, e) = db.store().edges_from(nb, Direction::Outgoing)[0];
+        db.remove_edge_property(e, "weight");
+    })
+    .await;
+    let store = open(&base).await;
+    let prov = AccountableProvenance::new("r", "m").unwrap();
+    for e in [
+        store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap_err(),
+        store
+            .coactivate_session(p.id, &[a, b, c], Uuid::new_v4(), &prov)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(format!("{e:#}").contains("weight"), "{e:#}");
+        assert!(!format!("{e:#}").contains("indéterminé"), "{e:#}");
+    }
+    // Not indeterminate: another call still works, and the earlier pairs were not written.
+    store.boost_energy(c, 0.1).await.unwrap();
+    assert!(store.get_synapses(a).await.unwrap().is_empty());
+    store.close().await.unwrap();
+
+    // `source` that is not a string, again on the last pair.
+    base_brute(&base, move |db| {
+        let nb = futures_noeud(db, b);
+        let (_, e) = db.store().edges_from(nb, Direction::Outgoing)[0];
+        db.set_edge_property(e, "weight", Value::from(0.5_f64));
+        db.set_edge_property(e, "source", Value::from(5_i64));
+    })
+    .await;
+    let store = open(&base).await;
+    let e = store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap_err();
+    assert!(format!("{e:#}").contains("source"), "{e:#}");
+    assert!(store.get_synapses(a).await.unwrap().is_empty());
+    store.boost_energy(c, 0.1).await.unwrap();
+}
+
+/// The engine deletes a node's edges with it, so an edge whose neighbour has no labels cannot
+/// be built by deleting the neighbour (the guard of `genre_de` against a dangling edge is
+/// defensive). What can exist is a neighbour with NO label: it is not a `Note` nor a
+/// `Decision`, and the `neighbor:Note` / `neighbor:Note OR neighbor:Decision` of the Cypher
+/// leaves it out, which is what the reads do.
+#[tokio::test]
+async fn a_neighbour_that_is_not_a_note_is_left_out_as_the_cypher_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let a;
+    {
+        let store = open(&base).await;
+        a = une_note(&store, None).await.id;
+        store.close().await.unwrap();
+    }
+    base_brute(&base, move |db| {
+        let na = futures_noeud(db, a);
+        let autre = db.create_node_with_props(&["Other"], vec![("id", Value::from("x"))]);
+        db.create_edge_with_props(na, autre, "SYNAPSE", [("weight", Value::from(0.5_f64))]);
+        let mort = db.create_node_with_props(&["Note"], vec![("id", Value::from("y"))]);
+        db.create_edge_with_props(na, mort, "SYNAPSE", [("weight", Value::from(0.5_f64))]);
+        assert!(db.delete_node(mort));
+        assert_eq!(
+            db.store().edges_from(na, Direction::Outgoing).len(),
+            1,
+            "cascade"
+        );
+    })
+    .await;
+    let store = open(&base).await;
+    assert!(store.get_synapses(a).await.unwrap().is_empty());
+    assert!(store.get_cross_entity_synapses(a).await.unwrap().is_empty());
+}
+
+/// Neo4j drops a link whose entity id is empty: a target with an empty `path` is not a row.
+#[tokio::test]
+async fn an_entity_link_with_an_empty_path_is_dropped_as_neo4j_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (p, q);
+    {
+        let store = open(&base).await;
+        p = projet_actif(&store).await;
+        q = projet_actif(&store).await;
+        let n = une_note(&store, Some(p.id)).await;
+        store
+            .link_note_to_entity(n.id, &EntityType::Project, &q.id.to_string(), None, None)
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+    let qid = q.id;
+    base_brute(&base, move |db| {
+        let x = id_brut_sync(db, "Project", qid);
+        db.set_node_property(x, "path", Value::from(""));
+    })
+    .await;
+    let store = open(&base).await;
+    assert!(store
+        .get_project_note_entity_links(p.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+fn id_brut_sync(
+    db: &obrain_engine::ObrainDB,
+    etiquette: &str,
+    id: Uuid,
+) -> obrain_common::types::NodeId {
+    db.store()
+        .nodes_by_label(etiquette)
+        .into_iter()
+        .find(|n| {
+            db.get_node(*n).and_then(|x| {
+                x.get_property("id")
+                    .and_then(|v| v.as_str().map(str::to_string))
+            }) == Some(id.to_string())
+        })
+        .unwrap()
+}
+
+/// `coactivate_session` cut at every engine write on edges that already exist: the weight is
+/// written last, so an edge whose weight is the new one carries the new session, count and
+/// provenance; an edge with the old weight carries a prefix of them.
+#[tokio::test]
+async fn a_coactivation_cut_at_every_write_leaves_a_readable_prefix() {
+    let (s1, s2) = (Uuid::new_v4(), Uuid::new_v4());
+    for k in 1..=24 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = projet_actif(&store).await;
+        let n = des_notes(&store, Some(p.id), 2).await;
+        let ids = [n[0].id, n[1].id];
+        let prov1 = AccountableProvenance::new("regle-1", "mesure-1").unwrap();
+        let prov2 = AccountableProvenance::new("regle-2", "mesure-2").unwrap();
+        store
+            .coactivate_session(p.id, &ids, s1, &prov1)
+            .await
+            .unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .coactivate_session(p.id, &ids, s2, &prov2)
+            .await
+            .is_ok()
+        {
+            assert!(k > 14, "la coupure n'a atteint que {} points", k - 1);
+            return;
+        }
+        drop(store);
+        let brutes = base_brute(&base, |db| aretes_brutes(db, "SYNAPSE")).await;
+        assert_eq!(brutes.len(), 2, "k={k}");
+        for e in &brutes {
+            if proche(poids(e), 0.7) {
+                assert_eq!(
+                    e.2["last_session"].as_str(),
+                    Some(s2.to_string().as_str()),
+                    "k={k}"
+                );
+                assert_eq!(e.2["rule"].as_str(), Some("regle-2"), "k={k}");
+                assert_eq!(e.2["measure"].as_str(), Some("mesure-2"), "k={k}");
+                assert_eq!(e.2["reinforcement_count"].as_int64(), Some(2), "k={k}");
+            } else {
+                assert!(proche(poids(e), 0.5), "k={k}: {}", poids(e));
+            }
+        }
+        let store = open(&base).await;
+        store
+            .coactivate_session(p.id, &ids, s2, &prov2)
+            .await
+            .unwrap();
+    }
+    panic!("the cut never ran out of writes: raise the bound");
+}
+
+/// The resurrection by `coactivate_session`, cut at every engine write: the archive is deleted
+/// AFTER the live edges exist.
+#[tokio::test]
+async fn a_coactivation_revival_cut_at_every_write_never_loses_the_archive() {
+    let mut fin = None;
+    for k in 1..=8 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (p, a, b);
+        {
+            let store = open(&base).await;
+            p = projet_actif(&store).await;
+            let n = des_notes(&store, Some(p.id), 2).await;
+            (a, b) = (n[0].id, n[1].id);
+            store.close().await.unwrap();
+        }
+        base_brute(&base, move |db| {
+            let (na, nb) = (futures_noeud(db, a), futures_noeud(db, b));
+            db.create_edge_with_props(na, nb, "FORGOTTEN", [("weight", Value::from(0.6_f64))]);
+        })
+        .await;
+        let store = open(&base).await;
+        let prov = AccountableProvenance::new("r", "m").unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .coactivate_session(p.id, &[a, b], Uuid::new_v4(), &prov)
+            .await
+            .is_ok()
+        {
+            fin = Some(k);
+            break;
+        }
+        drop(store);
+        let (oubli, vivantes) = base_brute(&base, |db| {
+            (
+                aretes_brutes(db, "FORGOTTEN").len(),
+                aretes_brutes(db, "SYNAPSE").len(),
+            )
+        })
+        .await;
+        assert!(
+            oubli >= 1 || vivantes == 2,
+            "k={k}: the archive is gone and the live edges are not there ({oubli}, {vivantes})"
+        );
+    }
+    assert_eq!(
+        fin,
+        Some(4),
+        "three engine writes (two creations, one deletion)"
+    );
+}
+
+/// The provenance of a coactivation is a short statement: a rule, a measure or a date over
+/// 4096 bytes is refused before any write (`AccountableProvenance` bounds nothing, and the
+/// edge is created in one record that must stay small).
+#[tokio::test]
+async fn an_oversized_provenance_is_refused_before_any_write() {
+    let store = ObrainGraphStore::open_temporary().unwrap();
+    let p = projet_actif(&store).await;
+    let n = des_notes(&store, Some(p.id), 2).await;
+    let ids = [n[0].id, n[1].id];
+    let long = "m".repeat(4097);
+    let prov = AccountableProvenance::new("r", long).unwrap();
+    let e = store
+        .coactivate_session(p.id, &ids, Uuid::new_v4(), &prov)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("4096"), "{e:#}");
+    assert!(store.get_synapses(ids[0]).await.unwrap().is_empty());
+    let ok = AccountableProvenance::new("r", "m".repeat(4096)).unwrap();
+    assert_eq!(
+        store
+            .coactivate_session(p.id, &ids, Uuid::new_v4(), &ok)
+            .await
+            .unwrap(),
+        2
     );
 }
