@@ -95,9 +95,15 @@
 //! nodes and edges, not on the indexes (it is what Neo4j's `MATCH` sees, quarantined nodes
 //! included): the true totals, the samples (100, 50 for the skills) sorted by id, since Cypher
 //! gives no order. A node whose key is unreadable refuses (Neo4j prints an empty one).
-//! This backend cannot create an `AFFECTS` edge (the decision domain refuses it): every decision
-//! of a base made here is a gap, which is what the base holds, and a migrated base brings its own
-//! edges.
+//! Two of those totals are ALWAYS 0, on this backend AND on Neo4j, and that is inherited rather
+//! than reproduced by accident: `decisions_without_affects` and `commits_without_touches` are
+//! selected on the raw `project_id` property, which NEITHER engine writes on a `Decision`
+//! (attached by the `HAS_DECISION` edge, `src/obrain/decision.rs:28`) nor on a `Commit`. Neo4j's
+//! `MATCH (d:Decision) WHERE d.project_id = $pid` (`src/neo4j/analytics.rs:2504`) selects the same
+//! empty set. The port keeps that behaviour instead of diverging silently: the defect is on both
+//! sides and is tracked as a follow-up. The `AFFECTS` half is real, though: this backend cannot
+//! write an `AFFECTS` edge (the decision domain refuses it, its targets are not ported), so a base
+//! created here holds no `AFFECTS` at all — but the count above cannot see them either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
