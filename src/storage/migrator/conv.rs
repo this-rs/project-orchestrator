@@ -210,7 +210,24 @@ pub fn bolt_to_value(b: &BoltType, losses: &mut Losses) -> Result<Value, String>
     })
 }
 
-fn zoned(c: chrono::DateTime<chrono::FixedOffset>, losses: &mut Losses) -> Result<Value, String> {
+/// The sub-microsecond remainder (0..=999 ns) that [`zoned`] drops: obrain's
+/// `Timestamp` / `ZonedDatetime` hold microseconds only (`obrain-common`
+/// `zoned_datetime.rs`), so no native representation keeps it. The reversible
+/// option is a companion integer property (`<key>__nanos`) next to the
+/// microsecond value: `micros * 1000 + remainder` is the source instant.
+///
+/// NOT wired into the production copy: it adds a property PO can see, which is
+/// a decision (see docs/migration/GATES.md, G7). It exists so the round trip is
+/// demonstrated, in a test, before that decision.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn sub_micro_remainder(c: chrono::DateTime<chrono::FixedOffset>) -> Option<i64> {
+    Some(c.timestamp_nanos_opt()?.rem_euclid(1000))
+}
+
+pub(super) fn zoned(
+    c: chrono::DateTime<chrono::FixedOffset>,
+    losses: &mut Losses,
+) -> Result<Value, String> {
     let n = c
         .timestamp_nanos_opt()
         .ok_or("datetime outside the i64 nanosecond range")?;

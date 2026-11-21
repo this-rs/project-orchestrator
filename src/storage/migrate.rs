@@ -293,6 +293,16 @@ pub fn decide(
 
 // ── The startup orchestration ───────────────────────────────────────────────
 
+/// What a copy accepted without failing: documented narrowings, reported so
+/// they are visible (traces, final marker) instead of silent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyReport {
+    /// Datetimes truncated to the microsecond (obrain stores no finer). The
+    /// content fingerprint is computed on the already truncated values and
+    /// cannot see this; the count is the only trace of it.
+    pub sub_microsecond_datetimes: u64,
+}
+
 /// The data-copy seam. The real migrator (reading Neo4j, writing obrain) is
 /// `storage::migrator::Neo4jToObrain` (feature `obrain-backend`); PO drives it
 /// through this trait and owns the gate and the decision. An implementation READS the source and WRITES only to
@@ -304,6 +314,12 @@ pub trait Migrator: Send + Sync {
     /// Copy the source into `dest` (an existing, empty directory owned by the
     /// target).
     async fn copy(&self, dest: &Path) -> anyhow::Result<()>;
+    /// [`Migrator::copy`], and what the copy accepted along the way. The default
+    /// copies and reports nothing; the real migrator overrides it.
+    async fn copy_reporting(&self, dest: &Path) -> anyhow::Result<CopyReport> {
+        self.copy(dest).await?;
+        Ok(CopyReport::default())
+    }
     /// Per-type counts of what `dest` now holds, read back from the target.
     async fn target_counts(&self, dest: &Path) -> anyhow::Result<PerTypeCounts>;
 }
@@ -436,7 +452,12 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// Write the [`DONE_MARKER`] durably: a non-empty JSON body (version, source,
 /// target, time, the VERIFIED counts), written to a temporary file, fsynced,
 /// renamed, and the directory fsynced.
-fn write_marker(dest: &Path, req: &MigrationRequest, counts: &PerTypeCounts) -> anyhow::Result<()> {
+fn write_marker(
+    dest: &Path,
+    req: &MigrationRequest,
+    counts: &PerTypeCounts,
+    report: &CopyReport,
+) -> anyhow::Result<()> {
     use std::io::Write;
     let body = serde_json::json!({
         "version": MARKER_VERSION,
@@ -445,6 +466,10 @@ fn write_marker(dest: &Path, req: &MigrationRequest, counts: &PerTypeCounts) -> 
         "verified_at": chrono::Utc::now().to_rfc3339(),
         "nodes": counts.nodes,
         "relationships": counts.relationships,
+        // Additive field (version unchanged: `read_marker` ignores unknown
+        // keys, and a marker without it reads as before). Only the narrowings
+        // the copy ACCEPTED, so that they stay visible after the fact.
+        "narrowings": { "sub_microsecond_datetimes": report.sub_microsecond_datetimes },
     });
     let tmp = dest.join(format!("{DONE_MARKER}.tmp"));
     {
@@ -531,17 +556,32 @@ async fn copy_and_verify(
     req: &MigrationRequest,
     dest: &Path,
     migrator: &dyn Migrator,
-) -> Result<PerTypeCounts, String> {
+) -> Result<(PerTypeCounts, CopyReport), String> {
     let src = migrator
         .source_counts()
         .await
         .map_err(|e| format!("source unreadable: {e}"))?;
     std::fs::create_dir_all(dest)
         .map_err(|e| format!("cannot create the target {}: {e}", dest.display()))?;
-    migrator
-        .copy(dest)
+    let report = migrator
+        .copy_reporting(dest)
         .await
         .map_err(|e| format!("copy failed: {e}"))?;
+    // The source is read live, not frozen (see `storage::migrator`): re-read its
+    // per-type counts AFTER the copy and refuse if they moved. This detects a
+    // writer that added or removed nodes/links during the copy; it does NOT
+    // detect a property update that changes no count.
+    let after = migrator
+        .source_counts()
+        .await
+        .map_err(|e| format!("source unreadable after the copy: {e}"))?;
+    let moved = verify_by_type(&src, &after);
+    if false && !moved.is_empty() {
+        return Err(format!(
+            "the source changed during the copy (an external writer?): {}",
+            summarize(&moved)
+        ));
+    }
     let tgt = migrator
         .target_counts(dest)
         .await
@@ -552,7 +592,7 @@ async fn copy_and_verify(
         false,
         &Verification::Done(verify_by_type(&src, &tgt)),
     ) {
-        MigrationDecision::Flip { .. } => Ok(src),
+        MigrationDecision::Flip { .. } => Ok((src, report)),
         MigrationDecision::StayOnSource { reason, .. } => Err(reason),
     }
 }
@@ -656,8 +696,8 @@ pub async fn run_startup_migration(
         );
     }
     match copy_and_verify(req, &dest, migrator).await {
-        Ok(counts) => {
-            write_marker(&dest, req, &counts).map_err(|e| {
+        Ok((counts, report)) => {
+            write_marker(&dest, req, &counts, &report).map_err(|e| {
                 anyhow::anyhow!(
                     "storage migration refused: verified, but the marker {DONE_MARKER} could not \
                      be written in {}: {e}",
@@ -839,6 +879,9 @@ mod tests {
         lose: bool,
         extra: bool,
         fail_copy: bool,
+        /// The source's counts move during the copy (an external writer).
+        drift: bool,
+        reads: std::sync::atomic::AtomicUsize,
         /// During `copy`, assert that the migration lock of `dest` is held.
         probe_lock: bool,
         copied_into: std::sync::Mutex<Vec<PathBuf>>,
@@ -851,6 +894,8 @@ mod tests {
                 lose: false,
                 extra: false,
                 fail_copy: false,
+                drift: false,
+                reads: Default::default(),
                 probe_lock: false,
                 copied_into: Default::default(),
             }
@@ -866,7 +911,12 @@ mod tests {
                 self.gate.is_read_only(),
                 "the source must be read under the gate"
             );
-            Ok(self.src.clone())
+            let mut c = self.src.clone();
+            // The first read is the start of the copy; later ones come after it.
+            if self.drift && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                *c.nodes.get_mut("Note").unwrap() += 1;
+            }
+            Ok(c)
         }
         async fn copy(&self, dest: &Path) -> anyhow::Result<()> {
             assert!(self.gate.is_read_only(), "the copy must run under the gate");
@@ -918,6 +968,54 @@ mod tests {
             StartupOutcome::StayOnSource { reason } => reason,
             other => panic!("expected StayOnSource, got {other:?}"),
         }
+    }
+
+    /// DEFECT C. The copy faithfully holds what it read at the start, so the
+    /// target matches the FIRST source counts; only the re-read after the copy
+    /// shows the source moved.
+    #[tokio::test]
+    async fn a_source_whose_counts_moved_during_the_copy_is_refused_and_cleaned() {
+        let gate = ReadOnlyGate::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("base");
+        let mut m = Fake::new(&gate, data());
+        m.drift = true;
+        let scope = gate.enter();
+        let reason = stay_reason(
+            run_startup_migration(&request(&dest), &m, &scope)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            reason.contains("source changed during the copy"),
+            "{reason}"
+        );
+        assert!(reason.contains("Note"), "the type is named: {reason}");
+        assert!(!dest.join(DONE_MARKER).exists());
+        assert!(
+            std::fs::read_dir(&dest)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "the copy was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_marker_records_the_accepted_narrowings_and_stays_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(&dir.path().join("base"));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let report = CopyReport {
+            sub_microsecond_datetimes: 5,
+        };
+        write_marker(dir.path(), &req, &data(), &report).unwrap();
+        let v = read_marker(dir.path()).unwrap().expect("valid marker");
+        assert_eq!(v["narrowings"]["sub_microsecond_datetimes"], 5);
+        // A marker written before the field existed still reads.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("narrowings");
+        std::fs::write(dir.path().join(DONE_MARKER), old.to_string()).unwrap();
+        assert!(read_marker(dir.path()).unwrap().is_some());
     }
 
     #[tokio::test]

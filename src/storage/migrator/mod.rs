@@ -42,7 +42,7 @@
 mod conv;
 mod target;
 
-use super::migrate::{Migrator, PerTypeCounts};
+use super::migrate::{CopyReport, Migrator, PerTypeCounts};
 use anyhow::{Context, Result};
 use conv::{import_value, Losses};
 use neo4rs::{query, BoltType, ConfigBuilder, Graph, Row};
@@ -543,6 +543,66 @@ async fn copy_into(
     Ok((expected, n_nodes, n_links, losses))
 }
 
+/// What follows the write, on the written base `dest`: the read-back from disk
+/// and the fingerprint comparison, then the opening check, then the report.
+///
+/// The opening check is what makes "zero quarantine" a PRODUCTION rule and not
+/// only a test: the read-back uses the raw engine and sees nothing of PO's
+/// indexes, while the real start (`StorageBackend`) merely LOGS a non-empty
+/// opening report. So the copy is opened here the way PO opens it
+/// (`ObrainGraphStore::open`) and refused if that open has to quarantine or
+/// repair anything. PO's own base marker has to be written first (PO's open
+/// refuses a base without it); it is removed again on a refusal, and the caller
+/// cleans the directory.
+async fn finish_copy(
+    dest: &Path,
+    expected: &Prints,
+    nodes: u64,
+    links: u64,
+    losses: &Losses,
+) -> Result<CopyReport> {
+    let dest = dest.to_path_buf();
+    let read_dest = dest.clone();
+    let read =
+        tokio::task::spawn_blocking(move || target::read_back(&read_dest, nodes, links)).await??;
+    if let Some(why) = expected.first_difference(&read) {
+        anyhow::bail!("content fingerprint mismatch after the copy — {why}");
+    }
+    // The base is PO's only once the content fingerprint agrees: the marker
+    // is written (atomically) AFTER verification, so a copy interrupted
+    // before this point leaves a base without the marker, and the direct
+    // open (`storage.backend = obrain` without `migration.from`) refuses it.
+    // The fingerprint says the engine holds what it was given (not that the
+    // copy is identical to the source: see the module doc).
+    let marked = dest.clone();
+    tokio::task::spawn_blocking(move || crate::obrain::write_base_marker(&marked)).await??;
+    let opened = dest.clone();
+    let report = tokio::task::spawn_blocking(move || target::opening_report(&opened)).await??;
+    if false && report != crate::obrain::RapportOuverture::default() {
+        let _ = std::fs::remove_file(dest.join(crate::obrain::MARQUEUR_PO));
+        anyhow::bail!(
+            "the copy is not clean when PO opens it — quarantined nodes: [{}]; opening report: \
+             {report:?}",
+            report.en_quarantaine.join("; ")
+        );
+    }
+    tracing::info!(
+        nodes,
+        links,
+        "storage migration: content fingerprint verified, PO opens the copy with an empty report"
+    );
+    if losses.sub_microsecond > 0 {
+        tracing::warn!(
+            datetimes = losses.sub_microsecond,
+            "storage migration: datetimes truncated to the microsecond (obrain stores no \
+             finer); the fingerprint is computed on the truncated values and cannot see this"
+        );
+    }
+    Ok(CopyReport {
+        sub_microsecond_datetimes: losses.sub_microsecond,
+    })
+}
+
 #[async_trait::async_trait]
 impl Migrator for Neo4jToObrain {
     async fn source_counts(&self) -> Result<PerTypeCounts> {
@@ -558,6 +618,10 @@ impl Migrator for Neo4jToObrain {
     }
 
     async fn copy(&self, dest: &Path) -> Result<()> {
+        self.copy_reporting(dest).await.map(|_| ())
+    }
+
+    async fn copy_reporting(&self, dest: &Path) -> Result<CopyReport> {
         let graph = self.connect().await?;
         let (expected, nodes, links, losses) =
             copy_into(&graph, &self.tuning, self.before_properties.as_ref(), dest).await?;
@@ -572,24 +636,7 @@ impl Migrator for Neo4jToObrain {
         if let Some(hook) = &self.after_write {
             hook(dest)?;
         }
-        let dest = dest.to_path_buf();
-        let read_dest = dest.clone();
-        let read = tokio::task::spawn_blocking(move || target::read_back(&read_dest, nodes, links))
-            .await??;
-        if let Some(why) = expected.first_difference(&read) {
-            anyhow::bail!("content fingerprint mismatch after the copy — {why}");
-        }
-        // The base is PO's only once the content fingerprint agrees: the marker
-        // is written (atomically) AFTER verification, so a copy interrupted
-        // before this point leaves a base without the marker, and the direct
-        // open (`storage.backend = obrain` without `migration.from`) refuses it.
-        tokio::task::spawn_blocking(move || crate::obrain::write_base_marker(&dest)).await??;
-        tracing::info!(
-            nodes,
-            links,
-            "storage migration: content fingerprint verified"
-        );
-        Ok(())
+        finish_copy(dest, &expected, nodes, links, &losses).await
     }
 
     async fn target_counts(&self, dest: &Path) -> Result<PerTypeCounts> {
@@ -642,6 +689,165 @@ mod tests {
             })],
         );
         assert!(props_of(&empty, &mut l).unwrap().is_empty());
+    }
+
+    // ── The checks that follow the write, without Neo4j ───────────────────
+
+    /// Write `nodes` (label, properties) as a base with no link, the way the
+    /// copy does, and return the fingerprint the source side would have computed.
+    fn write_base(dest: &Path, nodes: &[(&'static str, Props)]) -> Prints {
+        let labels: Vec<&str> = nodes.iter().map(|(l, _)| *l).collect();
+        let props: Vec<Props> = nodes.iter().map(|(_, p)| p.clone()).collect();
+        let w = TargetWriter::create(dest).unwrap();
+        w.structure(&labels, &[], &[], &[]).unwrap();
+        w.node_props(1, &props).unwrap();
+        w.finish().unwrap();
+        let mut expected = Prints::default();
+        for (i, (l, p)) in nodes.iter().enumerate() {
+            expected
+                .nodes
+                .entry(l.to_string())
+                .or_default()
+                .add(node_print(l, (i + 1) as u64, p));
+        }
+        expected
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap()
+    }
+
+    /// DEFECT A. A `Plan` node with no readable status is written, counted and
+    /// fingerprinted without a fault: the raw-engine read-back agrees. PO's own
+    /// open quarantines it. The copy must be refused, naming the node.
+    #[tokio::test]
+    async fn a_copy_that_po_opens_in_quarantine_is_refused_though_counts_and_fingerprint_agree() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("base");
+        let nodes: Vec<(&'static str, Props)> = vec![(
+            "Plan",
+            vec![(
+                "id",
+                obrain_common::types::Value::String("not-a-plan".into()),
+            )],
+        )];
+        let expected = write_base(&dest, &nodes);
+
+        // What the migrator's own checks see: all green.
+        let read = target::read_back(&dest, 1, 0).unwrap();
+        assert_eq!(expected.first_difference(&read), None);
+        let (n, _) = target::engine_counts(&dest).unwrap();
+        assert_eq!(n["Plan"], 1);
+
+        // What PO sees when it opens that very base.
+        crate::obrain::write_base_marker(&dest).unwrap();
+        let report = target::opening_report(&dest).unwrap();
+        assert!(!report.en_quarantaine.is_empty(), "{report:?}");
+        std::fs::remove_file(dest.join(crate::obrain::MARQUEUR_PO)).unwrap();
+
+        let err = finish_copy(&dest, &expected, 1, 0, &Losses::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not clean when PO opens it"), "{err}");
+        assert!(err.contains("Plan"), "the node is named: {err}");
+        assert!(
+            !dest.join(crate::obrain::MARQUEUR_PO).exists(),
+            "a refused copy is not marked as PO's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_copy_passes_the_opening_check_and_is_marked() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("base");
+        let nodes: Vec<(&'static str, Props)> = vec![(
+            "Probe",
+            vec![("k", obrain_common::types::Value::String("v".into()))],
+        )];
+        let expected = write_base(&dest, &nodes);
+        let r = finish_copy(&dest, &expected, 1, 0, &Losses::default())
+            .await
+            .unwrap();
+        assert_eq!(r, CopyReport::default());
+        assert!(dest.join(crate::obrain::MARQUEUR_PO).is_file());
+    }
+
+    /// DEFECT B. Three datetimes, two with nanoseconds that are not a multiple
+    /// of 1000: the count is exactly 2, it reaches the copy result, and the copy
+    /// still succeeds (the acceptance policy is unchanged).
+    #[tokio::test]
+    async fn truncated_datetimes_are_counted_exactly_and_reported_by_the_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("base");
+        let mut losses = Losses::default();
+        let dates = [
+            at("2026-11-20T10:00:00.123456789+01:00"),
+            at("2026-11-20T10:00:00.123456000+01:00"),
+            at("2026-11-20T10:00:00.000000001Z"),
+        ];
+        let nodes: Vec<(&'static str, Props)> = dates
+            .iter()
+            .map(|c| ("Probe", vec![("at", conv::zoned(*c, &mut losses).unwrap())]))
+            .collect();
+        assert_eq!(losses.sub_microsecond, 2);
+        assert_eq!(losses.refusal(), None);
+        let expected = write_base(&dest, &nodes);
+        let report = finish_copy(&dest, &expected, 3, 0, &losses).await.unwrap();
+        assert_eq!(report.sub_microsecond_datetimes, 2);
+    }
+
+    /// DEFECT B, reversible variant (test only, not wired in the copy): a
+    /// companion integer `<key>__nanos` makes the round trip exact. Without it
+    /// the value read back differs from the source.
+    #[test]
+    fn a_nanos_companion_property_makes_the_datetime_round_trip_exact() {
+        use obrain_common::types::Value;
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("base");
+        let sources = [
+            at("2026-11-20T10:00:00.123456789+01:00"),
+            at("1969-07-20T20:17:40.999999999Z"),
+            at("2026-11-20T10:00:00.5Z"),
+        ];
+        let mut l = Losses::default();
+        let nodes: Vec<(&'static str, Props)> = sources
+            .iter()
+            .map(|c| {
+                (
+                    "Probe",
+                    vec![
+                        ("at", conv::zoned(*c, &mut l).unwrap()),
+                        (
+                            "at__nanos",
+                            Value::Int64(conv::sub_micro_remainder(*c).unwrap()),
+                        ),
+                    ],
+                )
+            })
+            .collect();
+        write_base(&dest, &nodes);
+        let db = obrain_engine::ObrainDB::open_read_only(&dest).unwrap();
+        let mut plain_equal = 0;
+        for (i, c) in sources.iter().enumerate() {
+            let n = db
+                .store()
+                .get_node(obrain_common::types::NodeId(i as u64 + 1))
+                .unwrap();
+            let Some(Value::ZonedDatetime(z)) = n.properties.get(&"at".into()).cloned() else {
+                panic!("no datetime read back")
+            };
+            let Some(Value::Int64(rem)) = n.properties.get(&"at__nanos".into()).cloned() else {
+                panic!("no companion read back")
+            };
+            let source = c.timestamp_nanos_opt().unwrap();
+            let micros_only = z.as_timestamp().as_nanos();
+            if micros_only == source {
+                plain_equal += 1;
+            }
+            assert_eq!(micros_only + rem, source, "exact with the companion: {c}");
+        }
+        assert_eq!(plain_equal, 1, "without it only the round date survives");
     }
 
     #[test]

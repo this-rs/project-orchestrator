@@ -372,6 +372,17 @@ pub fn read_back(dest: &Path, nodes: u64, links: u64) -> Result<Prints> {
     Ok(prints)
 }
 
+/// Open the written base the way PO opens it ([`crate::obrain::ObrainGraphStore`])
+/// and return what that open had to do: quarantine, repair, delete. Synchronous.
+/// The store is dropped (the base closed) before returning.
+pub fn opening_report(dest: &Path) -> Result<crate::obrain::RapportOuverture> {
+    let store = crate::obrain::ObrainGraphStore::open(dest, crate::obrain::Creation::Interdite)
+        .with_context(|| format!("opening the copy {} the way PO does", dest.display()))?;
+    let report = store.rapport_d_ouverture().clone();
+    drop(store);
+    Ok(report)
+}
+
 /// The engine's own per-label and per-type counters, read-only (O(1): they do
 /// not scan). Labels and types holding nothing are left out.
 pub fn engine_counts(dest: &Path) -> Result<(BTreeMap<String, u64>, BTreeMap<String, u64>)> {
