@@ -257,9 +257,45 @@ pub(super) struct IndexContraintes {
     par_id: HashMap<Uuid, EntreeContrainte>,
     /// Ids of quarantined nodes: no creation may take them.
     reserves: HashSet<Uuid>,
+    /// The quarantined constraints of each plan (its `CONSTRAINED_BY` edge), with
+    /// their reason. `vue_contraintes` refuses by name rather than drop them in
+    /// silence.
+    quarantaine_par_plan: HashMap<Uuid, Vec<String>>,
+}
+
+/// The indexed plan a constraint node hangs from by a `CONSTRAINED_BY` edge,
+/// read as the decoded constraints are (an edge from the very NODE `plans`
+/// indexes counts: a quarantined plan of the same id is not it).
+fn plan_du_noeud(db: &ObrainDB, plans: &plan::IndexPlans, noeud: NodeId) -> Option<Uuid> {
+    aretes_entrantes(db, noeud, CONTRAINT_PAR)
+        .into_iter()
+        .find_map(|(_, src)| {
+            let id = id_du_noeud(db, src, LABEL_PLAN)?;
+            (plans.par_id.get(&id).map(|e| e.noeud) == Some(src)).then_some(id)
+        })
 }
 
 impl IndexContraintes {
+    /// The constraints held by a plan (`CONSTRAINED_BY`), in `id` order (a total order:
+    /// `get_plan_constraints` serves node order, Neo4j none). For the graph read of
+    /// `agent.rs`.
+    pub(super) fn du_plan(&self, plan: Uuid) -> Vec<ConstraintNode> {
+        let mut v: Vec<ConstraintNode> = self
+            .par_id
+            .values()
+            .filter(|e| e.plan == Some(plan))
+            .map(|e| e.contrainte.clone())
+            .collect();
+        v.sort_by_key(|c| c.id);
+        v
+    }
+
+    /// The quarantined constraints of a plan, with their reasons:
+    /// `vue_contraintes` refuses by name when this is non-empty.
+    pub(super) fn quarantaine_du_plan(&self, plan: Uuid) -> Option<&Vec<String>> {
+        self.quarantaine_par_plan.get(&plan)
+    }
+
     /// Rebuilds the index, after the plans: drafts are deleted with their edges,
     /// unreadable nodes quarantined (their id reserved), duplicates quarantined.
     pub(super) fn reconstruire(
@@ -269,11 +305,12 @@ impl IndexContraintes {
     ) -> Self {
         let store = db.store();
         let mut index = Self::default();
+        let mut en_quarantaine: Vec<(NodeId, String)> = Vec::new();
         for noeud in store.nodes_by_label(LABEL) {
             let Some(n) = db.get_node(noeud) else {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud Constraint {noeud:?} : illisible"));
+                let raison = format!("nœud Constraint {noeud:?} : illisible");
+                rapport.en_quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             };
             let get = |cle: &str| {
@@ -297,9 +334,9 @@ impl IndexContraintes {
                     {
                         index.reserves.insert(id);
                     }
-                    rapport
-                        .en_quarantaine
-                        .push(format!("nœud Constraint {noeud:?} : {e}"));
+                    let raison = format!("nœud Constraint {noeud:?} : {e}");
+                    rapport.en_quarantaine.push(raison.clone());
+                    en_quarantaine.push((noeud, raison));
                     continue;
                 }
             };
@@ -307,19 +344,13 @@ impl IndexContraintes {
                 // Reserved too: once the indexed one is deleted, a new creation of
                 // this id would lose to this older node at the next open.
                 index.reserves.insert(contrainte.id);
-                rapport.en_quarantaine.push(format!(
-                    "nœud Constraint {noeud:?} : id {} déjà pris",
-                    contrainte.id
-                ));
+                let raison = format!("nœud Constraint {noeud:?} : id {} déjà pris", contrainte.id);
+                rapport.en_quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             }
             // Held by the indexed plan NODE, not by a quarantined one of the same id.
-            let plan = aretes_entrantes(db, noeud, CONTRAINT_PAR)
-                .into_iter()
-                .find_map(|(_, src)| {
-                    let id = id_du_noeud(db, src, LABEL_PLAN)?;
-                    (plans.par_id.get(&id).map(|e| e.noeud) == Some(src)).then_some(id)
-                });
+            let plan = plan_du_noeud(db, plans, noeud);
             index.par_id.insert(
                 contrainte.id,
                 EntreeContrainte {
@@ -328,6 +359,18 @@ impl IndexContraintes {
                     plan,
                 },
             );
+        }
+        // A quarantined constraint keeps its `CONSTRAINED_BY` edge on disk: record
+        // it under its plan, so `vue_contraintes` refuses by name instead of
+        // silently dropping a constraint Neo4j would serve.
+        for (noeud, raison) in en_quarantaine {
+            if let Some(plan) = plan_du_noeud(db, plans, noeud) {
+                index
+                    .quarantaine_par_plan
+                    .entry(plan)
+                    .or_default()
+                    .push(raison);
+            }
         }
         index
     }

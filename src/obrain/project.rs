@@ -730,6 +730,7 @@ const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
         &["Workspace", "WorkspaceMilestone", "Resource", "Component"],
     ),
     ("notes", &["Note"]),
+    ("agents", &["Agent"]),
     (
         "chat",
         &[

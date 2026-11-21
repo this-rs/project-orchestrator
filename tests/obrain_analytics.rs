@@ -2,7 +2,7 @@
 //! backend does. Persistence across a close and a reopen, an update cut at every
 //! engine write and reopened (the update marker), a duplicated `WORKS_ON` edge, the
 //! quarantine of an unreadable node (its key reserved), the refusal of an absent
-//! target, and the refusals named. The behaviour shared with Neo4j and the mock
+//! target, and the 66 refusals named. The behaviour shared with Neo4j and the mock
 //! is in `tests/store_conformance.rs` (`analytics_checks!`).
 #![cfg(feature = "obrain-backend")]
 
@@ -695,7 +695,7 @@ async fn reserved_keys_do_not_collide() {
         .is_err());
 }
 
-/// The 119 methods of the other sub-lots refuse by their own name, and none is
+/// The 104 methods of the other sub-lots refuse by their own name, and none is
 /// counted as serving.
 #[tokio::test]
 async fn the_other_sub_lots_refuse_by_name() {
@@ -737,7 +737,7 @@ async fn the_other_sub_lots_refuse_by_name() {
         store.causal_walk("Note", "x", 2),
         "AnalyticsStore::causal_walk"
     );
-    assert_eq!(refusees_analytics().len(), 81);
+    assert_eq!(refusees_analytics().len(), 66);
     assert!(refusees_analytics()
         .iter()
         .all(|m| m.starts_with("AnalyticsStore::")));
@@ -748,9 +748,10 @@ async fn the_other_sub_lots_refuse_by_name() {
         .filter(|m| m.starts_with("AnalyticsStore::"))
         .count();
     assert_eq!(
-        n, 64,
+        n, 79,
         "25 (A1) + 23 (A2, `tests/obrain_neural.rs`) + 15 (memory and maintenance, \
-         `tests/obrain_memoire.rs`) serve and `run_data_migrations` answers its no-migration"
+         `tests/obrain_memoire.rs`) + 15 (agents and views, `tests/obrain_agents.rs`) \
+         serve and `run_data_migrations` answers its no-migration"
     );
     // The one that cannot refuse says what it is.
     assert!(store.run_data_migrations().await.is_empty());

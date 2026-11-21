@@ -1,8 +1,10 @@
-//! `AnalyticsStore` on obrain, sub-lot A1 ("profiles, rules, routing, settings") and,
-//! delegated to `synapse.rs`, sub-lot A2 ("the neural layer of the notes": synapses,
-//! energy, scars, the deep-maintenance clock): 48 of the 145 methods serve,
-//! `run_data_migrations` answers its documented "no migration", and the 96 others are
-//! refused by name in this very `impl` ([`REFUSEES`]). Nothing here answers an empty or default value in place of a
+//! `AnalyticsStore` on obrain, in four sub-lots: A1 ("profiles, rules, routing, settings"),
+//! A2 delegated to `synapse.rs` ("the neural layer of the notes": synapses, energy, scars,
+//! the deep-maintenance clock), the memory-and-maintenance lot (`memoire.rs`), and the
+//! "agents and views" lot (`agent.rs`, `vues.rs`, 15 methods that delegate there): 79 of the
+//! 145 methods serve, `run_data_migrations` answers its documented "no migration", and the
+//! 66 others are refused by name in this very `impl` ([`REFUSEES`]). Nothing here answers an
+//! empty or default value in place of a
 //! refusal. The classification of the 145 methods into sub-lots is in
 //! `CONSOLIDATION.md` ("Portage d'`AnalyticsStore` : sous-lots").
 //!
@@ -1141,12 +1143,9 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::set_function_embedding",
     "AnalyticsStore::vector_search_files",
     "AnalyticsStore::vector_search_functions",
-    "AnalyticsStore::get_project_decisions_for_graph",
     "AnalyticsStore::shadow_trace_closures",
     "AnalyticsStore::compute_homeostasis",
     "AnalyticsStore::compute_structural_drift",
-    "AnalyticsStore::get_pm_graph_data",
-    "AnalyticsStore::get_chat_graph_data",
     "AnalyticsStore::get_project_import_edges",
     "AnalyticsStore::get_project_call_edges",
     "AnalyticsStore::get_project_extends_edges",
@@ -1198,22 +1197,10 @@ pub(super) const REFUSEES: &[&str] = &[
     "AnalyticsStore::get_note_embeddings_for_project",
     "AnalyticsStore::list_project_symbols",
     "AnalyticsStore::get_project_inheritance_edges",
-    "AnalyticsStore::get_project_constraints",
     "AnalyticsStore::get_entity_neighborhood",
     "AnalyticsStore::get_scoped_entity_neighborhood",
-    "AnalyticsStore::ensure_agent",
-    "AnalyticsStore::backfill_agents",
-    "AnalyticsStore::link_agent_authored",
-    "AnalyticsStore::link_agent_lived",
-    "AnalyticsStore::link_agent_knows",
-    "AnalyticsStore::link_agent_uses",
-    "AnalyticsStore::release_agent_knows",
     "AnalyticsStore::entity_exists",
     "AnalyticsStore::entities_linked",
-    "AnalyticsStore::project_synced",
-    "AnalyticsStore::list_assertion_notes",
-    "AnalyticsStore::record_assertion_check",
-    "AnalyticsStore::agent_knows",
     "AnalyticsStore::ranked_foundation",
     "AnalyticsStore::schema_catalog",
     "AnalyticsStore::causal_walk",
@@ -1527,6 +1514,7 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<Vec<TopologyViolation>> {
         Err(crate::obrain::NonPorte("AnalyticsStore::check_file_topology").into())
     }
+    // REFUSED: walks the neighbours of ANY entity, `File` and `Function` among them; no traversal was run against obrain.
     async fn get_entity_neighborhood(
         &self,
         center_type: &str,
@@ -1535,6 +1523,7 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
         Err(crate::obrain::NonPorte("AnalyticsStore::get_entity_neighborhood").into())
     }
+    // REFUSED: same as `get_entity_neighborhood`, scoped.
     async fn get_scoped_entity_neighborhood(
         &self,
         center_type: &str,
@@ -1544,9 +1533,11 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
         Err(crate::obrain::NonPorte("AnalyticsStore::get_scoped_entity_neighborhood").into())
     }
+    // REFUSED: `apoc` / `CALL` over every label and relationship of the base; not a query this backend runs.
     async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog> {
         Err(crate::obrain::NonPorte("AnalyticsStore::schema_catalog").into())
     }
+    // REFUSED: a variable-length walk over every edge type; no GQL against obrain without having been run (`CONSOLIDATION.md`).
     async fn causal_walk(
         &self,
         label: &str,
@@ -1555,6 +1546,7 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<crate::graph::schema::CausalWalk> {
         Err(crate::obrain::NonPorte("AnalyticsStore::causal_walk").into())
     }
+    // REFUSED: a variable-length path between two entities; same reason as `causal_walk`.
     async fn typed_path(
         &self,
         from_label: &str,
@@ -1602,16 +1594,16 @@ impl AnalyticsStore for ObrainGraphStore {
             .await
     }
     async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::ensure_agent").into())
+        self.agent_assurer(agent_id, model).await
     }
     async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::backfill_agents").into())
+        self.agent_reprise().await
     }
     async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::link_agent_authored").into())
+        self.agent_a_ecrit(agent_id, note_id).await
     }
     async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::link_agent_lived").into())
+        self.agent_a_vecu(agent_id, episode_id).await
     }
     async fn link_agent_knows(
         &self,
@@ -1621,7 +1613,8 @@ impl AnalyticsStore for ObrainGraphStore {
         project: Option<Uuid>,
         provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::link_agent_knows").into())
+        self.agent_sait(agent_id, note_id, scope, project, provenance)
+            .await
     }
     async fn link_agent_uses(
         &self,
@@ -1630,7 +1623,8 @@ impl AnalyticsStore for ObrainGraphStore {
         target_id: Uuid,
         provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::link_agent_uses").into())
+        self.agent_utilise(agent_id, label, target_id, provenance)
+            .await
     }
     async fn release_agent_knows(
         &self,
@@ -1638,8 +1632,9 @@ impl AnalyticsStore for ObrainGraphStore {
         rule: &str,
         keep: &[Uuid],
     ) -> Result<usize> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::release_agent_knows").into())
+        self.agent_relacher(agent_id, rule, keep).await
     }
+    // REFUSED: reads `File` / `Function` / `Struct` / `Trait` / `Enum` by name; the code domain is refused whole (`code.rs`), so `false` would REFUTE a belief that Neo4j can confirm.
     async fn entity_exists(
         &self,
         kind: &str,
@@ -1648,6 +1643,7 @@ impl AnalyticsStore for ObrainGraphStore {
     ) -> Result<Option<bool>> {
         Err(crate::obrain::NonPorte("AnalyticsStore::entity_exists").into())
     }
+    // REFUSED: same as `entity_exists` (an edge between two code entities).
     async fn entities_linked(
         &self,
         from_kind: &str,
@@ -1660,10 +1656,10 @@ impl AnalyticsStore for ObrainGraphStore {
         Err(crate::obrain::NonPorte("AnalyticsStore::entities_linked").into())
     }
     async fn project_synced(&self, project_id: Uuid) -> Result<Option<bool>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::project_synced").into())
+        self.projet_synchronise(project_id)
     }
     async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::list_assertion_notes").into())
+        self.croyances(limit)
     }
     async fn record_assertion_check(
         &self,
@@ -1672,7 +1668,8 @@ impl AnalyticsStore for ObrainGraphStore {
         status: Option<crate::notes::models::NoteStatus>,
         reason: Option<&str>,
     ) -> Result<()> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::record_assertion_check").into())
+        self.croyance_verifiee(note_id, result, status, reason)
+            .await
     }
     async fn agent_knows(
         &self,
@@ -1680,8 +1677,9 @@ impl AnalyticsStore for ObrainGraphStore {
         project: Option<Uuid>,
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::agent_knows").into())
+        self.agent_connait(agent_id, project, limit)
     }
+    // REFUSED: counts `LINKED_TO` anchors on `File` and `SYNAPSE` edges (sub-lot A2), neither written here.
     async fn ranked_foundation(
         &self,
         project: Option<Uuid>,
@@ -2183,27 +2181,27 @@ impl AnalyticsStore for ObrainGraphStore {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_project_decisions_for_graph").into())
+        self.vue_decisions(project_id)
     }
     async fn get_pm_graph_data(
         &self,
         project_id: Uuid,
         limit: usize,
     ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_pm_graph_data").into())
+        self.vue_pm(project_id, limit)
     }
     async fn get_chat_graph_data(
         &self,
         project_id: Uuid,
         limit: usize,
     ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_chat_graph_data").into())
+        self.vue_discussions(project_id)
     }
     async fn get_project_constraints(
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
-        Err(crate::obrain::NonPorte("AnalyticsStore::get_project_constraints").into())
+        self.vue_contraintes(project_id)
     }
 }
 
@@ -2227,7 +2225,7 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
-        assert_eq!(REFUSEES.len(), 81);
+        assert_eq!(REFUSEES.len(), 66);
     }
 
     /// The reserved keys of `trigger::cle_reservee` never collide on a value that

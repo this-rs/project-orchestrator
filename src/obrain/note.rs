@@ -165,7 +165,7 @@ fn refus_doublon<T>(methode: &'static str) -> Result<T> {
 /// Delete one edge of a note write. The engine refusing it means the index named an edge
 /// the base does not delete: base and index disagree, so the store is indeterminate until a
 /// restart rebuilds the index (same contract as `apres_ecriture`), and the call fails.
-fn supprimer_arete(w: &mut Ecriture<'_>, arete: EdgeId, methode: &str) -> Result<()> {
+pub(super) fn supprimer_arete(w: &mut Ecriture<'_>, arete: EdgeId, methode: &str) -> Result<()> {
     let supprimee = !w.suppression_d_arete_refusee() && w.db.delete_edge(arete);
     if !supprimee {
         w.interne
@@ -775,6 +775,15 @@ impl IndexNotes {
         self.par_id.values().map(|e| &e.note)
     }
 
+    /// Every held note with its node, in id order (what `agent.rs` reads: the beliefs, the
+    /// authors).
+    pub(super) fn avec_noeuds(&self) -> Vec<(&Note, NodeId)> {
+        let mut v: Vec<(&Note, NodeId)> =
+            self.par_id.values().map(|e| (&e.note, e.noeud)).collect();
+        v.sort_by_key(|(n, _)| n.id);
+        v
+    }
+
     /// Whether a node of this id is on disk but was quarantined at open.
     pub(super) fn est_reservee(&self, id: Uuid) -> bool {
         self.reserves.contains(&id)
@@ -865,6 +874,34 @@ pub(super) fn ecrire_propriete_de_note(
     // The new value, or the one it replaces, in a blob column: the full flush.
     w.etape()?;
     w.poser(ancienne.noeud, cle, valeur);
+    let entree = ObrainGraphStore::relire(w, &ancienne)?;
+    w.rendre_durable()?;
+    w.index_mut()?.notes.publier(entree);
+    Ok(true)
+}
+
+/// Write SEVERAL properties that another domain keeps on a note node (`None` removes the
+/// property), one engine write each in the order given, then publish the re-decoded note
+/// after the durability step. `Ok(false)`: this backend holds no note of that id (nothing
+/// written). Not atomic: an interruption leaves the properties before it written, which is
+/// why the caller orders them so that every prefix reads as a valid note.
+pub(super) fn ecrire_proprietes_de_note(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    proprietes: Vec<(&'static str, Option<Value>)>,
+) -> Result<bool> {
+    let Some(ancienne) = ObrainGraphStore::entree_de(w, id)? else {
+        return Ok(false);
+    };
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        match valeur {
+            Some(v) => w.poser(ancienne.noeud, cle, v),
+            None => {
+                w.db.remove_node_property(ancienne.noeud, cle);
+            }
+        }
+    }
     let entree = ObrainGraphStore::relire(w, &ancienne)?;
     w.rendre_durable()?;
     w.index_mut()?.notes.publier(entree);

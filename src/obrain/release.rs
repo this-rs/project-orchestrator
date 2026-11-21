@@ -145,6 +145,53 @@ pub(super) struct IndexReleases {
     deploiements_hors_index: HashMap<Uuid, Vec<NodeId>>,
     jalons: HashMap<Uuid, Entree<MilestoneNode>>,
     jalons_par_projet: HashMap<Uuid, Vec<Uuid>>,
+    /// The quarantined milestones and releases of each project, with their
+    /// reason. `vue_pm` refuses by name rather than drop them in silence.
+    quarantaine_par_projet: HashMap<Uuid, Vec<String>>,
+}
+
+/// The raw `project_id` of a quarantined release or milestone node, when it
+/// still reads as a UUID (a node quarantined for another field keeps it).
+fn projet_brut(db: &ObrainDB, noeud: NodeId) -> Option<Uuid> {
+    db.get_node(noeud)?
+        .get_property("project_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+}
+
+impl IndexReleases {
+    /// The milestones of a project with their node, in id order (the read of the PM graph,
+    /// `vues.rs`).
+    pub(super) fn jalons_du_projet(&self, projet: Uuid) -> Vec<(Uuid, NodeId)> {
+        let mut v: Vec<(Uuid, NodeId)> = self
+            .jalons_par_projet
+            .get(&projet)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.jalons.get(id).map(|e| (*id, e.noeud)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The releases of a project with their node, in id order.
+    pub(super) fn versions_du_projet(&self, projet: Uuid) -> Vec<(Uuid, NodeId)> {
+        let mut v: Vec<(Uuid, NodeId)> = self
+            .releases_par_projet
+            .get(&projet)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.releases.get(id).map(|e| (*id, e.noeud)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The quarantined milestones and releases of a project, with their reasons:
+    /// `vue_pm` refuses by name when this is non-empty.
+    pub(super) fn quarantaine_du_projet(&self, projet: Uuid) -> Option<&Vec<String>> {
+        self.quarantaine_par_projet.get(&projet)
+    }
 }
 
 /// Insert an entity under its parent.
@@ -309,7 +356,17 @@ impl IndexReleases {
         // its deployments first, before anything is read.
         rapport.suppressions_achevees += achever_suppressions(db, usize::MAX);
 
-        for (noeud, r) in charger(db, ETIQUETTE_RELEASE, lire_release, &mut rapport) {
+        let (releases, releases_illisibles) =
+            charger_avec_quarantaine(db, ETIQUETTE_RELEASE, lire_release, &mut rapport);
+        for noeud in releases_illisibles {
+            if let Some(p) = projet_brut(db, noeud) {
+                idx.quarantaine_par_projet
+                    .entry(p)
+                    .or_default()
+                    .push(format!("nœud Release {noeud:?} : illisible à l'ouverture"));
+            }
+        }
+        for (noeud, r) in releases {
             if idx.releases.contains_key(&r.id) {
                 rapport
                     .en_quarantaine
@@ -379,7 +436,19 @@ impl IndexReleases {
                 Entree { noeud, valeur: d },
             );
         }
-        for (noeud, j) in charger(db, ETIQUETTE_JALON, lire_jalon, &mut rapport) {
+        let (jalons, jalons_illisibles) =
+            charger_avec_quarantaine(db, ETIQUETTE_JALON, lire_jalon, &mut rapport);
+        for noeud in jalons_illisibles {
+            if let Some(p) = projet_brut(db, noeud) {
+                idx.quarantaine_par_projet
+                    .entry(p)
+                    .or_default()
+                    .push(format!(
+                        "nœud Milestone {noeud:?} : illisible à l'ouverture"
+                    ));
+            }
+        }
+        for (noeud, j) in jalons {
             if idx.jalons.contains_key(&j.id) {
                 rapport
                     .en_quarantaine

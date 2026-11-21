@@ -6245,24 +6245,118 @@ pub mod conformance {
         assert!(store.health_check().await.unwrap());
         task_cleanup(store, &p, &plan).await;
     }
-
+    /// What the durable self knows (`KNOWS`): `created` says who drew the edge, the last
+    /// measure wins, the two scales (global, the project asked), the strongest first with
+    /// the instant of `at` then the id breaking a tie, the bound and the total it withheld,
+    /// the release of one rule, and a project's sync state. Same on every backend.
+    pub async fn check_analytics_agent_knowledge(store: &dyn GraphStore) {
+        use project_orchestrator::graph::rules::{KnowledgeScope, Provenance};
+        let prov = |rule: &str, score: Option<f64>, at: &str| {
+            let mut p = Provenance::new(rule, "measure");
+            p.at = at.to_string();
+            p.score = score;
+            p.accountable().unwrap()
+        };
+        let root = store.agent_identity_namespace().await.unwrap();
+        store.ensure_agent(root, None).await.unwrap();
+        let p = a_project("agent-knowledge");
+        store.create_project(&p).await.unwrap();
+        assert_eq!(store.project_synced(p.id).await.unwrap(), Some(false));
+        store.update_project_synced(p.id).await.unwrap();
+        assert_eq!(store.project_synced(p.id).await.unwrap(), Some(true));
+        assert_eq!(store.project_synced(Uuid::new_v4()).await.unwrap(), None);
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let n = a_note(None, &format!("agent-knowledge {i}"));
+            store.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let (g, pr) = (KnowledgeScope::Global, KnowledgeScope::Project);
+        let old = "2026-01-01T00:00:00Z";
+        let new = "2026-02-01T00:00:00Z";
+        assert!(store
+            .link_agent_knows(root, ids[0], g, None, &prov("ak-a", Some(0.5), old))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(root, ids[1], g, None, &prov("ak-a", Some(0.5), new))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(root, ids[2], pr, Some(p.id), &prov("ak-b", Some(0.9), old))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(
+                root,
+                ids[3],
+                pr,
+                Some(Uuid::new_v4()),
+                &prov("ak-b", Some(0.99), old)
+            )
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .link_agent_knows(root, ids[0], g, None, &prov("ak-a", Some(0.5), old))
+                .await
+                .unwrap(),
+            "a second call is not a creation"
+        );
+        assert!(!store
+            .link_agent_knows(root, Uuid::new_v4(), g, None, &prov("ak-a", None, old))
+            .await
+            .unwrap());
+        let k = store.agent_knows(root, None, 10).await.unwrap();
+        assert_eq!((k.notes, k.available), (vec![ids[1], ids[0]], 2));
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[2], ids[1], ids[0]]);
+        let k = store.agent_knows(root, Some(p.id), 1).await.unwrap();
+        assert_eq!(
+            (k.notes.clone(), k.available, k.withheld()),
+            (vec![ids[2]], 3, 2)
+        );
+        assert_eq!(
+            store
+                .release_agent_knows(root, "ak-b", &[ids[2]])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .release_agent_knows(root, "ak-b", &[ids[2]])
+                .await
+                .unwrap(),
+            0
+        );
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[2], ids[1], ids[0]]);
+        assert_eq!(
+            store.release_agent_knows(root, "ak-b", &[]).await.unwrap(),
+            1
+        );
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[1], ids[0]]);
+        for id in ids {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
     // ------------------------------------------------------------------
     // Analytics, sub-lot A2: the synapses of the notes, their energy, their
     // scars. What the three stores agree on (what is specific to obrain, and
     // what the mock cannot be the reference for, is in `tests/obrain_neural.rs`).
     // ------------------------------------------------------------------
-
     fn close_to(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-3
     }
-
     async fn a_note_of(store: &dyn GraphStore, p: Uuid, energy: f64) -> Note {
         let mut n = a_note(Some(p), "neural");
         n.energy = energy;
         store.create_note(&n).await.unwrap();
         n
     }
-
     /// The `SYNAPSE` layer between notes: both directions on creation, the update of an
     /// existing weight (no second edge), the read order (heaviest first), the Hebbian
     /// reinforcement (only notes of one project, `0.5` for a new pair, capped at 1.0), the
@@ -6297,7 +6391,6 @@ pub mod conformance {
         assert_eq!(store.get_synapses(b).await.unwrap(), vec![(a, 0.3)]);
         assert!(store.get_synapses(Uuid::new_v4()).await.unwrap().is_empty());
         assert_eq!(store.delete_synapses(Uuid::new_v4()).await.unwrap(), 0);
-
         let mut w = store.get_all_synapse_weights(Some(p.id)).await.unwrap();
         w.sort_by(|x, y| x.partial_cmp(y).unwrap());
         assert_eq!(w, vec![0.3, 0.3, 0.6, 0.6]);
@@ -6345,7 +6438,6 @@ pub mod conformance {
             1,
             "the minimum filters"
         );
-
         // Reinforcement: 0.3 + 0.1, 0.6 + 0.1, and the new pair (b, c) starts at 0.5.
         assert!(store.reinforce_synapses(&[a], 0.1).await.is_err());
         assert_eq!(store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap(), 6);
@@ -6368,7 +6460,6 @@ pub mod conformance {
                 .unwrap(),
             2
         );
-
         // Weakening `b`: 0.5 - 0.1 and 0.5 - 0.1 are under 0.45 and go; a-b became 0.5 too.
         let avant = store.get_synapses(b).await.unwrap().len();
         assert_eq!(avant, 2);
@@ -6384,7 +6475,6 @@ pub mod conformance {
         }
         store.delete_project(p.id, &p.name).await.ok();
     }
-
     /// The energy and the scars of a note: a boost adds to the stored energy (capped at 1.0),
     /// the reactivation counter counts the notes it found, a scar is added and capped and
     /// healed, and healing an unknown node answers `false`.
@@ -6402,7 +6492,6 @@ pub mod conformance {
             1.0
         ));
         store.boost_energy(Uuid::new_v4(), 0.5).await.unwrap();
-
         assert_eq!(store.track_reactivation(&[]).await.unwrap(), 0);
         assert_eq!(
             store
@@ -6424,7 +6513,6 @@ pub mod conformance {
                 .reactivation_count,
             1
         );
-
         assert_eq!(store.apply_scars(&[], 0.3).await.unwrap(), 0);
         assert_eq!(
             store
@@ -6457,13 +6545,11 @@ pub mod conformance {
         }
         store.delete_project(p.id, &p.name).await.ok();
     }
-
     // ------------------------------------------------------------------
     // Analytics, the memory layer and its maintenance: the shadow traces, the notes the
     // heuristic wrote, the scope of a protocol. What the stores agree on (what is specific
     // to obrain is in `tests/obrain_memoire.rs`).
     // ------------------------------------------------------------------
-
     fn a_shadow_trace(
         session: Uuid,
         project: Uuid,
@@ -6509,7 +6595,6 @@ pub mod conformance {
             rewarded: vec![],
         }
     }
-
     /// The shadow traces: recorded and read back, the latest `keep` of a session kept, listed by
     /// session (oldest first) and by note (latest first, limited), a reward claimed once.
     pub async fn check_memory_shadow_traces(store: &dyn GraphStore) {
@@ -6581,7 +6666,6 @@ pub mod conformance {
             vec!["task_closure".to_string()]
         );
     }
-
     /// The notes the heuristic wrote: counted by shape (one shape here, so the order of the
     /// groups is not in question), archived when active and unconfirmed, by scope.
     pub async fn check_memory_auto_observed(store: &dyn GraphStore) {
@@ -6646,7 +6730,6 @@ pub mod conformance {
         store.delete_project(p.id, &p.name).await.ok();
         store.delete_project(q.id, &q.name).await.ok();
     }
-
     /// `rescope_protocol` attaches a protocol to a project, then makes it transverse.
     pub async fn check_memory_rescope_protocol(store: &dyn GraphStore) {
         let (p, q) = (a_project("rescope-p"), a_project("rescope-q"));
@@ -8553,6 +8636,7 @@ macro_rules! analytics_checks {
                 check_analytics_user_profile,
                 check_analytics_routing,
                 check_analytics_frustration_and_step_parent,
+                check_analytics_agent_knowledge,
             ]
         );
     };
