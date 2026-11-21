@@ -256,7 +256,7 @@ fn lire_decision(get: &dyn Fn(&str) -> Option<Value>) -> Result<DecisionNode> {
 /// One decision: where it lives in the base, what the base says about it
 /// (decoded once), and the project it is attached to directly, if any.
 #[derive(Clone)]
-struct EntreeDecision {
+pub(super) struct EntreeDecision {
     noeud: NodeId,
     decision: DecisionNode,
     projet: Option<Uuid>,
@@ -320,6 +320,37 @@ fn projet_du_noeud(db: &ObrainDB, projets: &project::IndexProjets, noeud: NodeId
 }
 
 impl IndexDecisions {
+    /// The node of a decision this backend holds.
+    pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
+        self.par_id.get(&id).map(|e| e.noeud)
+    }
+
+    /// Whether a node of this id is on disk but was quarantined at open.
+    pub(super) fn est_reservee(&self, id: Uuid) -> bool {
+        self.reserves.contains(&id)
+    }
+
+    /// How many `Decision` nodes were quarantined at open.
+    pub(super) fn en_quarantaine(&self) -> usize {
+        self.reserves.len()
+    }
+
+    /// Every decision this backend holds, with its node.
+    pub(super) fn toutes_avec_noeud(&self) -> impl Iterator<Item = (&DecisionNode, NodeId)> + '_ {
+        self.par_id.values().map(|e| (&e.decision, e.noeud))
+    }
+
+    /// The decision `id`, as the index holds it.
+    pub(super) fn decision(&self, id: Uuid) -> Option<&DecisionNode> {
+        self.par_id.get(&id).map(|e| &e.decision)
+    }
+
+    /// Publish an entry returned by [`poser_proprietes_de_decision`], AFTER the
+    /// durability step of the write that made it.
+    pub(super) fn publier_entree(&mut self, e: EntreeDecision) {
+        self.publier(e);
+    }
+
     fn inscrire(&mut self, e: EntreeDecision) {
         self.par_id.insert(e.decision.id, e);
     }
@@ -475,6 +506,26 @@ impl ObrainGraphStore {
     fn relire_decision(w: &Ecriture<'_>, e: &EntreeDecision) -> Result<EntreeDecision> {
         w.apres_ecriture(EntreeDecision::decoder(w.db, e.noeud, e.projet))
     }
+}
+
+/// Set properties on a decision node (one engine write each, in order) and re-decode it,
+/// WITHOUT making it durable or publishing it (the caller does both once its whole write is
+/// done). `Ok(None)`: no such decision, nothing written; a RESERVED id (quarantined at
+/// open) is refused.
+pub(super) fn poser_proprietes_de_decision(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    proprietes: Vec<(&'static str, Value)>,
+) -> Result<Option<EntreeDecision>> {
+    ObrainGraphStore::refuser_si_reserve(w, id, "écriture d'une propriété")?;
+    let Some(ancienne) = ObrainGraphStore::entree_decision(w, id)? else {
+        return Ok(None);
+    };
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        w.poser(ancienne.noeud, cle, valeur);
+    }
+    Ok(Some(ObrainGraphStore::relire_decision(w, &ancienne)?))
 }
 
 /// The ported half of `DecisionStore`. The name of the trait method is the name

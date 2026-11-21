@@ -113,6 +113,7 @@ mod constraint;
 mod decision;
 mod featuregraph;
 mod federation;
+mod memoire;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod note;
@@ -124,9 +125,11 @@ mod protocol;
 mod protocolrun;
 mod release;
 mod search;
+mod shadow;
 mod sharing;
 mod skill;
 mod step;
+mod synapse;
 mod task;
 mod trigger;
 mod vues;
@@ -611,8 +614,8 @@ struct Etat {
     recherche: search::IndexRecherche,
 
     analyse: analytics::IndexAnalyse,
-
     agents: agent::IndexAgents,
+    ombres: shadow::IndexOmbres,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -1056,6 +1059,7 @@ impl ObrainGraphStore {
         let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
         let analyse = analytics::IndexAnalyse::reconstruire(&db, &mut rapport);
         let agents = agent::IndexAgents::reconstruire(&db, &mut rapport);
+        let ombres = shadow::IndexOmbres::reconstruire(&db, &mut rapport);
         let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
             .with_context(contexte)?;
 
@@ -1097,8 +1101,8 @@ impl ObrainGraphStore {
             recherche,
 
             analyse,
-
             agents,
+            ombres,
         };
         let store = Self {
             interne: Arc::new(Interne {

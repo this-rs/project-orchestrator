@@ -793,6 +793,68 @@ impl IndexNotes {
     pub(super) fn en_quarantaine(&self) -> usize {
         self.en_quarantaine
     }
+
+    /// The notes attached to a project (`project_id`), in id order, with their node.
+    pub(super) fn du_projet(&self, projet: Uuid) -> Vec<(Uuid, NodeId)> {
+        self.par_projet
+            .get(&projet)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.par_id.get(id).map(|e| (*id, e.noeud)))
+            .collect()
+    }
+
+    /// Every note this backend holds, with its node.
+    pub(super) fn toutes_avec_noeud(&self) -> impl Iterator<Item = (&Note, NodeId)> + '_ {
+        self.par_id.values().map(|e| (&e.note, e.noeud))
+    }
+
+    /// The `LINKED_TO` links of the notes of a project, as `(note, entity id)` in
+    /// that order, for `get_project_note_entity_links`. A note whose links this
+    /// backend does not all resolve (an unported domain, a missing target, a
+    /// duplicated edge) makes the answer incomplete: refused, never shortened.
+    pub(super) fn liens_du_projet(&self, projet: Uuid) -> Result<Vec<(Uuid, String)>> {
+        let mut v = Vec::new();
+        for id in self.par_projet.get(&projet).into_iter().flatten() {
+            let Some(e) = self.par_id.get(id) else {
+                continue;
+            };
+            if e.non_resolus > 0 {
+                bail!(
+                    "la note {id} a {} lien(s) LINKED_TO que ce backend ne résout pas (domaine                      non porté, cible absente ou arête en double) : la liste des liens du projet                      serait incomplète",
+                    e.non_resolus
+                );
+            }
+            for l in &e.liens {
+                v.push((*id, l.id_entite.clone()));
+            }
+        }
+        Ok(v)
+    }
+
+    /// Publish a note entry returned by [`poser_proprietes_de_note`], AFTER the durability
+    /// step of the write that made it.
+    pub(super) fn publier_entree(&mut self, e: EntreeNote) {
+        self.publier(e);
+    }
+}
+
+/// Set properties on a note node (one engine write each, in order) and re-decode the note,
+/// WITHOUT making it durable or publishing it: the caller does both once its whole write is
+/// done ([`IndexNotes::publier_entree`]). `Ok(None)`: no such note, nothing written.
+pub(super) fn poser_proprietes_de_note(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    proprietes: Vec<(&'static str, Value)>,
+) -> Result<Option<EntreeNote>> {
+    let Some(ancienne) = ObrainGraphStore::entree_de(w, id)? else {
+        return Ok(None);
+    };
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        w.poser(ancienne.noeud, cle, valeur);
+    }
+    Ok(Some(ObrainGraphStore::relire(w, &ancienne)?))
 }
 
 /// Write ONE property that another domain keeps on a note node (`sharing_consent`,

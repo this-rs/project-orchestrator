@@ -674,6 +674,57 @@ impl IndexProtocoles {
 // The trait
 // ============================================================================
 
+impl ObrainGraphStore {
+    /// `rescope_protocol`: `None` makes the protocol transverse, `Some(project)` attaches it.
+    ///
+    /// Membership is a PROPERTY here (module doc), so the whole write is ONE engine write of
+    /// `project_id` (`''` for none): there is no state between "old scope" and "new scope" for a
+    /// cut to leave, and no second index to keep in step (the project index is only READ, to
+    /// check the target). Neo4j also moves a `BELONGS_TO` edge; this backend writes none and no
+    /// reader traverses one (`BELONGS_TO` edges a migrated base carries are left as they are).
+    ///
+    /// Differences with Neo4j, on the strict side: a protocol that does not exist REFUSES (Neo4j's
+    /// `MATCH` writes nothing and answers `Ok`; the mock refuses too), and so does a project that
+    /// does not exist (Neo4j writes the dangling `project_id` and no edge).
+    pub(super) async fn protocole_rescoper(&self, id: Uuid, projet: Option<Uuid>) -> Result<()> {
+        self.ecrire(
+            || (),
+            move |(), w: &mut Ecriture<'_>| {
+                let (noeud, actuel) = {
+                    let etat = w.index()?;
+                    let Some(f) = etat.protocoles.protocoles.get(&id) else {
+                        bail!("protocol {id} not found");
+                    };
+                    if let Some(p) = projet {
+                        if !etat.projets.contient(p) {
+                            bail!(
+                                "le projet {p} n'existe pas : le protocole {id} ne peut pas y être \
+                                 rattaché (Neo4j écrirait un `project_id` sans arête)"
+                            );
+                        }
+                    }
+                    (f.noeud, f.valeur.project_id)
+                };
+                if actuel == projet {
+                    return Ok(());
+                }
+                let fiche = reecrire(
+                    w,
+                    noeud,
+                    vec![(
+                        "project_id",
+                        texte(projet.map(|u| u.to_string()).unwrap_or_default()),
+                    )],
+                    &lire_protocole,
+                )?;
+                w.index_mut()?.protocoles.protocoles.insert(id, fiche);
+                Ok(())
+            },
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl ProtocolStore for ObrainGraphStore {
     async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()> {
