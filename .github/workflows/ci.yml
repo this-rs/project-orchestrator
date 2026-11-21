@@ -776,8 +776,27 @@ jobs:
       # `obrain_dates` rides along: it proves a migrated `ZonedDatetime` is READ
       # (not replaced by `Utc::now()`), and the two suites are the same kind of
       # guard — a portage behaviour nothing else asserts.
-      - name: Run the task-and-step and date portage tests
-        run: cargo test --features obrain-backend --lib storage::migrator --test obrain_taches --test obrain_dates
+      # THREE invocations, not one. In `cargo test <FILTER> --lib --test A --test B`
+      # the positional FILTER applies to EVERY target, so `storage::migrator`
+      # filtered out all of `obrain_taches` and `obrain_dates` (measured on
+      # 7beae326: 0 run, the rest "filtered out") while the step stayed green.
+      # Each step also checks that the tests really RAN: a green run that ran
+      # nothing is the failure this step exists to prevent.
+      - name: Run the migrator unit tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --lib storage::migrator 2>&1 | tee /tmp/migrator.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/migrator.log
+      - name: Run the task-and-step portage tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --test obrain_taches 2>&1 | tee /tmp/taches.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/taches.log
+      - name: Run the date portage tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --test obrain_dates 2>&1 | tee /tmp/dates.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/dates.log
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
