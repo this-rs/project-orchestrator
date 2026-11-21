@@ -576,7 +576,7 @@ async fn copy_and_verify(
         .await
         .map_err(|e| format!("source unreadable after the copy: {e}"))?;
     let moved = verify_by_type(&src, &after);
-    if false && !moved.is_empty() {
+    if !moved.is_empty() {
         return Err(format!(
             "the source changed during the copy (an external writer?): {}",
             summarize(&moved)

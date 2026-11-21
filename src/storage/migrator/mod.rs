@@ -578,7 +578,7 @@ async fn finish_copy(
     tokio::task::spawn_blocking(move || crate::obrain::write_base_marker(&marked)).await??;
     let opened = dest.clone();
     let report = tokio::task::spawn_blocking(move || target::opening_report(&opened)).await??;
-    if false && report != crate::obrain::RapportOuverture::default() {
+    if report != crate::obrain::RapportOuverture::default() {
         let _ = std::fs::remove_file(dest.join(crate::obrain::MARQUEUR_PO));
         anyhow::bail!(
             "the copy is not clean when PO opens it — quarantined nodes: [{}]; opening report: \
