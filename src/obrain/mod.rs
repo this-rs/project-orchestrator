@@ -136,7 +136,9 @@ mod vues;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
-pub use mesure::{Durabilite, Interruption, ValeurBrute};
+pub use mesure::{
+    attendre_la_barriere, Durabilite, Interruption, ValeurBrute, VerrouTenu, DELAI_DE_BARRIERE,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -576,10 +578,37 @@ struct Interne {
     /// A test hook: the point where the next write stops (`mesure.rs`).
     #[cfg(any(test, feature = "mock-store"))]
     interruption: Mutex<Option<Interruption>>,
+    /// The clock of the decisions a write takes under the writer lock.
+    horloge: Horloge,
+    /// A test hook: the next write signals here once it is on the blocking pool,
+    /// right BEFORE it asks for the writer lock (`mesure.rs`).
+    #[cfg(any(test, feature = "mock-store"))]
+    avant_verrou: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The directory itself, when the base is a throwaway one
     /// ([`ObrainGraphStore::open_temporary`]). Declared LAST: fields drop in
     /// order, so the base is closed before its directory is removed.
     _jetable: Option<tempfile::TempDir>,
+}
+
+/// The clock a write reads, under the writer lock, for the decisions that depend on
+/// "now" (a token's expiry). In a production build it is the wall clock and nothing
+/// else; a test build can freeze it at an instant it chooses
+/// (`ObrainGraphStore::figer_l_horloge`, `mesure.rs`), so that a test moves time by
+/// a statement instead of a sleep.
+#[derive(Default)]
+struct Horloge {
+    #[cfg(any(test, feature = "mock-store"))]
+    figee: Mutex<Option<DateTime<Utc>>>,
+}
+
+impl Horloge {
+    fn maintenant(&self) -> DateTime<Utc> {
+        #[cfg(any(test, feature = "mock-store"))]
+        if let Some(t) = *self.figee.lock().unwrap_or_else(|e| e.into_inner()) {
+            return t;
+        }
+        Utc::now()
+    }
 }
 
 /// In-memory indexes, rebuilt from the base at open.
@@ -634,6 +663,11 @@ struct Ecriture<'a> {
 }
 
 impl Ecriture<'_> {
+    /// "Now", read under the writer lock (an `Ecriture` only exists under it).
+    fn maintenant(&self) -> DateTime<Utc> {
+        self.interne.horloge.maintenant()
+    }
+
     fn index(&self) -> Result<RwLockReadGuard<'_, Etat>> {
         self.interne
             .etat
@@ -1119,6 +1153,9 @@ impl ObrainGraphStore {
                 rapport,
                 #[cfg(any(test, feature = "mock-store"))]
                 interruption: Mutex::new(None),
+                horloge: Horloge::default(),
+                #[cfg(any(test, feature = "mock-store"))]
+                avant_verrou: Mutex::new(None),
                 _jetable: jetable,
             }),
         };
@@ -1222,6 +1259,15 @@ impl ObrainGraphStore {
         let interne = self.interne.clone();
         tokio::task::spawn_blocking(move || {
             let prepare = preparer();
+            #[cfg(any(test, feature = "mock-store"))]
+            if let Some(signal) = interne
+                .avant_verrou
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = signal.send(());
+            }
             let _ecrivain = interne
                 .ecrivain
                 .lock()

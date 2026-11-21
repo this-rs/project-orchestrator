@@ -1003,8 +1003,14 @@ impl AuthStore for ObrainGraphStore {
         let hash = token_hash.to_string();
         // The instant is taken UNDER the writer lock: a token that expires while the
         // call waits for the lock is expired (as Neo4j evaluates it after the MATCH).
-        self.ecrire(|| (), move |(), w| consommer_jeton(w, &hash, Utc::now()))
-            .await
+        self.ecrire(
+            || (),
+            move |(), w| {
+                let maintenant = w.maintenant();
+                consommer_jeton(w, &hash, maintenant)
+            },
+        )
+        .await
     }
 
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
@@ -1214,7 +1220,7 @@ impl AuthStore for ObrainGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obrain::Creation;
+    use crate::obrain::{attendre_la_barriere, Creation, DELAI_DE_BARRIERE};
 
     fn oidc(externe: &str, email: &str) -> UserNode {
         let now = Utc::now();
@@ -1688,51 +1694,87 @@ mod tests {
     }
 
     /// The instant of a consumption is taken under the writer lock: a token that
-    /// expires while the call waits behind a slow write is expired, not consumed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// expires while the call waits for the lock is expired, not consumed.
+    ///
+    /// No sleep and no wall-clock window: the test holds the writer lock itself,
+    /// waits for the consumption's signal that it is about to ask for that lock
+    /// (so it was called while the token was valid), moves the store's frozen clock
+    /// past the expiry, and only then releases the lock.
+    #[tokio::test]
     async fn la_consommation_prend_l_heure_sous_le_verrou() {
-        use crate::obrain::Durabilite;
-        let store =
-            ObrainGraphStore::open_temporary_avec(Durabilite::LenteAPourTest(2000)).unwrap();
+        let store = ObrainGraphStore::open_temporary().unwrap();
         let user_id = Uuid::new_v4();
         let t0 = Utc::now();
-        // Created in ~2 s (the slow durability step): ~1 s of life left after.
+        store.figer_l_horloge(t0);
+        let expire = t0 + chrono::Duration::hours(1);
         store
-            .create_refresh_token(
-                user_id,
-                "empreinte-lente",
-                t0 + chrono::Duration::seconds(3),
-            )
+            .create_refresh_token(user_id, "empreinte-temoin", expire)
             .await
             .unwrap();
-        assert!(
-            Utc::now() < t0 + chrono::Duration::milliseconds(2700),
-            "setup too slow"
-        );
-        // A slow write holds the writer lock ~2 s; the consumption is called during
-        // it, while the token is still valid, and runs after it, once it has expired.
-        let (_, consomme) = tokio::join!(
-            store.create_mcp_token(
-                user_id,
-                "jti-lent",
-                "l",
-                "s",
-                t0 + chrono::Duration::days(1)
-            ),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                assert!(
-                    Utc::now() < t0 + chrono::Duration::seconds(3),
-                    "called too late"
-                );
-                store.consume_refresh_token("empreinte-lente").await
-            }
-        );
-        assert!(Utc::now() > t0 + chrono::Duration::seconds(3));
+        store
+            .create_refresh_token(user_id, "empreinte-attente", expire)
+            .await
+            .unwrap();
+        // Control: at t0 the token is consumable (the test below is not vacuous).
+        assert!(store
+            .consume_refresh_token("empreinte-temoin")
+            .await
+            .unwrap()
+            .is_some());
+
+        let verrou = store.tenir_le_verrou_d_ecriture().await.unwrap();
+        let en_attente = store.signaler_avant_le_verrou();
+        let (consomme, barriere) =
+            tokio::join!(store.consume_refresh_token("empreinte-attente"), async {
+                let barriere = attendre_la_barriere(
+                    en_attente,
+                    DELAI_DE_BARRIERE,
+                    "signaler_avant_le_verrou (consume_refresh_token)",
+                )
+                .await;
+                // Called at t0, still waiting for the lock: the token expires now.
+                store.figer_l_horloge(t0 + chrono::Duration::hours(2));
+                // Released whatever the barrier said: the consumption never hangs.
+                drop(verrou);
+                barriere
+            });
+        if let Err(e) = barriere {
+            panic!("{e:#}");
+        }
         assert!(
             consomme.unwrap().is_none(),
             "expired while waiting for the lock: not a valid rotation"
         );
+        store.close().await.unwrap();
+    }
+
+    /// A barrier whose hook is never called fails, bounded and by the hook's name: it
+    /// does not hang the test. (The armed signal is never consumed: no write runs.)
+    #[tokio::test]
+    async fn une_barriere_jamais_atteinte_echoue_au_lieu_de_bloquer() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let jamais = store.signaler_avant_le_verrou();
+        let err = attendre_la_barriere(
+            jamais,
+            std::time::Duration::from_millis(50),
+            "signaler_avant_le_verrou (aucune écriture lancée)",
+        )
+        .await
+        .expect_err("no write ran: the barrier cannot have been reached");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("barrière de test non atteinte")
+                && message.contains("signaler_avant_le_verrou (aucune écriture lancée)")
+                && message.contains("n'a pas été appelé"),
+            "{message}"
+        );
+        // An abandoned barrier (sender dropped unsent) is named too, not a hang.
+        let (envoi, reception) = tokio::sync::oneshot::channel::<()>();
+        drop(envoi);
+        let err = attendre_la_barriere(reception, DELAI_DE_BARRIERE, "abandonné")
+            .await
+            .expect_err("the sender was dropped");
+        assert!(format!("{err:#}").contains("barrière de test abandonnée"));
         store.close().await.unwrap();
     }
 

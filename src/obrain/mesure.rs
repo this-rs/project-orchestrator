@@ -93,6 +93,40 @@ pub enum Durabilite {
     LenteAPourTest(u64),
 }
 
+/// How long a test waits at a barrier before failing. Not a timing window: the
+/// barrier is what orders the test (nominally it is reached in milliseconds); this
+/// bound only turns a barrier that is never reached into a named failure instead of
+/// a hung test.
+#[doc(hidden)]
+pub const DELAI_DE_BARRIERE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for a test barrier's signal, at most `delai`. A barrier never reached (its
+/// hook not called) or abandoned (its sender dropped unsent) is an error that names
+/// the hook, never a hang.
+#[doc(hidden)]
+pub async fn attendre_la_barriere(
+    signal: tokio::sync::oneshot::Receiver<()>,
+    delai: std::time::Duration,
+    hook: &str,
+) -> Result<()> {
+    match tokio::time::timeout(delai, signal).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(anyhow!(
+            "barrière de test abandonnée : le hook {hook} a été retiré sans signaler"
+        )),
+        Err(_) => Err(anyhow!(
+            "barrière de test non atteinte en {delai:?} : le hook {hook} n'a pas été appelé"
+        )),
+    }
+}
+
+/// The writer lock, held for a test by [`ObrainGraphStore::tenir_le_verrou_d_ecriture`]:
+/// released when this is dropped.
+#[doc(hidden)]
+pub struct VerrouTenu {
+    _liberer: std::sync::mpsc::Sender<()>,
+}
+
 impl ObrainGraphStore {
     /// [`ObrainGraphStore::open`] with an explicit durability step.
     #[doc(hidden)]
@@ -129,6 +163,56 @@ impl ObrainGraphStore {
     #[doc(hidden)]
     pub fn interrompre_au_prochain(&self, point: Interruption) {
         *self.interne.interruption.lock().unwrap() = Some(point);
+    }
+
+    /// Freeze the store's clock at `instant` (the clock a write reads under the
+    /// writer lock): a test moves time by calling this again, never by sleeping.
+    #[doc(hidden)]
+    pub fn figer_l_horloge(&self, instant: chrono::DateTime<chrono::Utc>) {
+        *self
+            .interne
+            .horloge
+            .figee
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(instant);
+    }
+
+    /// Arm a signal: the next write sends on it once it runs on the blocking pool,
+    /// right before it asks for the writer lock. With the lock held by the test,
+    /// that write is then known to be waiting for it.
+    #[doc(hidden)]
+    pub fn signaler_avant_le_verrou(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (envoi, reception) = tokio::sync::oneshot::channel();
+        *self
+            .interne
+            .avant_verrou
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(envoi);
+        reception
+    }
+
+    /// Hold the writer lock, as a slow write would, until the returned value is
+    /// dropped. Answers once the lock IS held. For a test that must place another
+    /// write behind it deterministically. The lock is held on a blocking thread,
+    /// never across an `.await` of the caller.
+    #[doc(hidden)]
+    pub async fn tenir_le_verrou_d_ecriture(&self) -> Result<VerrouTenu> {
+        let interne = self.interne.clone();
+        let (tenu, est_tenu) = tokio::sync::oneshot::channel();
+        let (liberer, attendre) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ecrivain = interne.ecrivain.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = tenu.send(());
+            // Returns when the `VerrouTenu` is dropped (its sender with it).
+            let _ = attendre.recv();
+        });
+        attendre_la_barriere(
+            est_tenu,
+            DELAI_DE_BARRIERE,
+            "tenir_le_verrou_d_ecriture (prise du verrou d'écriture)",
+        )
+        .await?;
+        Ok(VerrouTenu { _liberer: liberer })
     }
 
     /// The raw properties of a project's node as the ENGINE reads them now, for
