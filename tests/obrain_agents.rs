@@ -1559,3 +1559,211 @@ async fn the_eight_methods_left_refuse_by_name() {
         assert!(!refusees_analytics().contains(&name.as_str()), "{name}");
     }
 }
+
+/// A decision quarantined at open (unreadable) but still attached by `HAS_DECISION`
+/// refuses the graph view by name: Neo4j serves it, dropping it in silence is a loss.
+#[tokio::test]
+async fn a_quarantined_decision_of_the_project_refuses_the_graph_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, did) = (p.id, Uuid::new_v4());
+    with_engine(&base, move |db| {
+        let proj = node_of(db, "Project", pid);
+        let d = db.create_node(&["Decision"]);
+        // No `description`: `lire_decision` fails, the node is quarantined.
+        db.set_node_property(d, "id", Value::from(did.to_string()));
+        db.create_edge(proj, d, "HAS_DECISION");
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    let e = store
+        .get_project_decisions_for_graph(pid)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<NonPorte>(),
+        Some(&NonPorte("AnalyticsStore::get_project_decisions_for_graph")),
+        "{e:#}"
+    );
+}
+
+/// An `INFORMED_BY` edge on a decision of ANOTHER project does not refuse this project's
+/// graph view: the refusal is bounded to the project's own decisions, as `AFFECTS`.
+#[tokio::test]
+async fn informed_by_on_another_projects_decision_does_not_refuse_this_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let (p, q) = (a_project(), a_project());
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    store.create_project(&q).await.unwrap();
+    let (dp, dq) = (a_decision(1, "p"), a_decision(2, "q"));
+    store.create_decision_global(&dp, Some(p.id)).await.unwrap();
+    store.create_decision_global(&dq, Some(q.id)).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, qid, dqid) = (p.id, q.id, dq.id);
+    with_engine(&base, move |db| {
+        let d = node_of(db, "Decision", dqid);
+        let t = db.create_node(&["Task"]);
+        db.set_node_property(t, "id", Value::from(Uuid::new_v4().to_string()));
+        db.create_edge(t, d, "INFORMED_BY");
+        let _ = (pid, qid);
+    })
+    .await;
+    let store = open(&base).await;
+    // q's own decision carries INFORMED_BY: q refuses.
+    assert!(store.get_project_decisions_for_graph(qid).await.is_err());
+    // p's decisions are clean: p serves, the refusal does not leak across projects.
+    let got = store.get_project_decisions_for_graph(pid).await.unwrap();
+    assert_eq!(
+        got.iter().map(|(d, _)| d.id).collect::<Vec<_>>(),
+        vec![dp.id]
+    );
+}
+
+/// A plan quarantined at open but still attached to the project (its `project_id`) refuses
+/// the PM graph by name: Neo4j serves it, dropping it in silence is a loss.
+#[tokio::test]
+async fn a_quarantined_plan_of_the_project_refuses_the_pm_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, plid) = (p.id, Uuid::new_v4());
+    with_engine(&base, move |db| {
+        let n = db.create_node(&["Plan"]);
+        db.set_node_property(n, "id", Value::from(plid.to_string()));
+        db.set_node_property(n, "project_id", Value::from(pid.to_string()));
+        // No title/description/status/created_by/priority/created_at: quarantined.
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    let e = store.get_pm_graph_data(pid, 10).await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<NonPorte>(),
+        Some(&NonPorte("AnalyticsStore::get_pm_graph_data")),
+        "{e:#}"
+    );
+}
+
+/// A milestone quarantined at open but still attached to the project refuses the PM graph.
+#[tokio::test]
+async fn a_quarantined_milestone_of_the_project_refuses_the_pm_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, mid) = (p.id, Uuid::new_v4());
+    with_engine(&base, move |db| {
+        let n = db.create_node(&["Milestone"]);
+        db.set_node_property(n, "id", Value::from(mid.to_string()));
+        db.set_node_property(n, "project_id", Value::from(pid.to_string()));
+        // No title: quarantined.
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    let e = store.get_pm_graph_data(pid, 10).await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<NonPorte>(),
+        Some(&NonPorte("AnalyticsStore::get_pm_graph_data")),
+        "{e:#}"
+    );
+}
+
+/// A release quarantined at open but still attached to the project refuses the PM graph.
+#[tokio::test]
+async fn a_quarantined_release_of_the_project_refuses_the_pm_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, rid) = (p.id, Uuid::new_v4());
+    with_engine(&base, move |db| {
+        let n = db.create_node(&["Release"]);
+        db.set_node_property(n, "id", Value::from(rid.to_string()));
+        db.set_node_property(n, "project_id", Value::from(pid.to_string()));
+        // No version: quarantined.
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    let e = store.get_pm_graph_data(pid, 10).await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<NonPorte>(),
+        Some(&NonPorte("AnalyticsStore::get_pm_graph_data")),
+        "{e:#}"
+    );
+}
+
+/// A constraint quarantined at open but still hung from a plan that reaches the project by
+/// `BELONGS_TO_PROJECT` refuses the constraints view by name (Neo4j serves it).
+#[tokio::test]
+async fn a_quarantined_constraint_of_the_plan_refuses_the_constraints_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    let plan = a_plan(Some(p.id), 1, "plan");
+    store.create_plan(&plan).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+    let (pid, plid, cid) = (p.id, plan.id, Uuid::new_v4());
+    with_engine(&base, move |db| {
+        let (a, b) = (node_of(db, "Plan", plid), node_of(db, "Project", pid));
+        db.create_edge(a, b, "BELONGS_TO_PROJECT");
+        let c = db.create_node(&["Constraint"]);
+        db.set_node_property(c, "id", Value::from(cid.to_string()));
+        db.create_edge(a, c, "CONSTRAINED_BY");
+        // No constraint_type/description: quarantined.
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+    let e = store.get_project_constraints(pid).await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<NonPorte>(),
+        Some(&NonPorte("AnalyticsStore::get_project_constraints")),
+        "{e:#}"
+    );
+}
+
+/// A `last_synced` that is PRESENT but unreadable is still PRESENT: `project_synced`
+/// answers `true` (Neo4j's `p.last_synced IS NOT NULL`), not `false`.
+#[tokio::test]
+async fn project_synced_is_true_when_last_synced_is_present_but_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let p = a_project();
+    let store = open(&base).await;
+    store.create_project(&p).await.unwrap();
+    assert_eq!(store.project_synced(p.id).await.unwrap(), Some(false));
+    store.close().await.unwrap();
+    drop(store);
+    let pid = p.id;
+    with_engine(&base, move |db| {
+        let n = node_of(db, "Project", pid);
+        db.set_node_property(n, "last_synced", Value::from("not-a-date"));
+    })
+    .await;
+    let store = open(&base).await;
+    assert_eq!(store.project_synced(pid).await.unwrap(), Some(true));
+}

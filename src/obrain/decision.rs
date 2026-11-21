@@ -289,6 +289,34 @@ pub(super) struct IndexDecisions {
     /// Ids of nodes that are on disk but could not be read at open (quarantined):
     /// reserved, so a later creation refuses rather than overwrites what is there.
     reserves: HashSet<Uuid>,
+    /// The quarantined decisions of each project (the project of the incoming
+    /// `HAS_DECISION` edge), with their reason. `vue_decisions` refuses by name
+    /// rather than drop them in silence: Neo4j serves every decision it reaches.
+    quarantaine_par_projet: HashMap<Uuid, Vec<String>>,
+}
+
+/// The project a decision node is attached to by an incoming `HAS_DECISION`
+/// edge whose source is a project this backend addresses.
+fn projet_du_noeud(db: &ObrainDB, projets: &project::IndexProjets, noeud: NodeId) -> Option<Uuid> {
+    let mut projet: Option<Uuid> = None;
+    for (source, arete) in db.store().edges_from(noeud, Direction::Incoming) {
+        let Some(e) = db.get_edge(arete) else {
+            continue;
+        };
+        if &*e.edge_type != APPARTIENT {
+            continue;
+        }
+        let pid = db.get_node(source).and_then(|n| {
+            n.get_property("id")
+                .and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
+        });
+        // The project of that id must be THIS node: a duplicate quarantined at
+        // open carries the id of the held project, and is not it.
+        if let Some(pid) = pid.filter(|p| projets.noeud_de(*p) == Some(source)) {
+            projet = Some(projet.map_or(pid, |existant| existant.min(pid)));
+        }
+    }
+    projet
 }
 
 impl IndexDecisions {
@@ -322,9 +350,10 @@ impl IndexDecisions {
         v
     }
 
-    /// The node of every decision held.
-    pub(super) fn noeuds(&self) -> Vec<NodeId> {
-        self.par_id.values().map(|e| e.noeud).collect()
+    /// The quarantined decisions attached to `projet`, with their reasons:
+    /// `vue_decisions` refuses by name when this is non-empty.
+    pub(super) fn quarantaine_du_projet(&self, projet: Uuid) -> Option<&Vec<String>> {
+        self.quarantaine_par_projet.get(&projet)
     }
 
     pub(super) fn reconstruire(
@@ -335,11 +364,12 @@ impl IndexDecisions {
         let store = db.store();
         let mut index = Self::default();
         let mut vus: Vec<(NodeId, Uuid)> = Vec::new();
+        let mut en_quarantaine: Vec<(NodeId, String)> = Vec::new();
         for noeud in store.nodes_by_label(LABEL) {
             let Some(n) = db.get_node(noeud) else {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud Decision {noeud:?} : illisible"));
+                let raison = format!("nœud Decision {noeud:?} : illisible");
+                rapport.en_quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             };
             let get = |cle: &str| {
@@ -367,9 +397,9 @@ impl IndexDecisions {
                     {
                         index.reserves.insert(id);
                     }
-                    rapport
-                        .en_quarantaine
-                        .push(format!("nœud Decision {noeud:?} : {e}"));
+                    let raison = format!("nœud Decision {noeud:?} : {e}");
+                    rapport.en_quarantaine.push(raison.clone());
+                    en_quarantaine.push((noeud, raison));
                     continue;
                 }
             };
@@ -378,10 +408,9 @@ impl IndexDecisions {
                 // id stays reserved even once the first is deleted, so a later
                 // creation never lands next to the node left in quarantine.
                 index.reserves.insert(decision.id);
-                rapport.en_quarantaine.push(format!(
-                    "nœud Decision {noeud:?} : id {} déjà pris",
-                    decision.id
-                ));
+                let raison = format!("nœud Decision {noeud:?} : id {} déjà pris", decision.id);
+                rapport.en_quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             }
             let id = decision.id;
@@ -399,29 +428,23 @@ impl IndexDecisions {
         // project: it cannot be verified. A DIVERGENCE, named in the module doc:
         // Neo4j has no quarantine and would return that project's id.
         for (noeud, id) in &vus {
-            let mut projet: Option<Uuid> = None;
-            for (source, arete) in store.edges_from(*noeud, Direction::Incoming) {
-                let Some(e) = db.get_edge(arete) else {
-                    continue;
-                };
-                if &*e.edge_type != APPARTIENT {
-                    continue;
-                }
-                let pid = db.get_node(source).and_then(|n| {
-                    n.get_property("id")
-                        .and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
-                });
-                // The project of that id must be THIS node: a duplicate quarantined at
-                // open carries the id of the held project, and is not it.
-                if let Some(pid) = pid.filter(|p| projets.noeud_de(*p) == Some(source)) {
-                    projet = Some(projet.map_or(pid, |existant| existant.min(pid)));
-                }
-            }
-            if let Some(p) = projet {
+            if let Some(p) = projet_du_noeud(db, projets, *noeud) {
                 if let Some(mut e) = index.desinscrire(*id) {
                     e.projet = Some(p);
                     index.inscrire(e);
                 }
+            }
+        }
+        // A quarantined decision keeps its `HAS_DECISION` edge on disk: record it
+        // under that project, so `vue_decisions` refuses by name instead of
+        // silently dropping a decision Neo4j would serve.
+        for (noeud, raison) in en_quarantaine {
+            if let Some(p) = projet_du_noeud(db, projets, noeud) {
+                index
+                    .quarantaine_par_projet
+                    .entry(p)
+                    .or_default()
+                    .push(raison);
             }
         }
         Ok(index)

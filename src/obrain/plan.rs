@@ -262,6 +262,32 @@ pub(super) struct IndexPlans {
     /// creation with one of them is refused (Neo4j's uniqueness constraint on
     /// `Plan.id`), as `note.rs` and `chat.rs` do.
     reserves: std::collections::HashSet<Uuid>,
+    /// The quarantined plans of each project (its `project_id` or a `HAS_PLAN`
+    /// edge), with their reason. `vue_pm` refuses by name rather than drop them
+    /// in silence.
+    quarantaine_par_projet: HashMap<Uuid, Vec<String>>,
+}
+
+/// The projects a quarantined plan still belongs to: its raw `project_id` and
+/// its `HAS_PLAN` edges (the same membership a decoded plan has,
+/// [`Entree::appartient_a`]).
+fn projets_du_plan_quarantaine(
+    db: &ObrainDB,
+    projets: &IndexProjets,
+    noeud: NodeId,
+) -> BTreeSet<Uuid> {
+    let mut appartenances = constraint::projets_lies(db, noeud, projets);
+    if let Some(pid) = db
+        .get_node(noeud)
+        .and_then(|n| {
+            n.get_property("project_id")
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+        .and_then(|s| (!s.is_empty()).then(|| s.parse::<Uuid>().ok()).flatten())
+    {
+        appartenances.insert(pid);
+    }
+    appartenances
 }
 
 impl IndexPlans {
@@ -269,6 +295,12 @@ impl IndexPlans {
     /// to link a commit to a plan, or to list a plan's commits).
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)
+    }
+
+    /// The quarantined plans of a project, with their reasons: `vue_pm` refuses
+    /// by name when this is non-empty.
+    pub(super) fn quarantaine_du_projet(&self, projet: Uuid) -> Option<&Vec<String>> {
+        self.quarantaine_par_projet.get(&projet)
     }
 
     /// Rebuilds the index. Returns it with the number of drafts deleted and the
@@ -282,9 +314,12 @@ impl IndexPlans {
         let mut index = Self::default();
         let mut brouillons = 0;
         let mut quarantaine = Vec::new();
+        let mut en_quarantaine: Vec<(NodeId, String)> = Vec::new();
         for noeud in store.nodes_by_label(LABEL) {
             let Some(n) = db.get_node(noeud) else {
-                quarantaine.push(format!("nœud Plan {noeud:?} : illisible"));
+                let raison = format!("nœud Plan {noeud:?} : illisible");
+                quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             };
             let get = |cle: &str| {
@@ -302,7 +337,9 @@ impl IndexPlans {
             let (plan, statut) = match lire_plan(&get) {
                 Ok(lu) => lu,
                 Err(e) => {
-                    quarantaine.push(format!("nœud Plan {noeud:?} : {e}"));
+                    let raison = format!("nœud Plan {noeud:?} : {e}");
+                    quarantaine.push(raison.clone());
+                    en_quarantaine.push((noeud, raison));
                     if let Some(id) = get("id")
                         .and_then(|v| v.as_str().map(str::to_string))
                         .and_then(|s| s.parse::<Uuid>().ok())
@@ -313,7 +350,9 @@ impl IndexPlans {
                 }
             };
             if index.par_id.contains_key(&plan.id) {
-                quarantaine.push(format!("nœud Plan {noeud:?} : id {} déjà pris", plan.id));
+                let raison = format!("nœud Plan {noeud:?} : id {} déjà pris", plan.id);
+                quarantaine.push(raison.clone());
+                en_quarantaine.push((noeud, raison));
                 continue;
             }
             let lies = constraint::projets_lies(db, noeud, projets);
@@ -326,6 +365,18 @@ impl IndexPlans {
                     lies,
                 },
             );
+        }
+        // A quarantined plan keeps its membership on disk (`project_id` or a
+        // `HAS_PLAN` edge): record it under each project, so `vue_pm` refuses by
+        // name instead of silently dropping a plan Neo4j would serve.
+        for (noeud, raison) in en_quarantaine {
+            for p in projets_du_plan_quarantaine(db, projets, noeud) {
+                index
+                    .quarantaine_par_projet
+                    .entry(p)
+                    .or_default()
+                    .push(raison.clone());
+            }
         }
         Ok((index, brouillons, quarantaine))
     }

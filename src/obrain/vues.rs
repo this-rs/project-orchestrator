@@ -7,23 +7,28 @@
 //! REFUSES, by name, the one shape of base (a migrated one) where it could not be exact.
 //! None answers an empty value in place of a refusal.
 //!
-//! - **`get_project_decisions_for_graph`**: the decisions attached to the project
-//!   (`HAS_DECISION`), each with its `AFFECTS` relations. `AFFECTS` is refused on this
-//!   backend (`DecisionStore::add_decision_affects`, its targets are code entities), so
+//! - **`get_project_decisions_for_graph`**: the decisions attached DIRECTLY to the
+//!   project (`HAS_DECISION`), each with its `AFFECTS` relations. `AFFECTS` is refused on
+//!   this backend (`DecisionStore::add_decision_affects`, its targets are code entities), so
 //!   no decision this backend wrote has one: the relations are an exact empty list. A
-//!   decision of THIS project that carries an `AFFECTS` edge (migrated), or ANY decision
-//!   carrying an `INFORMED_BY` edge (the task chain of the reference's path, which this
-//!   backend does not resolve to a project), refuses the call. Order: `(decided_at, id)`
-//!   (Neo4j states none). As the reference, `embedding`, `embedding_model` and
-//!   `scar_intensity` are not returned; `chosen_option` is `None` for none (the reference
-//!   returns `Some("")`, an artefact of its column read, and `get_decision` returns `None`).
+//!   decision of THIS project that carries an `AFFECTS` edge, or an `INFORMED_BY` edge (the
+//!   task chain of the reference's path, which this backend does not resolve to a project),
+//!   refuses the call; a decision of ANOTHER project carrying either does not (the reference
+//!   filters by project). A decision this backend quarantined at open, that a `HAS_DECISION`
+//!   edge still attaches to the project, refuses by name: Neo4j serves it, dropping it in
+//!   silence would be a loss. Order: `(decided_at, id)` (Neo4j states none). As the
+//!   reference, `embedding`, `embedding_model` and `scar_intensity` are not returned;
+//!   `chosen_option` is `None` for none (the reference returns `Some("")`, an artefact of
+//!   its column read, and `get_decision` returns `None`).
 //! - **`get_project_constraints`**: the constraints of the plans that reach the project by
 //!   the edge `(:Plan)-[:BELONGS_TO_PROJECT]->(:Project)`, which is what the reference
 //!   matches. NO writer of this repository draws that edge (a plan reaches its project by
 //!   `HAS_PLAN`, `plan.rs`), so on a base written here the answer is empty, as it is on
 //!   Neo4j today; the port reproduces the reference, it does not correct it. Whether the
 //!   reference meant `HAS_PLAN` is a question for its owner. A plan that carries that edge
-//!   and that this backend quarantined refuses. Order: `(constraint id, plan id)`.
+//!   and that this backend quarantined refuses, as does a constraint quarantined at open
+//!   and still hung from such a plan (Neo4j serves it; dropping it in silence would be a
+//!   loss). Order: `(constraint id, plan id)`.
 //! - **`get_chat_graph_data`**: the sessions that have a `DISCUSSED` relation. `DISCUSSED`
 //!   is refused on this backend (`ChatStore::add_discussed`: its targets are code, plan and
 //!   task entities) and so is the `HAS_CHAT_SESSION` edge that scopes it, so no session
@@ -41,7 +46,8 @@
 //!   on a base written here, as on Neo4j, and the call REFUSES if such an edge from a
 //!   `Commit` exists (migrated); so do the `TOUCHES` edges they would carry to a `File`
 //!   (no `File` is written, `code.rs`). A plan with a part the task index could not read
-//!   refuses. Each branch has its own `LIMIT` as the reference, and no order but the plans'
+//!   refuses; so does a plan, a milestone or a release quarantined at open and still
+//!   attached to the project (Neo4j serves them, dropping them in silence would be a loss). Each branch has its own `LIMIT` as the reference, and no order but the plans'
 //!   (`priority DESC, id DESC`): the others are served in id order, the edges sorted by
 //!   `(type, source, target)`. A date (`target_date`) is decoded by the single decoder and
 //!   written RFC 3339 (the reference reads a string that a `datetime` does not give).
@@ -105,19 +111,29 @@ impl ObrainGraphStore {
     ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
         const M: &str = "AnalyticsStore::get_project_decisions_for_graph";
         self.lire(move |db, etat| {
-            for noeud in etat.decisions.noeuds() {
-                if !aretes_de_type(db, noeud, Direction::Incoming, "INFORMED_BY").is_empty() {
+            if let Some(raisons) = etat.decisions.quarantaine_du_projet(project_id) {
+                return refus_contextuel(
+                    M,
+                    format!(
+                        "décision(s) de ce projet en quarantaine (non lue à l'ouverture) : {}",
+                        raisons.join("; ")
+                    ),
+                );
+            }
+            let decisions = etat.decisions.du_projet(project_id);
+            for (d, noeud) in &decisions {
+                if !aretes_de_type(db, *noeud, Direction::Incoming, "INFORMED_BY").is_empty() {
                     return refus_contextuel(
                         M,
-                        "une décision porte une arête INFORMED_BY (chaîne par les tâches du \
-                         chemin de la référence) : son projet n'est pas résolu par ce backend"
-                            .to_string(),
+                        format!(
+                            "la décision {} porte une arête INFORMED_BY (chaîne par les \
+                             tâches du chemin de la référence) : son projet n'est pas résolu \
+                             par ce backend",
+                            d.id
+                        ),
                     );
                 }
-            }
-            let mut sortie = Vec::new();
-            for (mut d, noeud) in etat.decisions.du_projet(project_id) {
-                if !aretes_de_type(db, noeud, Direction::Outgoing, "AFFECTS").is_empty() {
+                if !aretes_de_type(db, *noeud, Direction::Outgoing, "AFFECTS").is_empty() {
                     return refus_contextuel(
                         M,
                         format!(
@@ -127,6 +143,9 @@ impl ObrainGraphStore {
                         ),
                     );
                 }
+            }
+            let mut sortie = Vec::new();
+            for (mut d, _) in decisions {
                 // The columns the reference does not return.
                 d.embedding = None;
                 d.embedding_model = None;
@@ -138,6 +157,7 @@ impl ObrainGraphStore {
     }
 
     pub(super) fn vue_contraintes(&self, project_id: Uuid) -> Result<Vec<(ConstraintNode, Uuid)>> {
+        const M: &str = "AnalyticsStore::get_project_constraints";
         self.lire(move |db, etat| {
             let Some(projet) = etat.projets.noeud_de(project_id) else {
                 if projet_en_quarantaine(db, project_id) {
@@ -174,6 +194,16 @@ impl ObrainGraphStore {
                              pas être lues"
                         )
                     })?;
+                if let Some(raisons) = etat.contraintes.quarantaine_du_plan(plan) {
+                    return refus_contextuel(
+                        M,
+                        format!(
+                            "contrainte(s) de ce plan en quarantaine (non lue à \
+                             l'ouverture) : {}",
+                            raisons.join("; ")
+                        ),
+                    );
+                }
                 for c in etat.contraintes.du_plan(plan) {
                     sortie.push((c, plan));
                 }
@@ -302,6 +332,25 @@ impl ObrainGraphStore {
                     );
                 }
                 return Ok((Vec::new(), Vec::new()));
+            }
+            if let Some(raisons) = etat.plans.quarantaine_du_projet(project_id) {
+                return refus_contextuel(
+                    M,
+                    format!(
+                        "plan(s) de ce projet en quarantaine (non lu à l'ouverture) : {}",
+                        raisons.join("; ")
+                    ),
+                );
+            }
+            if let Some(raisons) = etat.releases.quarantaine_du_projet(project_id) {
+                return refus_contextuel(
+                    M,
+                    format!(
+                        "jalon(s)/version(s) de ce projet en quarantaine (non lu à \
+                         l'ouverture) : {}",
+                        raisons.join("; ")
+                    ),
+                );
             }
             let mut plans: Vec<(&super::plan::Entree, i64)> = Vec::new();
             for e in etat

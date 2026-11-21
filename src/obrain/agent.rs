@@ -696,8 +696,15 @@ impl ObrainGraphStore {
 
     pub(super) fn projet_synchronise(&self, project_id: Uuid) -> Result<Option<bool>> {
         self.lire(move |db, etat| {
-            if let Some(p) = etat.projets.projet(project_id) {
-                return Ok(Some(p.last_synced.is_some()));
+            if let Some(noeud) = etat.projets.noeud_de(project_id) {
+                // The raw presence, as Neo4j's `p.last_synced IS NOT NULL` reads
+                // it: a PRESENT-but-unreadable date is PRESENT (a `warn` at open,
+                // not an absence), so `project_synced` answers `true`.
+                let brute = db
+                    .get_node(noeud)
+                    .and_then(|n| n.get_property("last_synced").cloned())
+                    .is_some_and(|v| !matches!(v, Value::Null));
+                return Ok(Some(brute));
             }
             if super::vues::projet_en_quarantaine(db, project_id) {
                 bail!(
