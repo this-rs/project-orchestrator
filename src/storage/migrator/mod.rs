@@ -242,8 +242,11 @@ fn read_ranges<T: Send + 'static>(
         // KNOWN LIMIT: the `JoinHandle` is dropped, not awaited. A panic inside a
         // reader (e.g. a panicking `BoltTime` conversion in `conv.rs`) closes
         // that reader early and TRUNCATES the read silently — the channel just
-        // delivers fewer results. The fingerprint and the per-type counts still
-        // catch a truncated copy, but the panic itself is never named.
+        // delivers fewer results. The fingerprint does NOT catch this: it is
+        // computed from the same rows that were read, so both sides agree on the
+        // truncated set. Only the per-type count check (`source_counts` against
+        // `target_counts` in `copy_and_verify`) catches it. The panic itself is
+        // never named.
         tokio::spawn(async move {
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);

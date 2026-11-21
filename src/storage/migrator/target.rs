@@ -577,14 +577,8 @@ mod tests {
         let why = before.first_difference(&after).unwrap();
         assert!(why.contains("fingerprint"), "{why}");
     }
-
-    #[test]
-    fn the_copy_does_not_mark_the_base_po_before_verification() {
-        let d = dir();
-        let dest = d.path().join("base");
-        write(&dest);
-        // `finish` checkpoints and closes but does NOT write the marker: it goes
-        // in after the read-back and the fingerprint comparison (see `copy`).
-        assert!(!dest.join(crate::obrain::MARQUEUR_PO).exists());
-    }
 }
+// NOTE: no test covers the order "marker written only after verification".
+// A test that calls `write()` / `finish` directly proves nothing about `copy`,
+// which is the only place that orders the steps. Covering it needs a real
+// source, so it is tracked as a follow-up rather than faked here.

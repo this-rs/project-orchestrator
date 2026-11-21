@@ -777,7 +777,7 @@ jobs:
       # (not replaced by `Utc::now()`), and the two suites are the same kind of
       # guard — a portage behaviour nothing else asserts.
       - name: Run the task-and-step and date portage tests
-        run: cargo test --features obrain-backend --test obrain_taches --test obrain_dates
+        run: cargo test --features obrain-backend --lib storage::migrator --test obrain_taches --test obrain_dates
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
