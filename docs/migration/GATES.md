@@ -14,20 +14,36 @@ Référence de la cible : `CONSOLIDATION.md` (règles, barre de performance, por
 ## ⚠ Ce qui rend une porte bloquante
 
 Une étape CI rouge n'empêche une fusion que si le check est **requis** sur la branche
-cible. Mesuré le 20/11/2026 par l'API GitHub : `consolidation/obrain-default` **n'est
-pas protégée** (aucune règle de branche, aucun ruleset visible). Sur cette branche, les
-portes ci-dessous signalent mais **ne bloquent pas** : une PR rouge reste fusionnable.
-Pour qu'elles bloquent, il faut rendre « Lint & Format », « Unit Tests », « Integration
-Tests » et « Obrain backend » requis sur cette branche (réglage d'administration du
-dépôt). Tant que ce n'est pas fait, le blocage repose sur la règle du portillon :
-aucune fusion avec un check rouge.
+cible. Mesuré le 20/11/2026 par l'API GitHub : `consolidation/obrain-default` n'était
+protégée par **rien** (`Branch not protected`, HTTP 404) — les portes ci-dessous
+signalaient sans bloquer.
+
+**C'est réglé depuis le 21/11/2026** (API, relu et non recopié) :
+
+- checks requis : `Lint & Format`, `Unit Tests`, `Integration Tests`, `Obrain backend` ;
+- `strict: false` — la branche n'a pas à être à jour, mais les checks doivent être verts
+  **sur le SHA de tête de la PR** ;
+- `enforce_admins: true` — le blocage s'applique aussi à l'orchestrateur, qui est la seule
+  identité qui fusionne : sans ce réglage, la protection ne gênerait personne ;
+- pull request obligatoire, mais **zéro approbation exigée** (`required_approving_review_count: 0`, pas de code owners) : la PR est le passage obligé, pas une revue ; force-push et suppression de branche interdits.
+
+Effet vérifié le jour même : une PR dont un de ces quatre checks n'a pas conclu passe en
+`mergeStateStatus: BLOCKED`, et une PR verte sur son SHA de tête passe `CLEAN`.
+
+Ce que ça **ne** couvre pas, et qu'il faut savoir :
+- un job **instable** (le test `kill9` de `Obrain backend`) bloque une PR saine : on
+  relance le job, **jamais** on ne lève la protection ;
+- `strict: false` veut dire que la combinaison « tête de PR + nouvelle base » n'est pas
+  testée par GitHub : c'est à l'orchestrateur de rebaser et de relancer avant de fusionner ;
+- un changement qui réécrit `xtask/` ou le cliquet reste couvert par la relecture, pas
+  par la protection : une PR peut modifier la porte elle-même et rester verte.
 
 ## Vue d'ensemble
 
 | # | Porte | Ce qu'elle prouve | Où elle tourne | État réel (20/11/2026) |
 |---|---|---|---|---|
 | G1 | containment | la branche contient `origin/main` | CI, Lint & Format | vert sur la consolidation après la descente #1253 |
-| G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie (#1250 : sous-lot A1, 25 méthodes servies ; sous-lot A2 : 23 de plus, soit 48 servies, 96 refusées par nom) ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
+| G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain : élargie dans cette PR** de `obrain_project::` (10 tests) aux 18 modules `obrain_` (86 tests). **Trou** : les 28 contrôles transverses (`all_checks!`) ne tournent que sur Neo4j et le mock |
 | G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
