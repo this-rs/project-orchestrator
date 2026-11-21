@@ -48,6 +48,19 @@
 //!   could carry them, and the count a `MERGE` would then answer is not reproduced.
 //!   The same for a doubled `FORGOTTEN` edge on a pair that `reinforce_synapses`
 //!   revives. The reads answer what is there.
+//! - **A `source` that is not a string, and a `path` that is not a string, refuse.**
+//!   `reinforce_synapses` / `coactivate_session` would otherwise read the `source` as
+//!   absent and rewrite it `coactivation`; `get_project_note_entity_links` would otherwise
+//!   answer the id in place of an unreadable `path`. Both are refused by name, before any
+//!   write.
+//! - **A coactivation's provenance is bounded** (`rule`, `measure`, `at`: 4096 bytes each):
+//!   `AccountableProvenance` bounds nothing, and the edge is created in one small record.
+//! - **An unreadable chat session blocks `update_energy_scores`, as a CHOICE.** The dormant
+//!   projects (energy frozen) are computed from the last chat activity of each project; a
+//!   session that cannot be read could belong to any project and make it look dormant, so
+//!   it would be frozen without a word. The whole pass refuses until the session is fixed,
+//!   rather than guess a project for it. A decay pass is a maintenance that can wait; a
+//!   silently frozen project cannot be told from a healthy one.
 //! - **Non-finite numbers refuse** (`boost`, `increment`, `half_life`, a weight):
 //!   Neo4j would store them. `update_energy_scores` refuses a `half_life` that is not
 //!   strictly positive.
@@ -94,6 +107,8 @@ use crate::notes::{Note, PROJECT_DORMANT_AFTER_DAYS};
 
 const SYNAPSE: &str = "SYNAPSE";
 const OUBLIE: &str = "FORGOTTEN";
+/// The longest `rule`, `measure` or `at` of a coactivation's provenance, in bytes.
+const BORNE_PROVENANCE: usize = 4096;
 /// What a revived archived edge never starts under: `DecayPolicy::default().forget_threshold`.
 const PLANCHER_REVIVAL: f64 = 0.02;
 /// The property of a `Project` node that holds when its deep maintenance last ran.
@@ -852,6 +867,17 @@ impl ObrainGraphStore {
     ) -> Result<usize> {
         if notes.len() < 2 {
             return Ok(0);
+        }
+        // `AccountableProvenance` proves the three are non-empty and bounds nothing; they are
+        // written in the one record that creates an edge, which must stay small.
+        for (nom, v) in [("rule", &regle), ("measure", &mesure), ("at", &date)] {
+            if v.len() > BORNE_PROVENANCE {
+                bail!(
+                    "coactivate_session : `{nom}` de la provenance fait {} octets, au plus \
+                     {BORNE_PROVENANCE} sont admis (la provenance est une courte déclaration)",
+                    v.len()
+                );
+            }
         }
         let notes = notes.to_vec();
         self.ecrire(

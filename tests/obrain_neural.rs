@@ -1883,12 +1883,14 @@ async fn an_unreadable_edge_refuses_a_reinforcement_without_breaking_the_store()
         p = projet_actif(&store).await;
         let n = des_notes(&store, Some(p.id), 3).await;
         (a, b, c) = (n[0].id, n[1].id, n[2].id);
-        store.create_synapses(a, &[(b, 0.5)]).await.unwrap();
+        // The faulty edge is on the LAST pair (b, c): the pairs (a, b) and (a, c) come first
+        // and must not be written either.
+        store.create_synapses(b, &[(c, 0.5)]).await.unwrap();
         store.close().await.unwrap();
     }
     base_brute(&base, move |db| {
-        let na = futures_noeud(db, a);
-        let (_, e) = db.store().edges_from(na, Direction::Outgoing)[0];
+        let nb = futures_noeud(db, b);
+        let (_, e) = db.store().edges_from(nb, Direction::Outgoing)[0];
         db.remove_edge_property(e, "weight");
     })
     .await;
@@ -1897,29 +1899,30 @@ async fn an_unreadable_edge_refuses_a_reinforcement_without_breaking_the_store()
     for e in [
         store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap_err(),
         store
-            .coactivate_session(p.id, &[a, b], Uuid::new_v4(), &prov)
+            .coactivate_session(p.id, &[a, b, c], Uuid::new_v4(), &prov)
             .await
             .unwrap_err(),
     ] {
         assert!(format!("{e:#}").contains("weight"), "{e:#}");
         assert!(!format!("{e:#}").contains("indéterminé"), "{e:#}");
     }
-    // Not indeterminate: another call still works, and the pair with `c` was not written.
+    // Not indeterminate: another call still works, and the earlier pairs were not written.
     store.boost_energy(c, 0.1).await.unwrap();
-    assert!(store.get_synapses(c).await.unwrap().is_empty());
+    assert!(store.get_synapses(a).await.unwrap().is_empty());
     store.close().await.unwrap();
 
-    // `source` that is not a string.
+    // `source` that is not a string, again on the last pair.
     base_brute(&base, move |db| {
-        let na = futures_noeud(db, a);
-        let (_, e) = db.store().edges_from(na, Direction::Outgoing)[0];
+        let nb = futures_noeud(db, b);
+        let (_, e) = db.store().edges_from(nb, Direction::Outgoing)[0];
         db.set_edge_property(e, "weight", Value::from(0.5_f64));
         db.set_edge_property(e, "source", Value::from(5_i64));
     })
     .await;
     let store = open(&base).await;
-    let e = store.reinforce_synapses(&[a, b], 0.1).await.unwrap_err();
+    let e = store.reinforce_synapses(&[a, b, c], 0.1).await.unwrap_err();
     assert!(format!("{e:#}").contains("source"), "{e:#}");
+    assert!(store.get_synapses(a).await.unwrap().is_empty());
     store.boost_energy(c, 0.1).await.unwrap();
 }
 
@@ -2003,4 +2006,137 @@ fn id_brut_sync(
             }) == Some(id.to_string())
         })
         .unwrap()
+}
+
+/// `coactivate_session` cut at every engine write on edges that already exist: the weight is
+/// written last, so an edge whose weight is the new one carries the new session, count and
+/// provenance; an edge with the old weight carries a prefix of them.
+#[tokio::test]
+async fn a_coactivation_cut_at_every_write_leaves_a_readable_prefix() {
+    let (s1, s2) = (Uuid::new_v4(), Uuid::new_v4());
+    for k in 1..=24 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = projet_actif(&store).await;
+        let n = des_notes(&store, Some(p.id), 2).await;
+        let ids = [n[0].id, n[1].id];
+        let prov1 = AccountableProvenance::new("regle-1", "mesure-1").unwrap();
+        let prov2 = AccountableProvenance::new("regle-2", "mesure-2").unwrap();
+        store
+            .coactivate_session(p.id, &ids, s1, &prov1)
+            .await
+            .unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .coactivate_session(p.id, &ids, s2, &prov2)
+            .await
+            .is_ok()
+        {
+            assert!(k > 14, "la coupure n'a atteint que {} points", k - 1);
+            return;
+        }
+        drop(store);
+        let brutes = base_brute(&base, |db| aretes_brutes(db, "SYNAPSE")).await;
+        assert_eq!(brutes.len(), 2, "k={k}");
+        for e in &brutes {
+            if proche(poids(e), 0.7) {
+                assert_eq!(
+                    e.2["last_session"].as_str(),
+                    Some(s2.to_string().as_str()),
+                    "k={k}"
+                );
+                assert_eq!(e.2["rule"].as_str(), Some("regle-2"), "k={k}");
+                assert_eq!(e.2["measure"].as_str(), Some("mesure-2"), "k={k}");
+                assert_eq!(e.2["reinforcement_count"].as_int64(), Some(2), "k={k}");
+            } else {
+                assert!(proche(poids(e), 0.5), "k={k}: {}", poids(e));
+            }
+        }
+        let store = open(&base).await;
+        store
+            .coactivate_session(p.id, &ids, s2, &prov2)
+            .await
+            .unwrap();
+    }
+    panic!("the cut never ran out of writes: raise the bound");
+}
+
+/// The resurrection by `coactivate_session`, cut at every engine write: the archive is deleted
+/// AFTER the live edges exist.
+#[tokio::test]
+async fn a_coactivation_revival_cut_at_every_write_never_loses_the_archive() {
+    let mut fin = None;
+    for k in 1..=8 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (p, a, b);
+        {
+            let store = open(&base).await;
+            p = projet_actif(&store).await;
+            let n = des_notes(&store, Some(p.id), 2).await;
+            (a, b) = (n[0].id, n[1].id);
+            store.close().await.unwrap();
+        }
+        base_brute(&base, move |db| {
+            let (na, nb) = (futures_noeud(db, a), futures_noeud(db, b));
+            db.create_edge_with_props(na, nb, "FORGOTTEN", [("weight", Value::from(0.6_f64))]);
+        })
+        .await;
+        let store = open(&base).await;
+        let prov = AccountableProvenance::new("r", "m").unwrap();
+        store.interrompre_au_prochain(Interruption::AvantEtape(k));
+        if store
+            .coactivate_session(p.id, &[a, b], Uuid::new_v4(), &prov)
+            .await
+            .is_ok()
+        {
+            fin = Some(k);
+            break;
+        }
+        drop(store);
+        let (oubli, vivantes) = base_brute(&base, |db| {
+            (
+                aretes_brutes(db, "FORGOTTEN").len(),
+                aretes_brutes(db, "SYNAPSE").len(),
+            )
+        })
+        .await;
+        assert!(
+            oubli >= 1 || vivantes == 2,
+            "k={k}: the archive is gone and the live edges are not there ({oubli}, {vivantes})"
+        );
+    }
+    assert_eq!(
+        fin,
+        Some(4),
+        "three engine writes (two creations, one deletion)"
+    );
+}
+
+/// The provenance of a coactivation is a short statement: a rule, a measure or a date over
+/// 4096 bytes is refused before any write (`AccountableProvenance` bounds nothing, and the
+/// edge is created in one record that must stay small).
+#[tokio::test]
+async fn an_oversized_provenance_is_refused_before_any_write() {
+    let store = ObrainGraphStore::open_temporary().unwrap();
+    let p = projet_actif(&store).await;
+    let n = des_notes(&store, Some(p.id), 2).await;
+    let ids = [n[0].id, n[1].id];
+    let long = "m".repeat(4097);
+    let prov = AccountableProvenance::new("r", long).unwrap();
+    let e = store
+        .coactivate_session(p.id, &ids, Uuid::new_v4(), &prov)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("4096"), "{e:#}");
+    assert!(store.get_synapses(ids[0]).await.unwrap().is_empty());
+    let ok = AccountableProvenance::new("r", "m".repeat(4096)).unwrap();
+    assert_eq!(
+        store
+            .coactivate_session(p.id, &ids, Uuid::new_v4(), &ok)
+            .await
+            .unwrap(),
+        2
+    );
 }
