@@ -208,9 +208,11 @@ fn lire_tombe(get: &dyn Fn(&str) -> Option<Value>) -> Result<SignedTombstone> {
         issuer_did: texte("issuer_did")?,
         signature_hex: texte("signature_hex")?,
         // Neo4j's stated rule (`tombstone_from_stored`): the epoch, never "now",
-        // when the value is ABSENT or unreadable — a tombstone's date must not
-        // become the time of the read.
-        issued_at: super::date_propriete(get, "issued_at")?.unwrap_or(DateTime::UNIX_EPOCH),
+        // when the value is ABSENT or unreadable. FAIL-CLOSED: a revocation must
+        // never be lost to a bad date. The tombstone is kept (the hash stays
+        // revoked), with a warning that names it; the epoch fails every signature
+        // check, so it cannot be mistaken for a genuine date.
+        issued_at: super::date_optionnelle(get, "issued_at", &quoi).unwrap_or(DateTime::UNIX_EPOCH),
         reason: Some(texte("reason")?).filter(|r| !r.is_empty()),
         content_hash: hash,
     })
