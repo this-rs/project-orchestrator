@@ -8,6 +8,8 @@
 use crate::neo4j::traits::*;
 
 pub mod migrate;
+#[cfg(feature = "obrain-backend")]
+pub mod migrator;
 
 use std::sync::Arc;
 
@@ -90,7 +92,17 @@ impl StorageBackend {
     /// This is the single selection point: a new backend is added here, never
     /// in `AppState`.
     pub async fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_with(config, &migrate::NoMigrator).await
+        // With the obrain engine compiled in, the real Neo4j → obrain copy is
+        // wired (`migrator`); without it a migration request fails closed.
+        #[cfg(feature = "obrain-backend")]
+        {
+            let migrator = migrator::Neo4jToObrain::from_config(config);
+            Self::from_config_with(config, &migrator).await
+        }
+        #[cfg(not(feature = "obrain-backend"))]
+        {
+            Self::from_config_with(config, &migrate::NoMigrator).await
+        }
     }
 
     /// [`Self::from_config`] with the data-copy seam injected (the migrator

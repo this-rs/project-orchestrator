@@ -5,3 +5,6 @@
 
 tests/:  # tests d'intégration — les pilotes réels montent et vérifient les adaptateurs (passer par l'adaptateur serait circulaire)
 src/events/nats_broker_test.rs:  # test du broker — un client réel en boucle locale pour prouver l'échange, pas pour contourner l'adaptateur
+src/storage/migrator/conv.rs:  # pont entre les deux moteurs : la copie Neo4j -> obrain lit la source par le pilote Bolt et écrit la cible par le moteur ; exception limitée à ce fichier (feature obrain-backend, démarrage, derrière la garde de bascule)
+src/storage/migrator/mod.rs:  # pont entre les deux moteurs : la copie Neo4j -> obrain lit la source par le pilote Bolt et écrit la cible par le moteur ; exception limitée à ce fichier (feature obrain-backend, démarrage, derrière la garde de bascule)
+src/storage/migrator/target.rs:  # pont entre les deux moteurs : la copie Neo4j -> obrain lit la source par le pilote Bolt et écrit la cible par le moteur ; exception limitée à ce fichier (feature obrain-backend, démarrage, derrière la garde de bascule)

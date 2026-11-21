@@ -508,6 +508,49 @@ pub const MARQUEUR_PO: &str = "po-obrain-base";
 /// changes the shape of a node this backend writes.
 pub const SCHEMA_PO: &str = "schema = 1\n";
 
+/// Flush the directory entry of `dir` (a rename is durable only once its
+/// directory is).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Write the PO base marker ([`MARQUEUR_PO`]) atomically: a temporary file,
+/// fsynced, renamed into place, then the directory fsynced. The migration calls
+/// it only AFTER the copy was read back and verified; a base without a valid
+/// marker is never served (an interrupted copy leaves `substrate.meta` without
+/// the marker, and the direct open refuses it).
+pub fn write_base_marker(dest: &Path) -> Result<()> {
+    use std::io::Write;
+    let tmp = dest.join(format!("{MARQUEUR_PO}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("création du marqueur temporaire dans {}", dest.display()))?;
+        f.write_all(SCHEMA_PO.as_bytes()).with_context(|| {
+            format!("écriture du marqueur {MARQUEUR_PO} dans {}", dest.display())
+        })?;
+        f.sync_all()
+            .with_context(|| format!("synchronisation du marqueur {MARQUEUR_PO}"))?;
+    }
+    std::fs::rename(&tmp, dest.join(MARQUEUR_PO)).with_context(|| {
+        format!(
+            "renommage du marqueur {MARQUEUR_PO} dans {}",
+            dest.display()
+        )
+    })?;
+    sync_dir(dest).with_context(|| format!("synchronisation de {}", dest.display()))?;
+    Ok(())
+}
+
+/// Whether `dest` carries a valid PO base marker: present AND with the expected
+/// content. An empty, truncated or foreign marker is NOT a PO base — a crash
+/// between the rename and the directory sync (or a hand-made file) must not
+/// make PO serve a base it never verified.
+pub fn base_marker_valid(dest: &Path) -> bool {
+    std::fs::read_to_string(dest.join(MARQUEUR_PO))
+        .map(|s| s == SCHEMA_PO)
+        .unwrap_or(false)
+}
+
 /// Whether opening may create the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Creation {
@@ -931,11 +974,11 @@ impl ObrainGraphStore {
             );
         }
         if chemin.join("substrate.meta").is_file() {
-            if !chemin.join(MARQUEUR_PO).is_file() {
+            if !base_marker_valid(chemin) {
                 bail!(
-                    "{} est une base obrain mais pas une base PO : le fichier `{MARQUEUR_PO}` \
-                     manque. Une base d'un autre outil ne s'ouvre pas ici ; une base migrée le \
-                     porte. Rien n'a été touché",
+                    "{} est une base obrain mais pas une base PO : le marqueur `{MARQUEUR_PO}` \
+                     manque ou est invalide. Une base d'un autre outil ne s'ouvre pas ici ; une \
+                     base migrée le porte. Rien n'a été touché",
                     chemin.display()
                 );
             }
@@ -995,12 +1038,7 @@ impl ObrainGraphStore {
         if creer {
             // The base is PO's from its first instant: the marker is written before
             // anything else, and a failure here is an open failure.
-            std::fs::write(chemin.join(MARQUEUR_PO), SCHEMA_PO).with_context(|| {
-                format!(
-                    "écriture du marqueur {MARQUEUR_PO} dans {}",
-                    chemin.display()
-                )
-            })?;
+            write_base_marker(&chemin)?;
         }
         let contexte = || {
             format!(

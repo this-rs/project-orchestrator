@@ -492,6 +492,47 @@ mod with_the_feature {
         assert!(!theirs.join(MARQUEUR_PO).exists());
     }
 
+    /// The marker is READ, not just tested with `is_file()`: a 0-byte marker —
+    /// what a crash between the rename and the directory sync leaves, or a
+    /// hand-made file — must NOT make PO serve a base it never verified. This is
+    /// the direct path (`storage.backend = obrain` without `migration.from`).
+    #[tokio::test]
+    async fn an_empty_marker_is_not_a_po_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        {
+            let base = base.clone();
+            tokio::task::spawn_blocking(move || {
+                let db = obrain_engine::ObrainDB::open(&base).unwrap();
+                db.create_node_with_props(&["Project"], vec![("id", Value::from("x"))]);
+                db.checkpoint().unwrap();
+                db.close().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        assert!(base.join("substrate.meta").is_file());
+        // An interrupted copy: data written, marker absent — refused.
+        let msg = format!(
+            "{:#}",
+            try_open(&base, Creation::Interdite).await.err().unwrap()
+        );
+        assert!(
+            msg.contains(MARQUEUR_PO) && msg.contains("pas une base PO"),
+            "{msg}"
+        );
+        // An empty marker file is still not a PO base: the content is checked.
+        std::fs::write(base.join(MARQUEUR_PO), b"").unwrap();
+        let msg = format!(
+            "{:#}",
+            try_open(&base, Creation::Interdite).await.err().unwrap()
+        );
+        assert!(
+            msg.contains(MARQUEUR_PO) && msg.contains("pas une base PO"),
+            "{msg}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Persistence: close, reopen, same values, same order
     // ------------------------------------------------------------------
