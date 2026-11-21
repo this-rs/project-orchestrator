@@ -619,6 +619,14 @@ struct Interne {
     /// A test hook: the point where the next write stops (`mesure.rs`).
     #[cfg(any(test, feature = "mock-store"))]
     interruption: Mutex<Option<Interruption>>,
+    /// Pause the next durability step after the engine write, before publication.
+    #[cfg(test)]
+    pause_durabilite: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// The directory itself, when the base is a throwaway one
     /// ([`ObrainGraphStore::open_temporary`]). Declared LAST: fields drop in
     /// order, so the base is closed before its directory is removed.
@@ -875,6 +883,12 @@ impl Ecriture<'_> {
     /// readers when the write is a creation; [`ObrainGraphStore::ecrire`] calls
     /// it itself if the closure did not.
     fn rendre_durable(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if let Some((arrivee, reprise)) = self.interne.pause_durabilite.lock().unwrap().take() {
+            let _ = arrivee.send(());
+            // A dropped sender also releases the writer if the test fails.
+            let _ = reprise.recv();
+        }
         self.rendu_durable = true;
         let n = self.interne.ecritures.fetch_add(1, Ordering::Relaxed) + 1;
         let resultat = match self.interne.durabilite {
@@ -1157,6 +1171,8 @@ impl ObrainGraphStore {
                 rapport,
                 #[cfg(any(test, feature = "mock-store"))]
                 interruption: Mutex::new(None),
+                #[cfg(test)]
+                pause_durabilite: Mutex::new(None),
                 _jetable: jetable,
             }),
         };

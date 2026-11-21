@@ -811,15 +811,13 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/dates.log
 
       # Unit tests inside src/obrain are not included by the integration-test
-      # binaries above, nor by the default-feature unit test job. These two
-      # tests depend on wall-clock scheduling; re-enable them after replacing
-      # their timing windows with deterministic synchronization.
+      # binaries above, nor by the default-feature unit test job. The auth test
+      # depends on wall-clock scheduling; re-enable it after stabilizing it.
       - name: Run the obrain library unit tests
         run: |
           set -o pipefail
           cargo test --features obrain-backend --lib obrain:: -- \
             --skip obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou \
-            --skip obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable \
             2>&1 | tee /tmp/obrain-lib.log
           grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/obrain-lib.log
 
