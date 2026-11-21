@@ -304,6 +304,29 @@ impl IndexDecisions {
         self.inscrire(e);
     }
 
+    /// The decisions attached DIRECTLY to a project (`HAS_DECISION`), with their node,
+    /// in `(decided_at, id)` order (a total order: Neo4j states none). For the graph
+    /// read of `agent.rs`.
+    pub(super) fn du_projet(&self, projet: Uuid) -> Vec<(DecisionNode, NodeId)> {
+        let mut v: Vec<(DecisionNode, NodeId)> = self
+            .par_id
+            .values()
+            .filter(|e| e.projet == Some(projet))
+            .map(|e| (e.decision.clone(), e.noeud))
+            .collect();
+        v.sort_by(|a, b| {
+            a.0.decided_at
+                .cmp(&b.0.decided_at)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        v
+    }
+
+    /// The node of every decision held.
+    pub(super) fn noeuds(&self) -> Vec<NodeId> {
+        self.par_id.values().map(|e| e.noeud).collect()
+    }
+
     pub(super) fn reconstruire(
         db: &ObrainDB,
         projets: &project::IndexProjets,

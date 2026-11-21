@@ -147,6 +147,35 @@ pub(super) struct IndexReleases {
     jalons_par_projet: HashMap<Uuid, Vec<Uuid>>,
 }
 
+impl IndexReleases {
+    /// The milestones of a project with their node, in id order (the read of the PM graph,
+    /// `vues.rs`).
+    pub(super) fn jalons_du_projet(&self, projet: Uuid) -> Vec<(Uuid, NodeId)> {
+        let mut v: Vec<(Uuid, NodeId)> = self
+            .jalons_par_projet
+            .get(&projet)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.jalons.get(id).map(|e| (*id, e.noeud)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The releases of a project with their node, in id order.
+    pub(super) fn versions_du_projet(&self, projet: Uuid) -> Vec<(Uuid, NodeId)> {
+        let mut v: Vec<(Uuid, NodeId)> = self
+            .releases_par_projet
+            .get(&projet)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.releases.get(id).map(|e| (*id, e.noeud)))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
 /// Insert an entity under its parent.
 fn publier<T>(
     carte: &mut HashMap<Uuid, Entree<T>>,

@@ -6245,6 +6245,109 @@ pub mod conformance {
         assert!(store.health_check().await.unwrap());
         task_cleanup(store, &p, &plan).await;
     }
+
+    /// What the durable self knows (`KNOWS`): `created` says who drew the edge, the last
+    /// measure wins, the two scales (global, the project asked), the strongest first with
+    /// the instant of `at` then the id breaking a tie, the bound and the total it withheld,
+    /// the release of one rule, and a project's sync state. Same on every backend.
+    pub async fn check_analytics_agent_knowledge(store: &dyn GraphStore) {
+        use project_orchestrator::graph::rules::{KnowledgeScope, Provenance};
+        let prov = |rule: &str, score: Option<f64>, at: &str| {
+            let mut p = Provenance::new(rule, "measure");
+            p.at = at.to_string();
+            p.score = score;
+            p.accountable().unwrap()
+        };
+        let root = store.agent_identity_namespace().await.unwrap();
+        store.ensure_agent(root, None).await.unwrap();
+        let p = a_project("agent-knowledge");
+        store.create_project(&p).await.unwrap();
+        assert_eq!(store.project_synced(p.id).await.unwrap(), Some(false));
+        store.update_project_synced(p.id).await.unwrap();
+        assert_eq!(store.project_synced(p.id).await.unwrap(), Some(true));
+        assert_eq!(store.project_synced(Uuid::new_v4()).await.unwrap(), None);
+
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let n = a_note(None, &format!("agent-knowledge {i}"));
+            store.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let (g, pr) = (KnowledgeScope::Global, KnowledgeScope::Project);
+        let old = "2026-01-01T00:00:00Z";
+        let new = "2026-02-01T00:00:00Z";
+        assert!(store
+            .link_agent_knows(root, ids[0], g, None, &prov("ak-a", Some(0.5), old))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(root, ids[1], g, None, &prov("ak-a", Some(0.5), new))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(root, ids[2], pr, Some(p.id), &prov("ak-b", Some(0.9), old))
+            .await
+            .unwrap());
+        assert!(store
+            .link_agent_knows(
+                root,
+                ids[3],
+                pr,
+                Some(Uuid::new_v4()),
+                &prov("ak-b", Some(0.99), old)
+            )
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .link_agent_knows(root, ids[0], g, None, &prov("ak-a", Some(0.5), old))
+                .await
+                .unwrap(),
+            "a second call is not a creation"
+        );
+        assert!(!store
+            .link_agent_knows(root, Uuid::new_v4(), g, None, &prov("ak-a", None, old))
+            .await
+            .unwrap());
+
+        let k = store.agent_knows(root, None, 10).await.unwrap();
+        assert_eq!((k.notes, k.available), (vec![ids[1], ids[0]], 2));
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[2], ids[1], ids[0]]);
+        let k = store.agent_knows(root, Some(p.id), 1).await.unwrap();
+        assert_eq!(
+            (k.notes.clone(), k.available, k.withheld()),
+            (vec![ids[2]], 3, 2)
+        );
+
+        assert_eq!(
+            store
+                .release_agent_knows(root, "ak-b", &[ids[2]])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .release_agent_knows(root, "ak-b", &[ids[2]])
+                .await
+                .unwrap(),
+            0
+        );
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[2], ids[1], ids[0]]);
+        assert_eq!(
+            store.release_agent_knows(root, "ak-b", &[]).await.unwrap(),
+            1
+        );
+        let k = store.agent_knows(root, Some(p.id), 10).await.unwrap();
+        assert_eq!(k.notes, vec![ids[1], ids[0]]);
+
+        for id in ids {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ======================================================================
@@ -8120,6 +8223,7 @@ macro_rules! analytics_checks {
                 check_analytics_user_profile,
                 check_analytics_routing,
                 check_analytics_frustration_and_step_parent,
+                check_analytics_agent_knowledge,
             ]
         );
     };

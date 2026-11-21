@@ -103,6 +103,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod agent;
 mod analytics;
 mod auth;
 mod chat;
@@ -128,6 +129,7 @@ mod skill;
 mod step;
 mod task;
 mod trigger;
+mod vues;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -575,6 +577,8 @@ struct Etat {
     recherche: search::IndexRecherche,
 
     analyse: analytics::IndexAnalyse,
+
+    agents: agent::IndexAgents,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -1017,6 +1021,7 @@ impl ObrainGraphStore {
 
         let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
         let analyse = analytics::IndexAnalyse::reconstruire(&db, &mut rapport);
+        let agents = agent::IndexAgents::reconstruire(&db, &mut rapport);
         let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
             .with_context(contexte)?;
 
@@ -1058,6 +1063,8 @@ impl ObrainGraphStore {
             recherche,
 
             analyse,
+
+            agents,
         };
         let store = Self {
             interne: Arc::new(Interne {

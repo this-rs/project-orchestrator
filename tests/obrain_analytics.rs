@@ -2,7 +2,7 @@
 //! backend does. Persistence across a close and a reopen, an update cut at every
 //! engine write and reopened (the update marker), a duplicated `WORKS_ON` edge, the
 //! quarantine of an unreadable node (its key reserved), the refusal of an absent
-//! target, and the 119 refusals named. The behaviour shared with Neo4j and the mock
+//! target, and the 104 refusals named. The behaviour shared with Neo4j and the mock
 //! is in `tests/store_conformance.rs` (`analytics_checks!`).
 #![cfg(feature = "obrain-backend")]
 
@@ -695,7 +695,7 @@ async fn reserved_keys_do_not_collide() {
         .is_err());
 }
 
-/// The 119 methods of the other sub-lots refuse by their own name, and none is
+/// The 104 methods of the other sub-lots refuse by their own name, and none is
 /// counted as serving.
 #[tokio::test]
 async fn the_other_sub_lots_refuse_by_name() {
@@ -750,7 +750,7 @@ async fn the_other_sub_lots_refuse_by_name() {
         store.causal_walk("Note", "x", 2),
         "AnalyticsStore::causal_walk"
     );
-    assert_eq!(refusees_analytics().len(), 119);
+    assert_eq!(refusees_analytics().len(), 104);
     assert!(refusees_analytics()
         .iter()
         .all(|m| m.starts_with("AnalyticsStore::")));
@@ -761,8 +761,8 @@ async fn the_other_sub_lots_refuse_by_name() {
         .filter(|m| m.starts_with("AnalyticsStore::"))
         .count();
     assert_eq!(
-        n, 26,
-        "25 methods serve and `run_data_migrations` answers its no-migration"
+        n, 41,
+        "40 methods serve and `run_data_migrations` answers its no-migration"
     );
     // The one that cannot refuse says what it is.
     assert!(store.run_data_migrations().await.is_empty());

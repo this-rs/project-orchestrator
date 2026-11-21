@@ -260,6 +260,20 @@ pub(super) struct IndexContraintes {
 }
 
 impl IndexContraintes {
+    /// The constraints held by a plan (`CONSTRAINED_BY`), in `id` order (a total order:
+    /// `get_plan_constraints` serves node order, Neo4j none). For the graph read of
+    /// `agent.rs`.
+    pub(super) fn du_plan(&self, plan: Uuid) -> Vec<ConstraintNode> {
+        let mut v: Vec<ConstraintNode> = self
+            .par_id
+            .values()
+            .filter(|e| e.plan == Some(plan))
+            .map(|e| e.contrainte.clone())
+            .collect();
+        v.sort_by_key(|c| c.id);
+        v
+    }
+
     /// Rebuilds the index, after the plans: drafts are deleted with their edges,
     /// unreadable nodes quarantined (their id reserved), duplicates quarantined.
     pub(super) fn reconstruire(

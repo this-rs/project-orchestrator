@@ -665,6 +665,33 @@ impl IndexChat {
         v.sort();
         v
     }
+
+    /// The node of the episode whose `id` is `episode` (the episode's own id, not its
+    /// session's), for the `LIVED` edge of `agent.rs`. `None`: no such episode is held.
+    pub(super) fn noeud_d_episode(&self, episode: Uuid) -> Option<NodeId> {
+        self.episodes
+            .values()
+            .find(|e| e.episode.id == episode)
+            .map(|e| e.noeud)
+    }
+
+    /// Every episode held, as `(episode id, node, agent id of its session)`, in id order:
+    /// what `backfill_agents` reads (Neo4j reads the payload of every `SessionEpisode`).
+    pub(super) fn episodes_et_agents(&self) -> Vec<(Uuid, NodeId, Option<Uuid>)> {
+        let mut v: Vec<(Uuid, NodeId, Option<Uuid>)> = self
+            .episodes
+            .values()
+            .map(|e| {
+                (
+                    e.episode.id,
+                    e.noeud,
+                    e.episode.session.as_ref().and_then(|s| s.agent_id),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
 }
 
 #[derive(Clone)]
