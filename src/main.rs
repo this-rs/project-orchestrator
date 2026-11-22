@@ -104,6 +104,74 @@ enum SecretCommand {
 
 use project_orchestrator::runtime::build_runtime;
 
+/// The highest soft limit of open files this process ever asks for. A server
+/// serving HTTP, websockets, database connections and child CLIs needs
+/// thousands of descriptors — never hundreds of thousands, so the cap keeps a
+/// fat-fingered value harmless.
+const FD_LIMIT_CAP: u64 = 65_536;
+
+/// The soft limit of open files to request, given the current soft and hard
+/// limits, or `None` when there is nothing to raise.
+///
+/// The hard limit always wins: a soft limit above it is refused by the kernel.
+/// A soft limit already at or above what we would ask for is left alone, so an
+/// environment that is already generous costs one `getrlimit` and no syscall
+/// that changes anything.
+fn fd_limit_target(soft: u64, hard: u64) -> Option<u64> {
+    let wanted = FD_LIMIT_CAP.min(hard);
+    (wanted > soft).then_some(wanted)
+}
+
+/// Raise this process's soft limit of open files, once, before anything opens a
+/// socket, a pipe or a file.
+///
+/// Why this exists: a server inherits the soft limit of whoever started it, and
+/// that is 256 in a macOS shell. Past that wall the *next* `open`, `socket` or
+/// `fork` fails with `EMFILE` — `Too many open files` — and the failure surfaces
+/// on whatever tried: a sub-agent spawn, a log rotation, a database connection.
+/// It never says that the descriptor limit is the cause. Measured on
+/// 22/11/2026: a sub-agent that could not start, twice, with the backend holding
+/// 209 established sockets after a day and a half of uptime.
+///
+/// Failing to raise it is not a reason to refuse to serve: the inherited limit
+/// is kept and the reason is stated once, on stderr.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // SAFETY: both calls only write into a `rlimit` we own, and `RLIMIT_NOFILE`
+    // set to a value read from the kernel on the line before is a valid request.
+    unsafe {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+            eprintln!("open files: could not read RLIMIT_NOFILE, keeping the inherited limit");
+            return;
+        }
+        // `rlim_t` is `u64` on every target this server is built for (aarch64 and
+        // x86_64, darwin and linux): no cast, and none that could truncate.
+        let (soft, hard) = (current.rlim_cur, current.rlim_max);
+        let Some(target) = fd_limit_target(soft, hard) else {
+            return;
+        };
+        let wanted = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: current.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) != 0 {
+            eprintln!(
+                "open files: could not raise RLIMIT_NOFILE from {soft} to {target}, keeping {soft}"
+            );
+            return;
+        }
+        eprintln!("open files: RLIMIT_NOFILE raised from {soft} to {target}");
+    }
+}
+
+/// Nothing to raise outside unix: the limit there is not a per-process soft one.
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 fn main() -> Result<()> {
     build_runtime()?.block_on(run())
 }
@@ -122,6 +190,12 @@ async fn run() -> Result<()> {
         // Exit here: falling through would start logging.
         std::process::exit(code);
     }
+
+    // The server serves HTTP, websockets, database connections and child CLIs:
+    // raise the descriptor limit before anything opens one. Deliberately after
+    // the `secret` exit above — that path must print nothing, and it opens no
+    // socket.
+    raise_fd_limit();
 
     // Load .env file
     dotenvy::dotenv().ok();
@@ -369,4 +443,94 @@ async fn run_sync(config: Config, path: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The descriptor limit is raised before anything else runs, so a bad value here
+/// costs every later `open` — hence pure, exhaustive tests.
+#[cfg(test)]
+mod fd_limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_256_soft_limit_is_raised_to_the_cap() {
+        assert_eq!(fd_limit_target(256, u64::MAX), Some(FD_LIMIT_CAP));
+    }
+
+    #[test]
+    fn the_hard_limit_wins_when_it_is_lower_than_the_cap() {
+        assert_eq!(fd_limit_target(256, 1024), Some(1024));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlimited_hard_limit_still_caps_the_request() {
+        assert_eq!(
+            fd_limit_target(1024, libc::RLIM_INFINITY),
+            Some(FD_LIMIT_CAP)
+        );
+    }
+
+    #[test]
+    fn nothing_is_requested_when_the_soft_limit_is_already_enough() {
+        assert_eq!(fd_limit_target(FD_LIMIT_CAP, u64::MAX), None);
+        assert_eq!(fd_limit_target(FD_LIMIT_CAP + 1, u64::MAX), None);
+    }
+
+    #[test]
+    fn nothing_is_requested_when_the_hard_limit_is_already_the_soft_one() {
+        assert_eq!(fd_limit_target(1024, 1024), None);
+    }
+
+    /// The behaviour, not the arithmetic: start from the 256 a macOS shell gives,
+    /// call the real function, read the limit back from the kernel.
+    #[cfg(unix)]
+    #[test]
+    fn the_raise_takes_effect_on_the_kernel_limit() {
+        unsafe {
+            let mut original = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut original), 0);
+            if original.rlim_max < 4096 {
+                // A locked-down box: there is nothing to prove, and lowering the
+                // soft limit first would only risk `EMFILE` for the other tests.
+                return;
+            }
+            let low = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: original.rlim_max,
+            };
+            assert_eq!(
+                libc::setrlimit(libc::RLIMIT_NOFILE, &low),
+                0,
+                "could not lower the soft limit to 256 for the test"
+            );
+
+            raise_fd_limit();
+
+            let mut after = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut after), 0);
+            assert!(
+                after.rlim_cur > 256,
+                "the soft limit stayed at {}: the raise did nothing",
+                after.rlim_cur
+            );
+
+            // Leave the process as we found it for whatever runs next.
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &original), 0);
+        }
+    }
+
+    #[test]
+    fn the_requested_value_never_exceeds_the_hard_limit() {
+        for hard in [64u64, 1024, 65_535, 65_536, 65_537, u64::MAX] {
+            if let Some(target) = fd_limit_target(0, hard) {
+                assert!(target <= hard, "asked {target} with a hard limit of {hard}");
+            }
+        }
+    }
 }
