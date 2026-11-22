@@ -49,6 +49,7 @@ fn child_server() {
     }
     let loopback = env_num("FD_LOOPBACK").unwrap_or(0) as usize;
     let loopback_age = env_num("FD_LOOPBACK_AGE_MS");
+    let loopback_stall = env_num("FD_LOOPBACK_STALL_MS");
     fd_guard::init_fd_meter();
     let report = fd_guard::raise_nofile_limit(target);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -63,6 +64,9 @@ fn child_server() {
             fd_guard::ConnTracker::new(max, peers)
         };
         tracker.set_loopback_reserve(loopback);
+        if let Some(ms) = loopback_stall {
+            tracker.set_loopback_write_stall(Duration::from_millis(ms));
+        }
         if let Some(ms) = loopback_age {
             tracker.set_loopback_max_age(Duration::from_millis(ms));
         }
@@ -119,12 +123,23 @@ fn child_server() {
                     ([("content-type", "text/event-stream")], "data: hello\n\n")
                 }),
             )
+            .route("/big", get(|| async { "x".repeat(24 * 1024 * 1024) }))
+            .route("/mid", get(|| async { "y".repeat(3 * 1024 * 1024) }))
             .route(
                 "/slow",
                 get(|| async {
                     // A slow but ACTIVE request: nothing may cut it half way.
                     tokio::time::sleep(Duration::from_millis(2500)).await;
                     "done"
+                }),
+            )
+            .route(
+                "/stream-case",
+                get(|| async {
+                    (
+                        [("content-type", "Text/Event-Stream; charset=utf-8")],
+                        "data: hi\n\n",
+                    )
                 }),
             )
             .route(
@@ -293,6 +308,8 @@ struct Cfg {
     loopback: u64,
     /// Maximum age (ms) of a connection admitted on the loopback quota.
     loopback_age_ms: Option<u64>,
+    /// No-write-progress delay (ms) after which a quota connection is closed.
+    loopback_stall_ms: Option<u64>,
     /// Another directory for the descriptor meter (an unavailable one).
     meter_path: Option<&'static str>,
     soft: u64,
@@ -308,6 +325,7 @@ impl Cfg {
         Cfg {
             loopback: 0,
             loopback_age_ms: None,
+            loopback_stall_ms: None,
             meter_path: None,
             soft,
             hard,
@@ -359,6 +377,9 @@ fn spawn(cfg: Cfg) -> Server {
     let exe = std::env::current_exe().unwrap();
     let (soft, hard) = (cfg.soft, cfg.hard);
     let mut cmd = Command::new(exe);
+    if let Some(ms) = cfg.loopback_stall_ms {
+        cmd.env("FD_LOOPBACK_STALL_MS", ms.to_string());
+    }
     if let Some(ms) = cfg.loopback_age_ms {
         cmd.env("FD_LOOPBACK_AGE_MS", ms.to_string());
     }
@@ -1083,7 +1104,8 @@ async fn the_loopback_quota_serves_short_requests_only_and_never_cuts_a_request_
     for (path, headers) in [
         ("/health", "Connection: Upgrade\r\nUpgrade: websocket\r\n"),
         ("/stream", "Accept: text/event-stream\r\n"),
-        ("/stream", ""), // SSE chosen by the handler, no Accept header
+        ("/stream", ""),      // SSE chosen by the handler, no Accept header
+        ("/stream-case", ""), // the media type compared case-insensitively
     ] {
         let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
         send_get_with(&mut c, path, headers).await;
@@ -1160,7 +1182,7 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
     }
     let srv = spawn(Cfg {
         max: 3,
-        loopback: 8,
+        loopback: 1,
         loopback_age_ms: Some(5000),
         ..Cfg::new(128, 128)
     });
@@ -1212,6 +1234,7 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
     let r = get(srv.port, "/health", Duration::from_secs(3))
         .await
         .expect("no answer after h2c");
+    // The quota has ONE slot here: a leaked slot would make this a 503.
     assert_eq!(
         r.0, 200,
         "the quota slot of the refused h2c connection was not given back"
@@ -1233,6 +1256,84 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
         "an SSE response was served on the quota: {body}"
     );
     drop(holders);
+}
+
+/// Un lecteur arrêté sur le quota ne tient pas sa place indéfiniment : une écriture
+/// sans AUCUN progrès pendant le délai (1 s ici) ferme la connexion du quota et rend la
+/// place ; un client lent MAIS qui avance (3 Mo lus par morceaux pendant plus que ce
+/// délai) n'est jamais coupé ; les connexions ordinaires ne sont pas concernées.
+/// ROUGE sans le délai d'écriture : le quota (1 place) reste pris et `/health` 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reader_is_kept() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("quota-write-stall", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        max: 3,
+        loopback: 1,
+        loopback_stall_ms: Some(1000),
+        ..Cfg::new(128, 128)
+    });
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], srv.port));
+    let mut holders = Vec::new();
+    for _ in 0..3 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        holders.push(c);
+    }
+
+    // A slow reader that ADVANCES (128 KiB per 100 ms, 3 MiB in ~2.4 s, more than the
+    // 1 s delay) is served in full.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut slow = sock.connect(addr).await.unwrap();
+    send_get_with(&mut slow, "/mid", "").await;
+    let mut total = 0usize;
+    let mut chunk = vec![0u8; 128 * 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut chunk))
+            .await
+            .expect("a slow but advancing reader stalled")
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        total += n;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        total >= 3 * 1024 * 1024,
+        "the slow reader was cut after {total} bytes"
+    );
+
+    // A reader that STOPS: 24 MiB, tiny receive buffer, nothing is ever read.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut stuck = sock.connect(addr).await.unwrap();
+    send_get_with(&mut stuck, "/big", "").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The single quota slot is held by the stuck client...
+    assert_eq!(
+        get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .unwrap()
+            .0,
+        503
+    );
+    // ...until the write stalls for the delay: the connection is closed, the slot given back.
+    eventually_ok(srv.port, "/health", Duration::from_secs(6)).await;
+    // Ordinary connections were never touched.
+    for c in holders.iter_mut() {
+        send_get(c, "/health", false).await;
+        assert_eq!(
+            read_response(c).await.unwrap().0,
+            200,
+            "a normal connection was cut"
+        );
+    }
+    drop(stuck);
 }
 
 /// Mètre indisponible SANS table pleine (`/dev/fd` absent : conteneur, bac à

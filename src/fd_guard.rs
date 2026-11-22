@@ -54,6 +54,9 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 /// - rien ne coupe une requête dont hyper a analysé l'en-tête (il n'appelle le
 ///   service qu'alors ; le corps peut arriver lentement) ni une réponse en cours
 ///   (une réponse longue non-SSE n'est donc PAS bornée sur le quota) ;
+/// - une écriture qui n'avance plus depuis [`DEFAULT_LOOPBACK_WRITE_STALL`] (lecteur
+///   arrêté) ferme la connexion du quota et rend la place (rien d'autre n'y borne
+///   l'écriture) ;
 /// - HTTP/2 en clair (h2c, sans `Connection: close`) est refusé sur le quota ;
 /// - filet de sécurité (slowloris) : une connexion du quota dont les en-têtes ne
 ///   sont pas complets (rien reçu, ou en-têtes partiels) au bout de ce délai est
@@ -61,6 +64,17 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 pub const DEFAULT_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(10);
 /// Plancher du délai ci-dessus.
 pub const MIN_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(1);
+/// Variable d'environnement : durée (secondes, minimum 1) sans AUCUN progrès
+/// d'écriture au bout de laquelle une connexion du quota est fermée et sa place
+/// rendue (défaut [`DEFAULT_LOOPBACK_WRITE_STALL`]).
+pub const ENV_LOOPBACK_WRITE_STALL_SECS: &str = "ORCHESTRATOR_LOOPBACK_WRITE_STALL_SECS";
+/// Un lecteur arrêté (réponse non SSE, asset, export, servie à un client qui ne lit
+/// plus) tiendrait sinon sa place de quota indéfiniment : l'écriture HTTP n'est
+/// jamais coupée ailleurs, et le délai de route ne couvre que l'attente de la
+/// réponse. Sur une connexion du QUOTA seulement, une écriture qui n'avance plus
+/// depuis cette durée ferme la connexion. Choix : un délai d'ABSENCE DE PROGRÈS,
+/// pas un plafond de durée : un client lent mais qui avance n'est jamais coupé.
+pub const DEFAULT_LOOPBACK_WRITE_STALL: Duration = Duration::from_secs(30);
 
 /// Le quota est borné sous la marge [`RESERVE_FDS`] : il consomme de cette marge.
 pub fn clamp_loopback_reserve(n: usize) -> usize {
@@ -646,6 +660,7 @@ struct TrackerInner {
     loopback_reserve: AtomicUsize,
     loopback_in_use: AtomicUsize,
     loopback_max_age_ms: AtomicU64,
+    loopback_write_stall_ms: AtomicU64,
     /// Pairs des connexions admises sur le quota loopback, et leur état.
     quota_conns: Mutex<HashMap<SocketAddr, Arc<QuotaState>>>,
     rejecting: AtomicUsize,
@@ -712,6 +727,7 @@ impl ConnTracker {
                 loopback_reserve: AtomicUsize::new(0),
                 loopback_in_use: AtomicUsize::new(0),
                 loopback_max_age_ms: AtomicU64::new(millis_u64(DEFAULT_LOOPBACK_MAX_AGE)),
+                loopback_write_stall_ms: AtomicU64::new(millis_u64(DEFAULT_LOOPBACK_WRITE_STALL)),
                 quota_conns: Mutex::new(HashMap::new()),
                 rejecting: AtomicUsize::new(0),
                 last_log_ms: AtomicU64::new(0),
@@ -744,6 +760,27 @@ impl ConnTracker {
         self.inner
             .loopback_max_age_ms
             .store(millis_u64(age), Ordering::Relaxed);
+    }
+
+    /// Durée sans progrès d'écriture avant fermeture d'une connexion du quota
+    /// (minimum 1 s, relevée avec un `warn` sinon).
+    pub fn set_loopback_write_stall(&self, d: Duration) {
+        let d = if d < MIN_LOOPBACK_MAX_AGE {
+            tracing::warn!(
+                requested_ms = millis_u64(d),
+                "{ENV_LOOPBACK_WRITE_STALL_SECS} raised to the 1 s minimum"
+            );
+            MIN_LOOPBACK_MAX_AGE
+        } else {
+            d
+        };
+        self.inner
+            .loopback_write_stall_ms
+            .store(millis_u64(d), Ordering::Relaxed);
+    }
+
+    pub fn loopback_write_stall(&self) -> Duration {
+        Duration::from_millis(self.inner.loopback_write_stall_ms.load(Ordering::Relaxed))
     }
 
     /// L'état d'une connexion du quota (pour le middleware), si `peer` en est une.
@@ -797,7 +834,14 @@ impl ConnTracker {
         {
             tracker.set_loopback_max_age(Duration::from_secs(secs));
         }
+        if let Some(secs) = std::env::var(ENV_LOOPBACK_WRITE_STALL_SECS)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            tracker.set_loopback_write_stall(Duration::from_secs(secs));
+        }
         tracing::info!(
+            loopback_write_stall_secs = tracker.loopback_write_stall().as_secs(),
             loopback_reserve = clamped,
             loopback_max_age_secs = tracker.loopback_max_age().as_secs(),
             "Loopback quota over the connection cap"
@@ -1122,6 +1166,8 @@ pub struct GuardedStream {
     quota: Option<(Arc<QuotaState>, std::pin::Pin<Box<tokio::time::Sleep>>)>,
     /// Début du flux d'une connexion du quota, tant qu'on cherche la préface h2c.
     sniff: Option<Vec<u8>>,
+    /// Minuterie « aucun progrès d'écriture » d'une connexion du quota.
+    write_stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 /// Préface d'une connexion HTTP/2 « prior knowledge » (h2c).
@@ -1148,6 +1194,43 @@ impl GuardedStream {
             }
         }
         Ok(())
+    }
+}
+
+impl GuardedStream {
+    /// Quota seulement : une écriture qui reste en attente (tampon d'émission plein
+    /// car le client ne lit plus) depuis `loopback_write_stall` est une erreur ; tout
+    /// progrès (écriture réussie) réarme la minuterie.
+    fn guard_write<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        r: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        use std::future::Future;
+        if self.quota.is_none() {
+            return r;
+        }
+        match r {
+            Poll::Pending => {
+                let d = self.tracker.loopback_write_stall();
+                let timer = self
+                    .write_stall
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(d)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    self.write_stall = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "loopback quota connection: no write progress, the client stopped reading",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+            ready => {
+                self.write_stall = None;
+                ready
+            }
+        }
     }
 }
 
@@ -1199,10 +1282,12 @@ impl AsyncWrite for GuardedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.guard_write(cx, r)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let r = Pin::new(&mut self.inner).poll_flush(cx);
+        self.guard_write(cx, r)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
@@ -1212,7 +1297,8 @@ impl AsyncWrite for GuardedStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.guard_write(cx, r)
     }
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
@@ -1252,6 +1338,7 @@ impl axum::serve::Listener for GuardedListener {
                                 tracker: self.tracker.clone(),
                                 quota,
                                 sniff,
+                                write_stall: None,
                             },
                             peer,
                         );
@@ -1333,10 +1420,18 @@ pub async fn quota_guard(
         return quota_refusal();
     }
     let mut resp = next.run(req).await;
+    // NOTE: this refusal comes AFTER the handler ran: its effects are produced. No
+    // production route answers with an event stream today (the MCP GET answers 405),
+    // so nothing is lost; a route that did would have to be made safe to refuse.
     if resp
         .headers()
         .get(header::CONTENT_TYPE)
-        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"))
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
     {
         return quota_refusal();
     }

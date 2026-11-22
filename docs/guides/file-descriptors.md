@@ -33,22 +33,30 @@
   for SHORT REQUESTS ONLY. Every response on a quota connection carries
   `Connection: close` (the connection closes after its response, no keep-alive);
   a WebSocket upgrade, or a response whose `Content-Type` is `text/event-stream`,
-  gets a clean `503` (the
-  desktop therefore never reaches `onopen` through the quota and its reconnect
+  gets a clean `503` (the SSE refusal is applied AFTER the handler ran, so its
+  effects are produced; harmless while no production route answers with an event
+  stream; the desktop therefore never reaches `onopen` through the quota and its reconnect
   backoff keeps growing). The MCP Streamable HTTP requests are served: a POST
   (`Accept: application/json, text/event-stream`), and the GET
   (`Accept: text/event-stream`) whose 405 tells the client there is no server stream. HTTP/2 in clear text
   (h2c) is refused on the quota: it has no `Connection: close`, and hyper-util's
   `http2` feature is enabled in this build (checked with
-  `cargo tree -e features -i hyper-util`). Nothing cuts a request once hyper has parsed its head (it calls the service only
-  then; the body may arrive slowly), nor a response in progress: a LONG non-SSE response on a quota
-  connection is not bounded. As a safety net against slow-loris, a quota
-  connection whose request head is not complete (nothing received, or partial
-  headers) after `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1) is
-  closed, on the read side only and only when no byte is available. Silent local
-  connections can therefore hold the quota for that long. A LAN health probe is
-  not covered. A quota rather than a second health listener: no extra port,
-  every local client benefits.
+  `cargo tree -e features -i hyper-util`). What holds a quota place, honestly (a quota place is a short-request place, and
+  these are the only ways to keep one):
+  - an incomplete request head (nothing received, or partial headers): until
+    `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1), the safety net
+    against slow-loris, which closes on the read side only and only when no byte is
+    available;
+  - once hyper has parsed the head (it calls the service only then) nothing in the
+    quota cuts the REQUEST: a slow request body holds the place until the route
+    timeout (60 s for protected routes, `HTTP_REQUEST_TIMEOUT_SECS`; 20 s for public
+    routes, `PUBLIC_TIMEOUT_SECS`; not measured by a test here);
+  - a client that stops READING a response (asset, export...): until a write makes
+    no progress for `ORCHESTRATOR_LOOPBACK_WRITE_STALL_SECS` (default 30, minimum
+    1). A no-progress delay, not a duration cap: a slow client that keeps reading is
+    never cut. Only quota connections are subject to it.
+  A LAN health probe is not covered. A quota rather than a second health listener:
+  no extra port, every local client benefits.
 - `ORCHESTRATOR_CONN_STATS=1` logs, every 60 s, the top peers by remote address
   (connections, time since the first one of the current series, connections
   admitted). It is bounded (256 peers, then an aggregate counter) and forgets a
