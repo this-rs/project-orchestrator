@@ -16914,11 +16914,17 @@ impl ChatStore for MockGraphStore {
         Ok(Vec::new())
     }
 
+    /// The same answer as [`Self::get_session_links`], per session (the list and the
+    /// detail of a session read the same links).
     async fn get_session_links_batch(
         &self,
-        _session_ids: &[Uuid],
+        session_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
-        Ok(std::collections::HashMap::new())
+        let links = self.session_links.read().await;
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| links.get(id).map(|l| (*id, l.clone())))
+            .collect())
     }
 
     async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {

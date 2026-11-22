@@ -13947,10 +13947,12 @@ impl ChatManager {
         let parent =
             super::cancelled_parents::parent_checked_on_resume(session_node.spawned_by.as_deref());
         // The reference real progress is judged against, read before the first turn of the
-        // reopened session (`ObjectiveCounters::reopening_baseline`).
+        // reopened session (`ObjectiveCounters::reopening_baseline`) — not read at all for
+        // a session that tracks no objective, as on the agent engine.
         let objective_baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
             &self.graph,
             Some(session_node.id),
+            tracks_own_objectives(session_node.spawned_by.is_some()),
         )
         .await;
         let interrupt_flag = {
@@ -18557,11 +18559,13 @@ impl ChatManager {
             None => None,
         };
         let mut objectives = super::post_stream::ObjectiveCounters::opening(tracks, reopened);
-        if reopened && tracks {
-            // The reference, read before the first turn of the reopened session.
+        if reopened {
+            // The reference, read before the first turn of the reopened session (not read
+            // for a session that tracks no objective).
             objectives.baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
                 &self.graph,
                 node.as_ref().map(|n| n.id),
+                tracks,
             )
             .await;
         }
@@ -41702,10 +41706,10 @@ mod held_context_tests {
         );
     }
 
-    /// (d) reminder → Read → end, repeated: at most the cap. Calls that change nothing in
-    /// the store — a failed or same-status `task update`, an update of a task not linked
-    /// to the session, `git commit --dry-run`, a commit a hook refused — rearm nothing;
-    /// (e) a real status change of a linked task does.
+    /// (d) reminder → Read → end, repeated: at most the cap. Then three store-side cases
+    /// rearm nothing: calls the store never applied (failed update, dry-run, refused
+    /// commit — one scenario, the store unchanged), a same-status write, a real change of
+    /// a task not linked to the session; (e) a step of a linked task really completed does.
     #[tokio::test]
     async fn the_agent_engine_rearms_only_on_a_change_in_the_store() {
         use serde_json::json;
@@ -41728,28 +41732,26 @@ mod held_context_tests {
                 json!({"action": "update", "task_id": task.to_string(), "status": status}),
             )
         };
-        // A failed update (the store refused it: unchanged) and a same-status update.
-        total += reminded(&s, &sid, &with_tools(vec![update(mine, "completed")])).await;
+        // 1. Calls the store never applied: a `task update` that failed, a
+        //    `git commit --dry-run`, a commit its hook refused. The engine sees only the
+        //    calls, never their outcome: from the store's side these are ONE scenario —
+        //    nothing changed — played here in one turn.
+        total += reminded(
+            &s,
+            &sid,
+            &with_tools(vec![
+                update(mine, "completed"),
+                ("Bash", json!({"command": "git commit --dry-run -m x"})),
+                ("Bash", json!({"command": "git commit -m x"})),
+            ]),
+        )
+        .await;
+        // 2. An update that WAS applied but kept the same status (written again).
+        mock.tasks.write().await.get_mut(&mine).unwrap().status = TaskStatus::InProgress;
         total += reminded(&s, &sid, &with_tools(vec![update(mine, "in_progress")])).await;
-        // An update of a task that is not this session's, really applied.
+        // 3. An update of a task that is not this session's, really applied.
         mock.tasks.write().await.get_mut(&foreign).unwrap().status = TaskStatus::Completed;
         total += reminded(&s, &sid, &with_tools(vec![update(foreign, "completed")])).await;
-        // A dry-run commit, a commit refused by its hook: nothing recorded.
-        total += reminded(
-            &s,
-            &sid,
-            &with_tools(vec![(
-                "Bash",
-                json!({"command": "git commit --dry-run -m x"}),
-            )]),
-        )
-        .await;
-        total += reminded(
-            &s,
-            &sid,
-            &with_tools(vec![("Bash", json!({"command": "git commit -m x"}))]),
-        )
-        .await;
         for _ in 0..3 {
             total += reminded(&s, &sid, &TurnOutcome::default()).await;
         }
@@ -41869,14 +41871,17 @@ mod held_context_tests {
         ];
         for origin in origins {
             let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-            let (manager, sid) = world_spawned(mock, Some(origin.clone())).await;
+            let (manager, sid) = world_spawned(mock.clone(), Some(origin.clone())).await;
+            let own = agent_task(&mock, TaskStatus::InProgress, "Its own task").await;
+            link(&mock, &sid, own).await;
             for reopened in [false, true] {
+                let state = manager.agent_turn_state(&sid, reopened).await;
                 assert!(
-                    !manager
-                        .agent_turn_state(&sid, reopened)
-                        .await
-                        .objectives
-                        .enabled,
+                    state.objectives.baseline.lock().unwrap().is_none(),
+                    "no reference read for an untracked session: {origin}"
+                );
+                assert!(
+                    !state.objectives.enabled,
                     "agent engine, {origin}, reopened={reopened}"
                 );
             }

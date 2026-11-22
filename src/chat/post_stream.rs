@@ -1214,11 +1214,16 @@ impl ObjectiveCounters {
     /// The reference of a REOPENED session, read in the store at the reopening itself
     /// (before its first turn), so that progress made during that first turn is seen.
     /// Empty when the store cannot be read: then the end of the first turn is the
-    /// reference.
+    /// reference. Empty, WITHOUT reading the store, for a session that tracks no objective
+    /// (`tracks`, from `tracks_own_objectives`): both engines call it with the same guard.
     pub(crate) async fn reopening_baseline(
         graph: &Arc<dyn GraphStore>,
         session_uuid: Option<Uuid>,
+        tracks: bool,
     ) -> ProgressBaseline {
+        if !tracks {
+            return ProgressBaseline::default();
+        }
         let now = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             progress_snapshot(graph, session_uuid),
@@ -1392,7 +1397,10 @@ pub(crate) async fn objective_reminder(
                         .turns_since
                         .store(OBJECTIVE_REMINDER_COOLDOWN, Ordering::Relaxed);
                     counters.in_a_row.store(0, Ordering::Relaxed);
-                    *baseline = None;
+                    // What the store shows now is the new reference (never None: a later
+                    // failed read keeps it, instead of letting the next read absorb a
+                    // progress).
+                    *baseline = Some(now);
                 }
                 Some(_) => {}
                 // Reopened with the reminders spent: what the store shows now is the
@@ -1445,7 +1453,11 @@ pub(crate) async fn objective_reminder(
     // The cooldown starts: the next turn reads 1, below the threshold, and is skipped.
     counters.turns_since.store(1, Ordering::Relaxed);
     counters.in_a_row.fetch_add(1, Ordering::Relaxed);
-    // The reference progress is judged against: the store as it is at this reminder.
+    // The reference progress is judged against: the store as it is at this reminder. A
+    // read that fails (timeout, store error, steps unreadable) keeps the previous
+    // reference rather than clearing it: cleared, the next successful read would become
+    // the reference and absorb a progress made in between. Only a session that never had
+    // a readable reference has none (its first successful read becomes it).
     let now = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         progress_snapshot(graph, session_uuid),
@@ -1453,7 +1465,9 @@ pub(crate) async fn objective_reminder(
     .await
     .ok()
     .flatten();
-    *counters.baseline.lock().unwrap_or_else(|e| e.into_inner()) = now;
+    if let Some(now) = now {
+        *counters.baseline.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
     Some(reminder)
 }
 
@@ -2806,7 +2820,7 @@ mod integration_tests {
         let mut h = build_handler(graph.clone(), None, sid, true).await;
         h.session_uuid = uuid;
         let dyn_graph: Arc<dyn GraphStore> = graph;
-        let baseline = ObjectiveCounters::reopening_baseline(&dyn_graph, uuid).await;
+        let baseline = ObjectiveCounters::reopening_baseline(&dyn_graph, uuid, true).await;
         let mut sessions = h.active_sessions.write().await;
         let session = sessions.get_mut(sid).unwrap();
         session.objective_reminders_in_a_row.store(
@@ -3009,6 +3023,93 @@ mod integration_tests {
         assert!(r[0].contains("Next"), "{}", r[0]);
         assert_eq!(counters_of(&h).await, (1, 1));
         assert!(text_turn(&h).await.is_empty(), "then the cooldown");
+    }
+
+    /// A reference read that FAILS keeps the previous reference: reminder, progress
+    /// (rearmed), two reminders whose reference read fails (a task's steps unreadable),
+    /// then a real progress — it is still seen against the kept reference, and rearms.
+    /// (Cleared on failure, the next successful read became the reference and absorbed
+    /// the progress: the session stayed silent.)
+    #[tokio::test]
+    async fn a_failed_reference_read_keeps_the_previous_reference() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let unreadable = seed_task(&graph, TaskStatus::InProgress, Some("Unreadable")).await;
+        let b = seed_task(&graph, TaskStatus::InProgress, Some("Task B")).await;
+        let c = seed_task(&graph, TaskStatus::InProgress, Some("Task C")).await;
+        let h = build_handler(graph.clone(), None, "failed-reference", true).await;
+        link_tasks(&graph, h.session_uuid.unwrap(), &[unreadable, b, c]).await;
+        let set = |id: Uuid, st: TaskStatus| {
+            let graph = graph.clone();
+            async move { graph.tasks.write().await.get_mut(&id).unwrap().status = st }
+        };
+
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 1 (reference read ok)"
+        );
+        set(c, TaskStatus::Completed).await;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert_eq!(counters_of(&h).await.1, 0, "progress rearmed");
+
+        // From now on, every reference read fails (the steps of a task to do).
+        graph.fail_task_steps.lock().unwrap().insert(unreadable);
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 2 (reference read fails)"
+        );
+        assert!(text_turn(&h).await.is_empty(), "cooldown");
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 3 (reference read fails)"
+        );
+        assert_eq!(counters_of(&h).await.1, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+
+        // The store is readable again, and B really progresses.
+        graph.fail_task_steps.lock().unwrap().clear();
+        set(b, TaskStatus::Completed).await;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert_eq!(counters_of(&h).await.1, 0, "the progress was seen");
+        assert_eq!(text_turn(&h).await.len(), 1, "and the reminders rearmed");
+    }
+
+    /// The reference of a reopened session is not read at all for a session that tracks
+    /// no objective (the guard both engines pass), and read for one that does.
+    #[tokio::test]
+    async fn the_reopening_reference_is_read_only_for_a_tracked_session() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::InProgress, Some("Mine")).await;
+        let uuid = Uuid::new_v4();
+        link_tasks(&graph, uuid, &[task]).await;
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let untracked = ObjectiveCounters::reopening_baseline(&dyn_graph, Some(uuid), false).await;
+        assert!(untracked.lock().unwrap().is_none(), "nothing read");
+        let tracked = ObjectiveCounters::reopening_baseline(&dyn_graph, Some(uuid), true).await;
+        assert!(tracked.lock().unwrap().is_some(), "read");
+    }
+
+    /// The list (`get_session_links_batch`) and the detail (`get_session_links`) of a
+    /// session answer the same links, a task without title included.
+    #[tokio::test]
+    async fn the_batch_and_single_reads_of_links_agree() {
+        let graph = Arc::new(MockGraphStore::new());
+        let uuid = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        link_tasks(&graph, uuid, &[task]).await;
+        let single = graph.get_session_links(uuid).await.unwrap();
+        let batch = graph.get_session_links_batch(&[uuid]).await.unwrap();
+        let ids = |l: &crate::neo4j::models::LinkedSessionInfo| {
+            l.linked_tasks
+                .iter()
+                .map(|t| (t.id, t.title.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&single), vec![(task, String::new())]);
+        assert_eq!(ids(&batch[&uuid]), ids(&single));
     }
 
     /// A reopened session (restart, resume) starts with its allowance spent
