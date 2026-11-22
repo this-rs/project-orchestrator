@@ -27,18 +27,11 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
-use tokio::time::{interval, Duration};
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// How often this connection pings its client — and, while a turn is running,
-/// says so (see the ping arm of the loop). 30 s is what the socket has always
-/// used; a test cannot wait that long for the frame it asserts, so it gets a
-/// shorter beat. Nothing else depends on the value.
-#[cfg(not(test))]
-const WS_PING_EVERY: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const WS_PING_EVERY: Duration = Duration::from_millis(250);
+use super::ws_liveness::{Beat, Liveness};
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
@@ -160,6 +153,7 @@ pub async fn ws_chat(
     );
 
     let last_event = query.last_event;
+    let beat = Beat::for_chat(&headers);
 
     // Pre-upgrade auth: cookie first, then ticket fallback
     let neo4j = state.orchestrator.neo4j_arc();
@@ -181,7 +175,7 @@ pub async fn ws_chat(
     Ok(match auth_result {
         CookieAuthResult::Authenticated(claims) => ws
             .on_upgrade(move |socket| {
-                handle_ws_chat_preauthed(socket, state, session_id, last_event, claims)
+                handle_ws_chat_preauthed(socket, state, session_id, last_event, claims, beat)
             })
             .into_response(),
         CookieAuthResult::Invalid(reason) => {
@@ -200,6 +194,7 @@ async fn handle_ws_chat_preauthed(
     session_id: String,
     last_event: i64,
     claims: Claims,
+    beat: Beat,
 ) {
     let t0 = tokio::time::Instant::now();
     // Wait for client "ready" signal before sending auth_ok
@@ -215,7 +210,7 @@ async fn handle_ws_chat_preauthed(
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "⏱ ready handshake completed"
     );
-    handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
+    handle_ws_chat_loop(socket, state, session_id, last_event, claims, beat).await;
 }
 
 /// Main chat event loop for an authenticated WebSocket connection.
@@ -225,8 +220,10 @@ async fn handle_ws_chat_loop(
     session_id: String,
     last_event: i64,
     claims: Claims,
+    beat: Beat,
 ) {
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (ws_sender_raw, mut ws_receiver) = socket.split();
+    let mut ws_sender = super::ws_liveness::BoundedSink::new(ws_sender_raw);
 
     let loop_start = tokio::time::Instant::now();
 
@@ -602,8 +599,9 @@ async fn handle_ws_chat_loop(
             .await;
     }
 
-    let mut ping_interval = interval(WS_PING_EVERY);
+    let mut ping_interval = interval(beat.ping_every);
     ping_interval.tick().await; // skip first immediate tick
+    let mut liveness = Liveness::new(beat.pong_timeout);
 
     // Track responded permission request IDs to prevent double-click bugs.
     // If a user clicks Allow/Deny twice, the second response is silently ignored.
@@ -657,583 +655,593 @@ async fn handle_ws_chat_loop(
     let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     loop {
+        // Many writes in this loop ignore their result (`let _ = ...`). A write that
+        // stalled or failed poisons the sink: leave now, whichever path it was on,
+        // and let the socket (and its descriptor) go.
+        if ws_sender.is_broken() {
+            debug!(session_id = %session_id, "Chat WebSocket: a write failed or stalled, closing");
+            break;
+        }
         tokio::select! {
-            Some(frame) = ctl_rx.recv() => {
-                if ws_sender.send(Message::Text(frame.into())).await.is_err() {
-                    debug!("WebSocket send failed (control frame), client disconnected");
-                    break;
-                }
-            }
+        // `biased`: read what the client sent BEFORE judging a missed Pong, so a
+        // Pong that arrived while the loop was busy is never lost to the tick.
+        biased;
 
-            // Forward local broadcast events to the WebSocket client
-            event = async {
-                match &mut event_rx {
-                    Some(rx) => rx.recv().await,
-                    None => {
-                        // No subscription yet — wait forever (other branches will fire)
-                        std::future::pending().await
-                    }
-                }
-            } => {
-                match event {
-                    Ok(chat_event) => {
-                        // --- Snapshot dedup (local broadcast) ---
-                        // After a mid-stream join, events from the micro-window between
-                        // subscribe and snapshot may be duplicates. We dedup by fingerprint.
-                        // StreamDelta/StreamingStatus have no fingerprint and always pass.
-                        if !snapshot_fingerprints.is_empty() {
-                            if let Some(fp) = chat_event.fingerprint() {
-                                if snapshot_fingerprints.remove(&fp) {
-                                    debug!(
-                                        event_type = %chat_event.event_type(),
-                                        fingerprint = %fp,
-                                        remaining = snapshot_fingerprints.len(),
-                                        "Skipping broadcast event (duplicate of snapshot)"
-                                    );
-                                    continue;
-                                }
-                            }
-                            // Result event clears all remaining fingerprints (end of stream)
-                            if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
-                                snapshot_fingerprints.clear();
-                            }
-                        }
-                        if !send_chat_event!(chat_event, ws_sender) {
-                            debug!("WebSocket send failed, client disconnected");
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "Chat WS client lagged, some events missed");
-                        // Client may want to do a full replay — send a hint
-                        let hint = serde_json::json!({
-                            "type": "events_lagged",
-                            "skipped": n,
-                        });
-                        let _ = ws_sender.send(Message::Text(hint.to_string().into())).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // CLI subprocess was cleaned up (idle timeout) but the WebSocket
-                        // should stay alive. Transition to dormant: disable the broadcast
-                        // branch and let ping/pong + client messages keep running.
-                        // When the user sends a new message, resume_session() will spawn
-                        // a fresh CLI and the existing `if event_rx.is_none() { subscribe() }`
-                        // logic (below) will re-subscribe automatically.
-                        debug!(session_id = %session_id, "Chat broadcast closed (idle cleanup), going dormant");
-                        event_rx = None;
-                        snapshot_fingerprints.clear();
-                        let msg = serde_json::json!({
-                            "type": "session_dormant",
-                            "message": "CLI session cleaned up (idle timeout). Will resume on next message."
-                        });
-                        let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
-                    }
-                }
-            }
 
-            // Forward NATS chat events to the WebSocket client (cross-instance)
-            nats_msg = async {
-                match &mut nats_chat_sub {
-                    Some(sub) => sub.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match nats_msg {
-                    Some(msg) => {
-                        match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
-                            Ok(chat_event) => {
-                                // --- Cross-instance dedup ---
-                                // Dedup by fingerprint, same logic as local broadcast.
-                                if !snapshot_fingerprints.is_empty() {
-                                    if let Some(fp) = chat_event.fingerprint() {
-                                        if snapshot_fingerprints.remove(&fp) {
-                                            debug!(
-                                                event_type = %chat_event.event_type(),
-                                                fingerprint = %fp,
-                                                remaining = snapshot_fingerprints.len(),
-                                                "Skipping NATS event (duplicate of snapshot)"
-                                            );
+        // Handle incoming messages from the client
+        msg = ws_receiver.next() => {
+            match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let text_str: &str = &text;
+                    match serde_json::from_str::<WsChatClientMessage>(text_str) {
+                        Ok(client_msg) => {
+                            // A read-only mirror of a Claude Code sub-agent (P18c) takes nothing
+                            // that writes to it: refused with its own flat frame, before any
+                            // send, resume, proxy or answer is attempted.
+                            if writes_to_session(&client_msg)
+                                && chat_manager.refuse_if_mirror(&session_id).await.is_err()
+                            {
+                                let _ = ws_sender
+                                    .send(Message::Text(mirror_read_only_frame().to_string().into()))
+                                    .await;
+                                continue;
+                            }
+                            match client_msg {
+                                WsChatClientMessage::UserMessage { content, attachments, queue, refs } => {
+                                    debug!(session_id = %session_id, queue, "WS: Received user_message");
+
+                                    // Same routing as POST /api/chat/sessions/{id}/messages:
+                                    // local → remote (NATS RPC) → resume_session.
+                                    // Fold attached documents into the message text
+                                    // (see chat::message_attachments). An unknown id
+                                    // is refused, never silently dropped.
+                                    let typed = content.clone();
+                                    let content = match crate::refs::compose::compose_user_message(
+                                        &state.orchestrator.neo4j_arc(),
+                                        &content,
+                                        &refs,
+                                        &attachments,
+                                        chat_manager.refs_v1_enabled(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            let err = serde_json::to_string(&e.to_ws_event()).unwrap_or_default();
+                                            let _ = ws_sender.send(Message::Text(err.into())).await;
                                             continue;
                                         }
-                                    }
-                                    if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
-                                        snapshot_fingerprints.clear();
-                                    }
-                                }
+                                    };
+                                    // T4.3: Extract code entities and create DISCUSSED relations
+                                    // (non-blocking) — only for an accepted message.
+                                    spawn_entity_extraction(&state, &session_id, &typed);
+                                    let result = if queue {
+                                        chat_manager
+                                            .route_queued_user_message(&session_id, &content, Some(&claims))
+                                            .await
+                                    } else {
+                                        chat_manager
+                                            .route_user_message(&session_id, &content, Some(&claims))
+                                            .await
+                                    };
 
-                                if !send_chat_event!(chat_event, ws_sender) {
-                                    debug!("WebSocket send failed (NATS event), client disconnected");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to deserialize NATS ChatEvent: {}", e);
-                            }
-                        }
-                    }
-                    None => {
-                        // NATS subscriber closed
-                        debug!(session_id = %session_id, "NATS chat subscriber closed");
-                        nats_chat_sub = None;
-                    }
-                }
-            }
-
-            // Send periodic pings to detect dead clients, and — while a turn is
-            // running — one frame that refreshes the client's liveness clock.
-            //
-            // A ping never reaches JavaScript: the page answers it below the
-            // socket API. So for the client, a turn that has nothing to say is
-            // indistinguishable from a dead link, and its own stall watchdog
-            // (60 s of silence on a streaming session, front
-            // `chatWebSocket.ts`) reconnects the socket. On a native harness that
-            // is every few minutes: measured 18/11/2026 on a deepseek
-            // conversation, the parent said nothing for 659 s then 273 s while a
-            // delegated sub-agent worked, and the page reconnected eight times in
-            // eleven minutes, each time replaying the whole mid-stream snapshot —
-            // the thread sat on "…" throughout.
-            //
-            // Saying the truth costs one small frame per beat: the turn IS
-            // streaming, which is exactly what `streaming_status` means. It is a
-            // transient event (never persisted, never in the snapshot), and the
-            // client's handler for it is idempotent.
-            // One door out for a dead socket, not two: the beat stays alive only
-            // if every frame it writes lands. Splitting it in two branches would
-            // add a second `break` that no test can reach deterministically (a
-            // client that goes away is seen by the read arm first), i.e. a line
-            // nobody can ever prove.
-            _ = ping_interval.tick() => {
-                let mut alive = ws_sender.send(Message::Ping(vec![].into())).await.is_ok();
-                if alive && chat_manager.is_session_streaming(&session_id).await {
-                    let keepalive = serde_json::json!({
-                        "type": "streaming_status",
-                        "is_streaming": true,
-                    });
-                    alive = ws_sender
-                        .send(Message::Text(keepalive.to_string().into()))
-                        .await
-                        .is_ok();
-                }
-                if !alive {
-                    debug!("Ping failed, client disconnected");
-                    break;
-                }
-            }
-
-            // Handle incoming messages from the client
-            msg = ws_receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        let text_str: &str = &text;
-                        match serde_json::from_str::<WsChatClientMessage>(text_str) {
-                            Ok(client_msg) => {
-                                // A read-only mirror of a Claude Code sub-agent (P18c) takes nothing
-                                // that writes to it: refused with its own flat frame, before any
-                                // send, resume, proxy or answer is attempted.
-                                if writes_to_session(&client_msg)
-                                    && chat_manager.refuse_if_mirror(&session_id).await.is_err()
-                                {
-                                    let _ = ws_sender
-                                        .send(Message::Text(mirror_read_only_frame().to_string().into()))
-                                        .await;
-                                    continue;
-                                }
-                                match client_msg {
-                                    WsChatClientMessage::UserMessage { content, attachments, queue, refs } => {
-                                        debug!(session_id = %session_id, queue, "WS: Received user_message");
-
-                                        // Same routing as POST /api/chat/sessions/{id}/messages:
-                                        // local → remote (NATS RPC) → resume_session.
-                                        // Fold attached documents into the message text
-                                        // (see chat::message_attachments). An unknown id
-                                        // is refused, never silently dropped.
-                                        let typed = content.clone();
-                                        let content = match crate::refs::compose::compose_user_message(
-                                            &state.orchestrator.neo4j_arc(),
-                                            &content,
-                                            &refs,
-                                            &attachments,
-                                            chat_manager.refs_v1_enabled(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(c) => c,
-                                            Err(e) => {
-                                                let err = serde_json::to_string(&e.to_ws_event()).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(err.into())).await;
-                                                continue;
+                                    // A message proxied to a remote instance: make sure we
+                                    // have a NATS subscription to receive the stream.
+                                    if matches!(result, Ok(DeliveryRoute::Remote)) && nats_chat_sub.is_none() {
+                                        if let Some(ref nats) = state.nats_emitter {
+                                            if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
+                                                debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
+                                                nats_chat_sub = Some(sub);
                                             }
-                                        };
-                                        // T4.3: Extract code entities and create DISCUSSED relations
-                                        // (non-blocking) — only for an accepted message.
-                                        spawn_entity_extraction(&state, &session_id, &typed);
-                                        let result = if queue {
-                                            chat_manager
-                                                .route_queued_user_message(&session_id, &content, Some(&claims))
-                                                .await
-                                        } else {
-                                            chat_manager
-                                                .route_user_message(&session_id, &content, Some(&claims))
-                                                .await
-                                        };
+                                        }
+                                    }
 
-                                        // A message proxied to a remote instance: make sure we
-                                        // have a NATS subscription to receive the stream.
-                                        if matches!(result, Ok(DeliveryRoute::Remote)) && nats_chat_sub.is_none() {
-                                            if let Some(ref nats) = state.nats_emitter {
-                                                if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
-                                                    debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
-                                                    nats_chat_sub = Some(sub);
+                                    match result {
+                                        Ok(DeliveryRoute::ResumedAfterSendFailure) => {
+                                            // Resume succeeded — subscribe to the new broadcast channel
+                                            // (the old one is dead since the CLI was replaced)
+                                            match chat_manager.subscribe(&session_id).await {
+                                                Ok(rx) => {
+                                                    event_rx = Some(rx);
+                                                    if nats_chat_sub.is_some() {
+                                                        debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
+                                                        nats_chat_sub = None;
+                                                    }
+                                                    info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
+                                                }
+                                                Err(sub_err) => {
+                                                    debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
                                                 }
                                             }
                                         }
-
-                                        match result {
-                                            Ok(DeliveryRoute::ResumedAfterSendFailure) => {
-                                                // Resume succeeded — subscribe to the new broadcast channel
-                                                // (the old one is dead since the CLI was replaced)
+                                        Ok(_) => {
+                                            // If we did a local send/resume and don't have broadcast, subscribe now
+                                            if event_rx.is_none() {
                                                 match chat_manager.subscribe(&session_id).await {
                                                     Ok(rx) => {
                                                         event_rx = Some(rx);
+                                                        // Now that we have local broadcast, drop the NATS
+                                                        // subscription to avoid receiving every event twice.
                                                         if nats_chat_sub.is_some() {
-                                                            debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
+                                                            debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active");
                                                             nats_chat_sub = None;
                                                         }
-                                                        info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
+                                                        debug!(session_id = %session_id, "Subscribed to broadcast after first message");
                                                     }
-                                                    Err(sub_err) => {
-                                                        debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
-                                                    }
-                                                }
-                                            }
-                                            Ok(_) => {
-                                                // If we did a local send/resume and don't have broadcast, subscribe now
-                                                if event_rx.is_none() {
-                                                    match chat_manager.subscribe(&session_id).await {
-                                                        Ok(rx) => {
-                                                            event_rx = Some(rx);
-                                                            // Now that we have local broadcast, drop the NATS
-                                                            // subscription to avoid receiving every event twice.
-                                                            if nats_chat_sub.is_some() {
-                                                                debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active");
-                                                                nats_chat_sub = None;
-                                                            }
-                                                            debug!(session_id = %session_id, "Subscribed to broadcast after first message");
-                                                        }
-                                                        Err(e) => {
-                                                            // May fail if message was proxied remotely (no local session)
-                                                            debug!(session_id = %session_id, error = %e, "No local broadcast (session may be remote)");
-                                                        }
+                                                    Err(e) => {
+                                                        // May fail if message was proxied remotely (no local session)
+                                                        debug!(session_id = %session_id, error = %e, "No local broadcast (session may be remote)");
                                                     }
                                                 }
                                             }
-                                            Err(MessageDeliveryError::SendAndResume { send, resume }) => {
-                                                // Both send_message and resume_session failed — show error
-                                                error!(
-                                                    session_id = %session_id,
-                                                    send_error = %send,
-                                                    resume_error = %resume,
-                                                    "Both send_message and resume_session failed"
-                                                );
-                                                let err = delivery_error_frame(&MessageDeliveryError::SendAndResume { send, resume });
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                            }
-                                            Err(MessageDeliveryError::MirrorReadOnly) => {
-                                                // A read-only mirror of a Claude Code sub-agent
-                                                // (P18c): nothing was sent.
-                                                let err = delivery_error_frame(&MessageDeliveryError::MirrorReadOnly);
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                            }
-                                            Err(MessageDeliveryError::Resume(e)) => {
-                                                // resume_session itself failed — don't retry it again.
-                                                error!(
-                                                    session_id = %session_id,
-                                                    error = %e,
-                                                    "resume_session failed"
-                                                );
-                                                let err = delivery_error_frame(&MessageDeliveryError::Resume(e));
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                            }
                                         }
-                                    }
-
-                                    WsChatClientMessage::Interrupt => {
-                                        debug!(session_id = %session_id, "WS: Received interrupt");
-                                        if let Err(e) = chat_manager.interrupt(&session_id).await {
-                                            warn!(session_id = %session_id, error = %e, "Failed to interrupt");
-                                        }
-                                    }
-
-                                    WsChatClientMessage::QueueOp { op } => {
-                                        debug!(session_id = %session_id, ?op, "WS: Received queue_op");
-                                        // The new list comes back as a `pending_queue`
-                                        // event to every client. Only a session nobody
-                                        // holds any more needs an answer here: there
-                                        // is no queue, so the client must show none.
-                                        let reached = match chat_manager.pending_queue_op(&session_id, &op).await {
-                                            Ok(reached) => reached,
-                                            Err(e) => {
-                                                warn!(session_id = %session_id, error = %e, "WS: queue_op failed");
-                                                false
-                                            }
-                                        };
-                                        if !reached {
-                                            let empty = serde_json::json!({ "type": "pending_queue", "messages": [] });
-                                            let _ = ws_sender.send(Message::Text(empty.to_string().into())).await;
-                                        }
-                                    }
-
-                                    WsChatClientMessage::CancelTools => {
-                                        debug!(session_id = %session_id, "WS: Received cancel_tools");
-                                        // T4 of plan 28e9afe3 — kills running
-                                        // tool subprocess(es) without ending the
-                                        // turn. Broadcast of ChatEvent::ToolsCancelled
-                                        // happens inside cancel_running_tools so
-                                        // multi-tab clients see the cancel.
-                                        // Spawned (review N3): a cancel relayed to another
-                                        // instance may take up to its timeout, and this loop
-                                        // forwards the session's events meanwhile. A failure
-                                        // the client was not already told of comes back as a
-                                        // typed `error { code: cancel_failed, reason }` frame.
-                                        let (manager, sid, tx) = (
-                                            std::sync::Arc::clone(chat_manager),
-                                            session_id.clone(),
-                                            ctl_tx.clone(),
-                                        );
-                                        tokio::spawn(async move {
-                                            match manager.cancel_running_tools(&sid).await {
-                                                Ok(result) => {
-                                                    debug!(
-                                                        session_id = %sid,
-                                                        killed = result.killed_pids.len(),
-                                                        capped = result.capped,
-                                                        "WS: cancel_tools done"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
-                                                    if let Some(frame) = crate::chat::cancel_relay::ws_error_event(&e)
-                                                        .and_then(|event| control_frame(&event))
-                                                    {
-                                                        let _ = tx.send(frame);
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-
-                                    WsChatClientMessage::PermissionResponse { id, allow, scope } => {
-                                        let request_id = id.clone().unwrap_or_default();
-                                        let decision = if allow { "allow" } else { "deny" };
-
-                                        // Only the person the session belongs to answers it, as on REST
-                                        // (review #679 finding 6).
-                                        let refused = match may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
-                                            Err(why) => Some(why),
-                                            Ok(()) => lasting_answer_refused(&claims, allow, scope),
-                                        };
-                                        if let Some(why) = refused {
-                                            warn!(session_id = %session_id, request_id = %request_id, reason = why.reason(), "permission response refused before delivery");
-                                            let err = permission_forbidden_frame(&request_id, why);
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                            continue;
-                                        }
-
-                                        // Dedup: ignore duplicate responses (double-click protection)
-                                        if !request_id.is_empty() && !responded_permission_ids.insert(request_id.clone()) {
-                                            warn!(
+                                        Err(MessageDeliveryError::SendAndResume { send, resume }) => {
+                                            // Both send_message and resume_session failed — show error
+                                            error!(
                                                 session_id = %session_id,
-                                                request_id = %request_id,
-                                                decision,
-                                                "Duplicate permission response ignored"
+                                                send_error = %send,
+                                                resume_error = %resume,
+                                                "Both send_message and resume_session failed"
                                             );
-                                            continue;
+                                            let err = delivery_error_frame(&MessageDeliveryError::SendAndResume { send, resume });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                         }
+                                        Err(MessageDeliveryError::MirrorReadOnly) => {
+                                            // A read-only mirror of a Claude Code sub-agent
+                                            // (P18c): nothing was sent.
+                                            let err = delivery_error_frame(&MessageDeliveryError::MirrorReadOnly);
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                        Err(MessageDeliveryError::Resume(e)) => {
+                                            // resume_session itself failed — don't retry it again.
+                                            error!(
+                                                session_id = %session_id,
+                                                error = %e,
+                                                "resume_session failed"
+                                            );
+                                            let err = delivery_error_frame(&MessageDeliveryError::Resume(e));
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                    }
+                                }
 
-                                        // Determine routing: local or remote
-                                        let is_local = chat_manager.is_session_active(&session_id).await;
-                                        let routing = if is_local { "local" } else { "nats" };
+                                WsChatClientMessage::Interrupt => {
+                                    debug!(session_id = %session_id, "WS: Received interrupt");
+                                    if let Err(e) = chat_manager.interrupt(&session_id).await {
+                                        warn!(session_id = %session_id, error = %e, "Failed to interrupt");
+                                    }
+                                }
 
-                                        info!(
+                                WsChatClientMessage::QueueOp { op } => {
+                                    debug!(session_id = %session_id, ?op, "WS: Received queue_op");
+                                    // The new list comes back as a `pending_queue`
+                                    // event to every client. Only a session nobody
+                                    // holds any more needs an answer here: there
+                                    // is no queue, so the client must show none.
+                                    let reached = match chat_manager.pending_queue_op(&session_id, &op).await {
+                                        Ok(reached) => reached,
+                                        Err(e) => {
+                                            warn!(session_id = %session_id, error = %e, "WS: queue_op failed");
+                                            false
+                                        }
+                                    };
+                                    if !reached {
+                                        let empty = serde_json::json!({ "type": "pending_queue", "messages": [] });
+                                        let _ = ws_sender.send(Message::Text(empty.to_string().into())).await;
+                                    }
+                                }
+
+                                WsChatClientMessage::CancelTools => {
+                                    debug!(session_id = %session_id, "WS: Received cancel_tools");
+                                    // T4 of plan 28e9afe3 — kills running
+                                    // tool subprocess(es) without ending the
+                                    // turn. Broadcast of ChatEvent::ToolsCancelled
+                                    // happens inside cancel_running_tools so
+                                    // multi-tab clients see the cancel.
+                                    // Spawned (review N3): a cancel relayed to another
+                                    // instance may take up to its timeout, and this loop
+                                    // forwards the session's events meanwhile. A failure
+                                    // the client was not already told of comes back as a
+                                    // typed `error { code: cancel_failed, reason }` frame.
+                                    let (manager, sid, tx) = (
+                                        std::sync::Arc::clone(chat_manager),
+                                        session_id.clone(),
+                                        ctl_tx.clone(),
+                                    );
+                                    tokio::spawn(async move {
+                                        match manager.cancel_running_tools(&sid).await {
+                                            Ok(result) => {
+                                                debug!(
+                                                    session_id = %sid,
+                                                    killed = result.killed_pids.len(),
+                                                    capped = result.capped,
+                                                    "WS: cancel_tools done"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
+                                                if let Some(frame) = crate::chat::cancel_relay::ws_error_event(&e)
+                                                    .and_then(|event| control_frame(&event))
+                                                {
+                                                    let _ = tx.send(frame);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+
+                                WsChatClientMessage::PermissionResponse { id, allow, scope } => {
+                                    let request_id = id.clone().unwrap_or_default();
+                                    let decision = if allow { "allow" } else { "deny" };
+
+                                    // Only the person the session belongs to answers it, as on REST
+                                    // (review #679 finding 6).
+                                    let refused = match may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                        Err(why) => Some(why),
+                                        Ok(()) => lasting_answer_refused(&claims, allow, scope),
+                                    };
+                                    if let Some(why) = refused {
+                                        warn!(session_id = %session_id, request_id = %request_id, reason = why.reason(), "permission response refused before delivery");
+                                        let err = permission_forbidden_frame(&request_id, why);
+                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        continue;
+                                    }
+
+                                    // Dedup: ignore duplicate responses (double-click protection)
+                                    if !request_id.is_empty() && !responded_permission_ids.insert(request_id.clone()) {
+                                        warn!(
                                             session_id = %session_id,
                                             request_id = %request_id,
                                             decision,
-                                            scope = scope.as_str(),
-                                            routing,
-                                            "Permission decision"
+                                            "Duplicate permission response ignored"
                                         );
-
-                                        // Send control protocol response to CLI subprocess.
-                                        // Unlike user messages, permission responses use the SDK
-                                        // control protocol (JSON: {"allow": true/false}) and must
-                                        // NOT be persisted or broadcast as user_message events.
-                                        // Same routing as POST .../permissions/{request_id}.
-                                        let send_result =
-                                            answer_permission_frame(chat_manager, &session_id, &request_id, allow, scope).await;
-                                        if let Err(crate::chat::manager::PermissionDeliveryError::ScopeUnsupported(scope)) = &send_result {
-                                            // Refused, not answered: the request still waits, the same
-                                            // id may be answered again (with a scope the session offers).
-                                            responded_permission_ids.remove(&request_id);
-                                            let err = scope_unsupported_frame(&request_id, *scope);
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                        } else if let Err(e) = send_result {
-                                            warn!(
-                                                session_id = %session_id,
-                                                request_id = %request_id,
-                                                decision,
-                                                routing,
-                                                error = %e,
-                                                "Failed to send permission response"
-                                            );
-                                        }
+                                        continue;
                                     }
 
-                                    WsChatClientMessage::InputResponse { content, .. } => {
-                                        debug!(session_id = %session_id, "WS: Received input_response");
-                                        // Try local → remote → error (no resume for responses)
-                                        // Not a composed message: no block may ride on it.
-                                        let content = crate::refs::compose::inert(&content);
-                                        let send_result = if chat_manager.is_session_active(&session_id).await {
-                                            chat_manager.send_message(&session_id, &content).await
-                                        } else if chat_manager
-                                            .try_remote_send(&session_id, &content, "input_response")
-                                            .await
-                                            .unwrap_or(false)
-                                        {
-                                            Ok(())
-                                        } else {
-                                            Err(anyhow::anyhow!("Session not active on any instance"))
-                                        };
-                                        if let Err(e) = send_result {
-                                            warn!(session_id = %session_id, error = %e, "Failed to send input response");
-                                        }
-                                    }
+                                    // Determine routing: local or remote
+                                    let is_local = chat_manager.is_session_active(&session_id).await;
+                                    let routing = if is_local { "local" } else { "nats" };
 
-                                    WsChatClientMessage::SetPermissionMode { mode } => {
-                                        info!(session_id = %session_id, mode = %mode, "WS: Received set_permission_mode");
-                                        // The session's owner only (or anyone on a session without
-                                        // one), like the answers to its permission requests. Fails
-                                        // closed when the owner cannot be read.
-                                        if let Err(refusal) = may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
-                                            warn!(session_id = %session_id, reason = refusal.reason(), "set_permission_mode refused: not the session's owner");
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": format!("Permission mode not changed: {}", refusal.reason()),
-                                            });
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                        } else if chat_manager.is_session_active(&session_id).await {
-                                            match chat_manager.set_session_permission_mode(&session_id, &mode).await {
-                                                Ok(()) => {
-                                                    // A PERSON putting their session in trust lifts its
-                                                    // file scope (decision fce98b8a); anyone else
-                                                    // changes the mode only.
-                                                    let owner = match session_id.parse::<uuid::Uuid>() {
-                                                        Ok(id) => state.orchestrator.neo4j().get_chat_session(id).await.ok().flatten().and_then(|node| node.owner),
-                                                        Err(_) => None,
-                                                    };
-                                                    if lifts_file_scope_on_switch(&claims, &mode, owner.as_deref()) {
-                                                        chat_manager.lift_file_scope(&session_id).await;
-                                                    }
-                                                    // Send confirmation back to frontend
-                                                    let confirmation = serde_json::json!({
-                                                        "type": "permission_mode_changed",
-                                                        "mode": mode,
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                    info!(
+                                        session_id = %session_id,
+                                        request_id = %request_id,
+                                        decision,
+                                        scope = scope.as_str(),
+                                        routing,
+                                        "Permission decision"
+                                    );
+
+                                    // Send control protocol response to CLI subprocess.
+                                    // Unlike user messages, permission responses use the SDK
+                                    // control protocol (JSON: {"allow": true/false}) and must
+                                    // NOT be persisted or broadcast as user_message events.
+                                    // Same routing as POST .../permissions/{request_id}.
+                                    let send_result =
+                                        answer_permission_frame(chat_manager, &session_id, &request_id, allow, scope).await;
+                                    if let Err(crate::chat::manager::PermissionDeliveryError::ScopeUnsupported(scope)) = &send_result {
+                                        // Refused, not answered: the request still waits, the same
+                                        // id may be answered again (with a scope the session offers).
+                                        responded_permission_ids.remove(&request_id);
+                                        let err = scope_unsupported_frame(&request_id, *scope);
+                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                    } else if let Err(e) = send_result {
+                                        warn!(
+                                            session_id = %session_id,
+                                            request_id = %request_id,
+                                            decision,
+                                            routing,
+                                            error = %e,
+                                            "Failed to send permission response"
+                                        );
+                                    }
+                                }
+
+                                WsChatClientMessage::InputResponse { content, .. } => {
+                                    debug!(session_id = %session_id, "WS: Received input_response");
+                                    // Try local → remote → error (no resume for responses)
+                                    // Not a composed message: no block may ride on it.
+                                    let content = crate::refs::compose::inert(&content);
+                                    let send_result = if chat_manager.is_session_active(&session_id).await {
+                                        chat_manager.send_message(&session_id, &content).await
+                                    } else if chat_manager
+                                        .try_remote_send(&session_id, &content, "input_response")
+                                        .await
+                                        .unwrap_or(false)
+                                    {
+                                        Ok(())
+                                    } else {
+                                        Err(anyhow::anyhow!("Session not active on any instance"))
+                                    };
+                                    if let Err(e) = send_result {
+                                        warn!(session_id = %session_id, error = %e, "Failed to send input response");
+                                    }
+                                }
+
+                                WsChatClientMessage::SetPermissionMode { mode } => {
+                                    info!(session_id = %session_id, mode = %mode, "WS: Received set_permission_mode");
+                                    // The session's owner only (or anyone on a session without
+                                    // one), like the answers to its permission requests. Fails
+                                    // closed when the owner cannot be read.
+                                    if let Err(refusal) = may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                        warn!(session_id = %session_id, reason = refusal.reason(), "set_permission_mode refused: not the session's owner");
+                                        let err = serde_json::json!({
+                                            "type": "error",
+                                            "message": format!("Permission mode not changed: {}", refusal.reason()),
+                                        });
+                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                    } else if chat_manager.is_session_active(&session_id).await {
+                                        match chat_manager.set_session_permission_mode(&session_id, &mode).await {
+                                            Ok(()) => {
+                                                // A PERSON putting their session in trust lifts its
+                                                // file scope (decision fce98b8a); anyone else
+                                                // changes the mode only.
+                                                let owner = match session_id.parse::<uuid::Uuid>() {
+                                                    Ok(id) => state.orchestrator.neo4j().get_chat_session(id).await.ok().flatten().and_then(|node| node.owner),
+                                                    Err(_) => None,
+                                                };
+                                                if lifts_file_scope_on_switch(&claims, &mode, owner.as_deref()) {
+                                                    chat_manager.lift_file_scope(&session_id).await;
                                                 }
-                                                Err(e) => {
-                                                    warn!(session_id = %session_id, error = %e, "Failed to set permission mode");
-                                                    let err = serde_json::json!({
-                                                        "type": "error",
-                                                        "message": format!("Failed to set permission mode: {}", e),
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                                }
-                                            }
-                                        } else {
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": "Session not active on this instance",
-                                            });
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                        }
-                                    }
-
-                                    WsChatClientMessage::SetModel { model } => {
-                                        info!(session_id = %session_id, model = %model, "WS: Received set_model");
-                                        // set_model works whether the session is active or dormant:
-                                        // - Active: sends a live control_request to switch mid-conversation.
-                                        // - Dormant (idle-cleaned): persists to Neo4j so the next resume/spawn
-                                        //   launches with the chosen model.
-                                        // Previously this was gated on is_session_active, so selecting a model
-                                        // on an idle session was silently rejected and the respawn used the
-                                        // create-time model. set_session_model now handles both cases.
-                                        match chat_manager.set_session_model(&session_id, &model).await {
-                                            // The session broadcast `model_changed` to all its clients,
-                                            // this one included: confirming here too made the asking
-                                            // device show "Model changed" twice.
-                                            Ok(true) => {}
-                                            // Dormant session: nobody is subscribed, so nothing was
-                                            // broadcast — confirm to the asker alone.
-                                            Ok(false) => {
+                                                // Send confirmation back to frontend
                                                 let confirmation = serde_json::json!({
-                                                    "type": "model_changed",
-                                                    "model": model,
+                                                    "type": "permission_mode_changed",
+                                                    "mode": mode,
                                                 });
                                                 let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
                                             }
                                             Err(e) => {
-                                                warn!(session_id = %session_id, error = %e, "Failed to set model");
+                                                warn!(session_id = %session_id, error = %e, "Failed to set permission mode");
                                                 let err = serde_json::json!({
                                                     "type": "error",
-                                                    "message": format!("Failed to set model: {}", e),
+                                                    "message": format!("Failed to set permission mode: {}", e),
                                                 });
                                                 let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
                                         }
-                                    }
-
-                                    WsChatClientMessage::SetAutoContinue { enabled } => {
-                                        // Accepted and ignored, for older frontends: auto-continue is
-                                        // always on, capped (decision 7b95342a). The answer is the
-                                        // session's real state, so an old toggle snaps back to it.
-                                        debug!(session_id = %session_id, enabled = %enabled, "WS: set_auto_continue ignored (always on)");
-                                        let state = chat_manager.get_auto_continue_state(&session_id).await.unwrap_or(true);
-                                        let _ = ws_sender.send(Message::Text(auto_continue_state_frame(&session_id, state).to_string().into())).await;
+                                    } else {
+                                        let err = serde_json::json!({
+                                            "type": "error",
+                                            "message": "Session not active on this instance",
+                                        });
+                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(session_id = %session_id, error = %e, text = %text, "Failed to parse client message");
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": format!("Invalid message format: {}", e),
-                                });
-                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+
+                                WsChatClientMessage::SetModel { model } => {
+                                    info!(session_id = %session_id, model = %model, "WS: Received set_model");
+                                    // set_model works whether the session is active or dormant:
+                                    // - Active: sends a live control_request to switch mid-conversation.
+                                    // - Dormant (idle-cleaned): persists to Neo4j so the next resume/spawn
+                                    //   launches with the chosen model.
+                                    // Previously this was gated on is_session_active, so selecting a model
+                                    // on an idle session was silently rejected and the respawn used the
+                                    // create-time model. set_session_model now handles both cases.
+                                    match chat_manager.set_session_model(&session_id, &model).await {
+                                        // The session broadcast `model_changed` to all its clients,
+                                        // this one included: confirming here too made the asking
+                                        // device show "Model changed" twice.
+                                        Ok(true) => {}
+                                        // Dormant session: nobody is subscribed, so nothing was
+                                        // broadcast — confirm to the asker alone.
+                                        Ok(false) => {
+                                            let confirmation = serde_json::json!({
+                                                "type": "model_changed",
+                                                "model": model,
+                                            });
+                                            let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                        }
+                                        Err(e) => {
+                                            warn!(session_id = %session_id, error = %e, "Failed to set model");
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": format!("Failed to set model: {}", e),
+                                            });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                    }
+                                }
+
+                                WsChatClientMessage::SetAutoContinue { enabled } => {
+                                    // Accepted and ignored, for older frontends: auto-continue is
+                                    // always on, capped (decision 7b95342a). The answer is the
+                                    // session's real state, so an old toggle snaps back to it.
+                                    debug!(session_id = %session_id, enabled = %enabled, "WS: set_auto_continue ignored (always on)");
+                                    let state = chat_manager.get_auto_continue_state(&session_id).await.unwrap_or(true);
+                                    let _ = ws_sender.send(Message::Text(auto_continue_state_frame(&session_id, state).to_string().into())).await;
+                                }
                             }
                         }
+                        Err(e) => {
+                            warn!(session_id = %session_id, error = %e, text = %text, "Failed to parse client message");
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": format!("Invalid message format: {}", e),
+                            });
+                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                        }
                     }
+                }
 
-                    Some(Ok(Message::Pong(_))) => {
-                        // Client is alive
-                    }
+                Some(Ok(Message::Pong(payload))) => {
+                    liveness.on_pong(&payload);
+                }
 
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!(session_id = %session_id, "Chat WebSocket client disconnected");
-                        break;
-                    }
+                Some(Ok(Message::Close(_))) | None => {
+                    debug!(session_id = %session_id, "Chat WebSocket client disconnected");
+                    break;
+                }
 
-                    Some(Err(e)) => {
-                        debug!(session_id = %session_id, error = %e, "Chat WebSocket error");
-                        break;
-                    }
+                Some(Err(e)) => {
+                    debug!(session_id = %session_id, error = %e, "Chat WebSocket error");
+                    break;
+                }
 
-                    _ => {
-                        // Ignore binary, ping from client
-                    }
+                _ => {
+                    // Ignore binary, ping from client
                 }
             }
         }
+
+        // Send periodic pings to detect dead clients, and — while a turn is
+        // running — one frame that refreshes the client's liveness clock.
+        //
+        // A ping never reaches JavaScript: the page answers it below the
+        // socket API. So for the client, a turn that has nothing to say is
+        // indistinguishable from a dead link, and its own stall watchdog
+        // (60 s of silence on a streaming session, front
+        // `chatWebSocket.ts`) reconnects the socket. On a native harness that
+        // is every few minutes: measured 18/11/2026 on a deepseek
+        // conversation, the parent said nothing for 659 s then 273 s while a
+        // delegated sub-agent worked, and the page reconnected eight times in
+        // eleven minutes, each time replaying the whole mid-stream snapshot —
+        // the thread sat on "…" throughout.
+        //
+        // Saying the truth costs one small frame per beat: the turn IS
+        // streaming, which is exactly what `streaming_status` means. It is a
+        // transient event (never persisted, never in the snapshot), and the
+        // client's handler for it is idempotent.
+        // One door out for a dead socket, not two: the beat stays alive only
+        // if every frame it writes lands. Splitting it in two branches would
+        // add a second `break` that no test can reach deterministically (a
+        // client that goes away is seen by the read arm first), i.e. a line
+        // nobody can ever prove.
+        _ = ping_interval.tick() => {
+            let mut alive = super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "chat").await;
+            if alive && chat_manager.is_session_streaming(&session_id).await {
+                let keepalive = serde_json::json!({
+                    "type": "streaming_status",
+                    "is_streaming": true,
+                });
+                alive = ws_sender
+                    .send(Message::Text(keepalive.to_string().into()))
+                    .await
+                    .is_ok();
+            }
+            if !alive {
+                debug!("Ping failed, client disconnected");
+                break;
+            }
+        }
+        Some(frame) = ctl_rx.recv() => {
+            if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                debug!("WebSocket send failed (control frame), client disconnected");
+                break;
+            }
+        }
+
+        // Forward local broadcast events to the WebSocket client
+        event = async {
+            match &mut event_rx {
+                Some(rx) => rx.recv().await,
+                None => {
+                    // No subscription yet — wait forever (other branches will fire)
+                    std::future::pending().await
+                }
+            }
+        } => {
+            match event {
+                Ok(chat_event) => {
+                    // --- Snapshot dedup (local broadcast) ---
+                    // After a mid-stream join, events from the micro-window between
+                    // subscribe and snapshot may be duplicates. We dedup by fingerprint.
+                    // StreamDelta/StreamingStatus have no fingerprint and always pass.
+                    if !snapshot_fingerprints.is_empty() {
+                        if let Some(fp) = chat_event.fingerprint() {
+                            if snapshot_fingerprints.remove(&fp) {
+                                debug!(
+                                    event_type = %chat_event.event_type(),
+                                    fingerprint = %fp,
+                                    remaining = snapshot_fingerprints.len(),
+                                    "Skipping broadcast event (duplicate of snapshot)"
+                                );
+                                continue;
+                            }
+                        }
+                        // Result event clears all remaining fingerprints (end of stream)
+                        if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
+                            snapshot_fingerprints.clear();
+                        }
+                    }
+                    if !send_chat_event!(chat_event, ws_sender) {
+                        debug!("WebSocket send failed, client disconnected");
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "Chat WS client lagged, some events missed");
+                    // Client may want to do a full replay — send a hint
+                    let hint = serde_json::json!({
+                        "type": "events_lagged",
+                        "skipped": n,
+                    });
+                    let _ = ws_sender.send(Message::Text(hint.to_string().into())).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // CLI subprocess was cleaned up (idle timeout) but the WebSocket
+                    // should stay alive. Transition to dormant: disable the broadcast
+                    // branch and let ping/pong + client messages keep running.
+                    // When the user sends a new message, resume_session() will spawn
+                    // a fresh CLI and the existing `if event_rx.is_none() { subscribe() }`
+                    // logic (below) will re-subscribe automatically.
+                    debug!(session_id = %session_id, "Chat broadcast closed (idle cleanup), going dormant");
+                    event_rx = None;
+                    snapshot_fingerprints.clear();
+                    let msg = serde_json::json!({
+                        "type": "session_dormant",
+                        "message": "CLI session cleaned up (idle timeout). Will resume on next message."
+                    });
+                    let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
+                }
+            }
+        }
+
+        // Forward NATS chat events to the WebSocket client (cross-instance)
+        nats_msg = async {
+            match &mut nats_chat_sub {
+                Some(sub) => sub.next().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            match nats_msg {
+                Some(msg) => {
+                    match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
+                        Ok(chat_event) => {
+                            // --- Cross-instance dedup ---
+                            // Dedup by fingerprint, same logic as local broadcast.
+                            if !snapshot_fingerprints.is_empty() {
+                                if let Some(fp) = chat_event.fingerprint() {
+                                    if snapshot_fingerprints.remove(&fp) {
+                                        debug!(
+                                            event_type = %chat_event.event_type(),
+                                            fingerprint = %fp,
+                                            remaining = snapshot_fingerprints.len(),
+                                            "Skipping NATS event (duplicate of snapshot)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
+                                    snapshot_fingerprints.clear();
+                                }
+                            }
+
+                            if !send_chat_event!(chat_event, ws_sender) {
+                                debug!("WebSocket send failed (NATS event), client disconnected");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize NATS ChatEvent: {}", e);
+                        }
+                    }
+                }
+                None => {
+                    // NATS subscriber closed
+                    debug!(session_id = %session_id, "NATS chat subscriber closed");
+                    nats_chat_sub = None;
+                }
+            }
+        }}
     }
 
     info!(session_id = %session_id, "Chat WebSocket connection closed");

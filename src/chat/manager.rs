@@ -21441,6 +21441,7 @@ pub(crate) mod test_support {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+            objective_baseline: Default::default(),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,

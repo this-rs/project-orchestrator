@@ -820,7 +820,10 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    /// Delete a plan and its tasks, steps and constraints. Its tasks' decisions
+    /// are NOT destroyed (same rule as `delete_task`, issue #1189): they are
+    /// detached (the `INFORMED_BY` edge goes, the decision and its AFFECTS stay)
+    /// and, when the plan belongs to a project, kept in it by `HAS_DECISION`.
     pub async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
         // Delete all steps belonging to tasks of this plan
         let q = query(
@@ -832,11 +835,17 @@ impl Neo4jClient {
         .param("id", plan_id.to_string());
         self.graph.run(q).await?;
 
-        // Delete all decisions belonging to tasks of this plan
+        // Detach (not delete) the decisions of this plan's tasks. The project
+        // edge is written first, in the same statement, so they stay in the
+        // project's scope; a plan with no project leaves them with no project.
         let q = query(
             r#"
-            MATCH (p:Plan {id: $id})-[:HAS_TASK]->(t:Task)-[:INFORMED_BY]->(d:Decision)
-            DETACH DELETE d
+            MATCH (p:Plan {id: $id})-[:HAS_TASK]->(:Task)-[r:INFORMED_BY]->(d:Decision)
+            OPTIONAL MATCH (proj:Project)-[:HAS_PLAN]->(p)
+            WITH r, d, collect(DISTINCT proj) AS projects
+            FOREACH (pr IN projects | MERGE (pr)-[:HAS_DECISION]->(d))
+            WITH collect(r) AS links
+            FOREACH (r IN links | DELETE r)
             "#,
         )
         .param("id", plan_id.to_string());

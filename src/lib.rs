@@ -23,6 +23,8 @@ pub mod embeddings;
 pub mod episodes;
 pub mod evaluation;
 pub mod events;
+#[cfg(unix)]
+pub mod fd_guard;
 pub mod feedback;
 pub mod graph;
 pub mod heartbeat;
@@ -1600,6 +1602,18 @@ fn report_canonical_path_repair(result: Result<(usize, usize)>) {
 pub async fn start_server(mut config: Config) -> Result<()> {
     use std::net::SocketAddr;
 
+    // First of all: lift the soft RLIMIT_NOFILE (a launchd job inherits 256),
+    // before anything opens a socket or a file. Never fatal, never silent.
+    #[cfg(unix)]
+    let nofile = {
+        // Hold /dev/fd open from the start: measuring must not need a free descriptor.
+        fd_guard::init_fd_meter();
+        let report = fd_guard::raise_nofile_limit_and_log();
+        // After the limit is lifted, so the line describes the final state.
+        fd_guard::log_meter_at_startup();
+        report
+    };
+
     // ────────────────────────────────────────────────────────────────────
     // Setup-only mode: if the wizard hasn't been completed yet, start a
     // minimal server that only serves /health and /api/setup-status.
@@ -2932,6 +2946,39 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     tracing::info!("Server listening on {}", addr);
     boot.done("listening");
     boot.finish();
+    #[cfg(unix)]
+    {
+        use axum::serve::ListenerExt;
+        // Cap on simultaneous inbound connections, with a clean 503 beyond it
+        // (see `fd_guard`), and the fd usage watch (warns at 80 %).
+        let tracker = fd_guard::ConnTracker::from_env(nofile.soft_after);
+        let snap = tracker.snapshot();
+        tracing::info!(
+            effective_cap_now = snap.max,
+            per_peer_stats = tracker.per_peer_enabled(),
+            "Inbound connection cap: dynamic (limit - non-inbound fds - {} reserve), optional ceiling {}; per-peer stats {}",
+            fd_guard::RESERVE_FDS,
+            fd_guard::ENV_MAX_CONNECTIONS,
+            fd_guard::ENV_CONN_STATS
+        );
+        fd_guard::install_global(tracker.clone());
+        let _fd_monitor =
+            fd_guard::spawn_fd_monitor(std::time::Duration::from_secs(60), tracker.clone());
+        // `tap_io` (a no-op) gives the listener the `Connected<SocketAddr>`
+        // impl that `ConnectInfo<SocketAddr>` needs.
+        // Quota-loopback connections serve short requests only (see `fd_guard`).
+        let app = app.layer(axum::middleware::from_fn_with_state(
+            tracker.clone(),
+            fd_guard::quota_guard,
+        ));
+        let listener = fd_guard::GuardedListener::new(listener, tracker).tap_io(|_| {});
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
+    }
+    #[cfg(not(unix))]
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

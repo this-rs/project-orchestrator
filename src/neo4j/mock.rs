@@ -1028,6 +1028,53 @@ impl GraphStore for MockGraphStore {
 
 #[cfg(test)]
 mod tests {
+    /// A decision linked to TWO tasks (the trait has no writer for a second
+    /// INFORMED_BY edge, so the mock's tables are set directly): deleting one
+    /// task detaches only its own link; the decision stays linked to the other
+    /// task and, via HAS_DECISION, in the project. Deleting the second task
+    /// then detaches the last link; it stays in the project.
+    #[tokio::test]
+    async fn deleting_one_of_two_tasks_keeps_a_shared_decision_linked() {
+        let store = MockGraphStore::new();
+        let (project, plan) = (Uuid::new_v4(), Uuid::new_v4());
+        let (t1, t2, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store
+            .project_plans
+            .write()
+            .await
+            .insert(project, vec![plan]);
+        store.plan_tasks.write().await.insert(plan, vec![t1, t2]);
+        store.decisions.write().await.insert(
+            d,
+            DecisionNode {
+                id: d,
+                description: "shared".into(),
+                rationale: "why".into(),
+                alternatives: vec![],
+                chosen_option: None,
+                decided_by: "t".into(),
+                decided_at: chrono::Utc::now(),
+                status: DecisionStatus::Proposed,
+                embedding: None,
+                embedding_model: None,
+                scar_intensity: 0.0,
+                sharing_consent: Default::default(),
+            },
+        );
+        store.task_decisions.write().await.insert(t1, vec![d]);
+        store.task_decisions.write().await.insert(t2, vec![d]);
+
+        let report = store.delete_task(t1).await.unwrap();
+        assert_eq!(report.detached_decision_ids, vec![d]);
+        assert!(!store.task_decisions.read().await.contains_key(&t1));
+        assert_eq!(store.task_decisions.read().await[&t2], vec![d]);
+        assert_eq!(store.project_decisions.read().await[&project], vec![d]);
+
+        store.delete_task(t2).await.unwrap();
+        assert!(store.decisions.read().await.contains_key(&d));
+        assert_eq!(store.project_decisions.read().await[&project], vec![d]);
+    }
+
     /// Membership is the CONTAINS relation: a file whose `project_id` property names
     /// a project, with no CONTAINS edge from it, is not contained by that project
     /// (Neo4j answers the same). The earlier mock answered yes on the property.
@@ -9606,12 +9653,21 @@ impl PlanStore for MockGraphStore {
     }
 
     async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
-        // Cascade: delete tasks, steps, decisions, constraints
-        if let Some(task_ids) = self.plan_tasks.write().await.remove(&plan_id) {
-            for tid in task_ids {
-                self.delete_task(tid).await?;
-            }
+        // Cascade: delete tasks and steps; the tasks' decisions are detached,
+        // not destroyed (`delete_task`, issue #1189), and kept in the plan's
+        // project. The plan -> tasks entry is read first and removed after, so
+        // `delete_task` can still reach the project through it.
+        let task_ids = self
+            .plan_tasks
+            .read()
+            .await
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_default();
+        for tid in task_ids {
+            self.delete_task(tid).await?;
         }
+        self.plan_tasks.write().await.remove(&plan_id);
         if let Some(constraint_ids) = self.plan_constraints.write().await.remove(&plan_id) {
             let mut constraints = self.constraints.write().await;
             for cid in constraint_ids {
@@ -10303,12 +10359,44 @@ impl PlanStore for MockGraphStore {
                 }
             }
         }
-        // Cascade: decisions
+        // Decisions: detached, not deleted (issue #1189). Dropping the
+        // task -> decisions entry is the INFORMED_BY edge going; the decision
+        // and its AFFECTS (`decision_affects`) stay. Before it goes, the
+        // task's project (task -> plan -> project), when it has one, is linked
+        // to the decision (`project_decisions` = HAS_DECISION, as in Neo4j),
+        // so the decision stays in its project's scope; no project, no link.
+        let task_projects: Vec<Uuid> = {
+            let plan_tasks = self.plan_tasks.read().await;
+            let project_plans = self.project_plans.read().await;
+            let plans: Vec<Uuid> = plan_tasks
+                .iter()
+                .filter(|(_, ts)| ts.contains(&task_id))
+                .map(|(p, _)| *p)
+                .collect();
+            project_plans
+                .iter()
+                .filter(|(_, ps)| plans.iter().any(|p| ps.contains(p)))
+                .map(|(pr, _)| *pr)
+                .collect()
+        };
         if let Some(dec_ids) = self.task_decisions.write().await.remove(&task_id) {
-            let mut decisions = self.decisions.write().await;
+            let decisions = self.decisions.read().await;
+            let mut project_decisions = self.project_decisions.write().await;
+            for did in &dec_ids {
+                if !decisions.contains_key(did) {
+                    continue;
+                }
+                for pr in &task_projects {
+                    let ids = project_decisions.entry(*pr).or_default();
+                    if !ids.contains(did) {
+                        ids.push(*did);
+                    }
+                }
+            }
+            drop(project_decisions);
             for did in dec_ids {
-                if decisions.remove(&did).is_some() {
-                    report.deleted_decision_ids.push(did);
+                if decisions.contains_key(&did) && !report.detached_decision_ids.contains(&did) {
+                    report.detached_decision_ids.push(did);
                 }
             }
         }
