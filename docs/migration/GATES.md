@@ -52,7 +52,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
 | G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **non conçu** |
 | G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge** : sélection de la source implémentée et testée (migrateur factice) ; les écritures faites sur obrain après la bascule sont **perdues** pour la source, ni recopiées ni réconciliées ; un test de bout en bout ne suffirait pas : il faut une réconciliation sans perte, ou un refus du rollback dès qu'une écriture post-bascule existe |
-| G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) |
+| G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) ; `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` exclu de la CI (horloge) |
 
 ## Détail des portes automatisées
 
