@@ -95,7 +95,12 @@ async fn test_health_endpoint() {
     assert!(resp.status().is_success());
 
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok");
+    // "degraded" is accepted: Meilisearch down, or the descriptor meter blind/alerting.
+    assert!(
+        body["status"] == "ok" || body["status"] == "degraded",
+        "unexpected health status: {}",
+        body["status"]
+    );
     assert!(body["version"].is_string());
 }
 

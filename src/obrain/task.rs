@@ -1341,6 +1341,7 @@ impl ObrainGraphStore {
             || TaskDeletion {
                 steps_deleted: 0,
                 deleted_decision_ids: Vec::new(),
+                detached_decision_ids: Vec::new(),
             },
             move |_, w: &mut Ecriture<'_>| {
                 let (noeud, etapes) = {
@@ -1350,6 +1351,7 @@ impl ObrainGraphStore {
                         return Ok(TaskDeletion {
                             steps_deleted: 0,
                             deleted_decision_ids: Vec::new(),
+                            detached_decision_ids: Vec::new(),
                         });
                     };
                     idx.complet(task_id)?;
@@ -1406,6 +1408,7 @@ impl ObrainGraphStore {
                 Ok(TaskDeletion {
                     steps_deleted: nb_etapes,
                     deleted_decision_ids: Vec::new(),
+                    detached_decision_ids: Vec::new(),
                 })
             },
         )
