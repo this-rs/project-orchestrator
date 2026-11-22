@@ -12,9 +12,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::extract::ws::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use axum::extract::ws::Message;
 use tokio::time::Instant;
 
 use super::keepalive_ws_tests::rig;
@@ -40,9 +40,15 @@ async fn a_pong_acknowledges_its_ping_and_the_older_ones() {
     let p0 = live.next_ping(t0).unwrap();
     let p1 = live.next_ping(t0 + Duration::from_secs(30)).unwrap();
     assert_eq!(live.pending(), 2);
-    assert!(live.on_pong(&p1), "a Pong for the newest acknowledges the older");
+    assert!(
+        live.on_pong(&p1),
+        "a Pong for the newest acknowledges the older"
+    );
     assert_eq!(live.pending(), 0);
-    assert!(!live.on_pong(&p0), "a second Pong for a gone ping counts for nothing");
+    assert!(
+        !live.on_pong(&p0),
+        "a second Pong for a gone ping counts for nothing"
+    );
     assert!(live.next_ping(t0 + Duration::from_secs(300)).is_ok());
 }
 
@@ -160,7 +166,10 @@ fn parse(buf: &[u8]) -> Option<(Frame, usize)> {
     let opcode = buf[0] & 0x0f;
     let (len, head) = match buf[1] & 0x7f {
         126 if buf.len() >= 4 => (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4),
-        127 if buf.len() >= 10 => (u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize, 10),
+        127 if buf.len() >= 10 => (
+            u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize,
+            10,
+        ),
         126 | 127 => return None,
         n => (n as usize, 2),
     };
@@ -215,7 +224,10 @@ async fn until_closed(raw: &mut Raw, since: Instant, limit: Duration) -> (usize,
                 while matches!(tail, Frame::Other | Frame::Ping(_) | Frame::Close) {
                     tail = raw.next(Duration::from_secs(3)).await;
                 }
-                assert!(matches!(tail, Frame::Eof), "TCP still open after Close: {tail:?}");
+                assert!(
+                    matches!(tail, Frame::Eof),
+                    "TCP still open after Close: {tail:?}"
+                );
                 return (pings, since.elapsed());
             }
             Frame::Other => {}
@@ -291,12 +303,18 @@ async fn noise_does_not_extend(which: Socket) {
                 }
             }
         }
-        assert!(start.elapsed() < limit, "{which:?}: noise kept the peer alive");
+        assert!(
+            start.elapsed() < limit,
+            "{which:?}: noise kept the peer alive"
+        );
     };
     // Le premier Ping a été acquitté (à ~250 ms) ; le suivant (500 ms) ne l'est
     // jamais : échéance à 500+600, contrôlée au tick suivant. Une prolongation
     // par le bruit repousserait la coupure bien au-delà.
-    assert!(pings >= WS_PONG_TIMEOUT, "{which:?}: closed too early ({pings:?})");
+    assert!(
+        pings >= WS_PONG_TIMEOUT,
+        "{which:?}: closed too early ({pings:?})"
+    );
     assert!(
         pings <= WS_PING_EVERY * 2 + WS_PONG_TIMEOUT + WS_PING_EVERY * 3,
         "{which:?}: noise extended the deadline ({pings:?})"
@@ -391,7 +409,11 @@ fn server_side_socket_exists(client_local: SocketAddr) -> bool {
         panic!("/dev/fd unreadable: cannot observe descriptors");
     };
     for entry in dir.flatten() {
-        let Some(fd) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
             continue;
         };
         // SAFETY: never dropped (ManuallyDrop): the descriptor stays owned by its real owner.
@@ -426,7 +448,10 @@ async fn stalled_reader_is_dropped(which: Socket) {
         Socket::Events => ("/ws/events".to_string(), true),
         Socket::Activity => ("/ws/activity".to_string(), true),
         Socket::Run => (format!("/ws/run/{run_id}"), true),
-        Socket::Chat => (format!("/ws/chat/{}?last_event=999999999999999", rig.sid), true),
+        Socket::Chat => (
+            format!("/ws/chat/{}?last_event=999999999999999", rig.sid),
+            true,
+        ),
     };
     // A tiny receive buffer, set BEFORE connecting so the window stays small.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
@@ -439,14 +464,17 @@ async fn stalled_reader_is_dropped(which: Socket) {
     }
     // The handler subscribes after the upgrade (and `ready`): let it get there.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(server_side_socket_exists(client_local), "{which:?}: no server-side socket");
+    assert!(
+        server_side_socket_exists(client_local),
+        "{which:?}: no server-side socket"
+    );
 
     // The server produces far more than the socket buffers hold; the client reads NOTHING.
     for _ in 0..200 {
         match which {
-            Socket::Events | Socket::Activity => {
-                rig.bus.emit(crud(EntityType::Project, serde_json::json!({ "p": big() })))
-            }
+            Socket::Events | Socket::Activity => rig
+                .bus
+                .emit(crud(EntityType::Project, serde_json::json!({ "p": big() }))),
             Socket::Run => {
                 let ev = crate::runner::RunnerEvent::PlanStarted {
                     run_id,
@@ -456,7 +484,8 @@ async fn stalled_reader_is_dropped(which: Socket) {
                     total_waves: 1,
                     prediction: None,
                 };
-                rig.bus.emit(crud(EntityType::Runner, serde_json::to_value(&ev).unwrap()))
+                rig.bus
+                    .emit(crud(EntityType::Runner, serde_json::to_value(&ev).unwrap()))
             }
             Socket::Chat => {
                 rig.manager

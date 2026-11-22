@@ -8849,7 +8849,12 @@ pub(crate) mod tests {
                 .as_object()
                 .expect("`resources` is an object");
             assert!(res["open_fds"].as_u64().unwrap_or(1) > 0);
-            for key in ["fd_alert", "connections", "max_connections", "connections_rejected"] {
+            for key in [
+                "fd_alert",
+                "connections",
+                "max_connections",
+                "connections_rejected",
+            ] {
                 assert!(res.contains_key(key), "missing resources key `{key}`");
             }
         }

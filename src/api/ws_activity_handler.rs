@@ -549,10 +549,7 @@ fn attribute(event: &mut ActivityEvent, index: &AttributionIndex) {
 }
 
 /// Send one JSON frame. Returns `false` when the socket is gone.
-async fn send_json<S>(
-    sender: &mut super::ws_liveness::WsSender,
-    value: &S,
-) -> bool
+async fn send_json<S>(sender: &mut super::ws_liveness::WsSender, value: &S) -> bool
 where
     S: Serialize,
 {

@@ -119,7 +119,10 @@ pub fn nofile_limits() -> io::Result<(u64, u64)> {
 
 #[cfg(not(unix))]
 pub fn nofile_limits() -> io::Result<(u64, u64)> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no RLIMIT_NOFILE"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no RLIMIT_NOFILE",
+    ))
 }
 
 #[cfg(unix)]
@@ -144,7 +147,10 @@ fn set_soft_nofile(soft: u64, hard: u64) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_soft_nofile(_: u64, _: u64) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no RLIMIT_NOFILE"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no RLIMIT_NOFILE",
+    ))
 }
 
 /// Relever la limite souple jusqu'à `min(dure, target)`. Ne panique pas, ne
@@ -237,7 +243,9 @@ pub fn raise_nofile_limit_and_log() -> NofileReport {
 pub enum FdReading {
     Open(usize),
     /// La table est pleine (EMFILE) ou `/dev/fd` illisible : on NE DEVINE PAS.
-    Unavailable { errno: Option<i32> },
+    Unavailable {
+        errno: Option<i32>,
+    },
 }
 
 struct DirHandle(*mut libc::DIR);
@@ -611,7 +619,8 @@ impl ConnTracker {
         let i = &self.inner;
         match read_open_fds() {
             FdReading::Open(open) => {
-                let inbound = i.active.load(Ordering::Acquire) + i.rejecting.load(Ordering::Acquire);
+                let inbound =
+                    i.active.load(Ordering::Acquire) + i.rejecting.load(Ordering::Acquire);
                 Ok(open.saturating_sub(inbound + 1))
             }
             FdReading::Unavailable { errno } => Err(errno),
@@ -623,12 +632,13 @@ impl ConnTracker {
     pub fn effective_cap(&self) -> Option<usize> {
         let i = &self.inner;
         let configured = (i.max != 0).then_some(i.max);
-        let dynamic = i.soft_limit.filter(|&s| s != UNLIMITED).map(|soft| {
-            match self.non_inbound() {
-                Ok(n) => dynamic_cap(soft, n),
-                Err(_) => 0,
-            }
-        });
+        let dynamic =
+            i.soft_limit
+                .filter(|&s| s != UNLIMITED)
+                .map(|soft| match self.non_inbound() {
+                    Ok(n) => dynamic_cap(soft, n),
+                    Err(_) => 0,
+                });
         match (configured, dynamic) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -970,7 +980,11 @@ mod tests {
         };
         assert!(!u(79).alert());
         assert!(u(80).alert());
-        assert!(!FdUsage { open: 5_000, soft_limit: UNLIMITED }.alert());
+        assert!(!FdUsage {
+            open: 5_000,
+            soft_limit: UNLIMITED
+        }
+        .alert());
         let none = FdStatus::Unavailable { errno: Some(24) };
         assert!(none.alert());
         assert!(!none.describe().contains('%'), "{}", none.describe());
@@ -981,12 +995,20 @@ mod tests {
     #[test]
     fn the_held_meter_sees_descriptors_come_and_go() {
         init_fd_meter();
-        let FdReading::Open(base) = read_open_fds() else { panic!("unreadable") };
-        let files: Vec<_> = (0..20).map(|_| std::fs::File::open("/dev/null").unwrap()).collect();
-        let FdReading::Open(up) = read_open_fds() else { panic!() };
+        let FdReading::Open(base) = read_open_fds() else {
+            panic!("unreadable")
+        };
+        let files: Vec<_> = (0..20)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let FdReading::Open(up) = read_open_fds() else {
+            panic!()
+        };
         assert!(up >= base + 20, "{base} -> {up}");
         drop(files);
-        let FdReading::Open(down) = read_open_fds() else { panic!() };
+        let FdReading::Open(down) = read_open_fds() else {
+            panic!()
+        };
         assert!(down <= base + 2, "{base} -> {down}");
     }
 
@@ -996,7 +1018,10 @@ mod tests {
         let (head, body) = r.split_once("\r\n\r\n").unwrap();
         assert_eq!(body, REJECT_BODY);
         assert!(head.starts_with("HTTP/1.1 503 "));
-        assert!(head.contains(&format!("Content-Length: {}", body.len())), "{head}");
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "{head}"
+        );
     }
 
     #[test]
@@ -1007,7 +1032,10 @@ mod tests {
         let _b = t.admit(ip).unwrap();
         assert!(t.admit(ip).is_none());
         let s = t.snapshot();
-        assert_eq!((s.active, s.peers[0].count, s.peers[0].opened_total), (2, 2, 2));
+        assert_eq!(
+            (s.active, s.peers[0].count, s.peers[0].opened_total),
+            (2, 2, 2)
+        );
         t.release(&a);
         assert!(t.admit(ip).is_some());
         assert!(ConnTracker::new(0, false).admit(ip).is_some());

@@ -20,11 +20,11 @@ pub mod boot;
 pub mod chat;
 pub mod documents;
 pub mod embeddings;
-#[cfg(unix)]
-pub mod fd_guard;
 pub mod episodes;
 pub mod evaluation;
 pub mod events;
+#[cfg(unix)]
+pub mod fd_guard;
 pub mod feedback;
 pub mod graph;
 pub mod heartbeat;
@@ -2726,7 +2726,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             fd_guard::ENV_CONN_STATS
         );
         fd_guard::install_global(tracker.clone());
-        let _fd_monitor = fd_guard::spawn_fd_monitor(std::time::Duration::from_secs(60), tracker.clone());
+        let _fd_monitor =
+            fd_guard::spawn_fd_monitor(std::time::Duration::from_secs(60), tracker.clone());
         // `tap_io` (a no-op) gives the listener the `Connected<SocketAddr>`
         // impl that `ConnectInfo<SocketAddr>` needs.
         let listener = fd_guard::GuardedListener::new(listener, tracker).tap_io(|_| {});

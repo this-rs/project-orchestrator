@@ -62,15 +62,18 @@ fn child_server() {
             .route("/health", get(|| async { "ok" }))
             .route(
                 "/fds",
-                get(|| async {
-                    format!("{:?}", fd_guard::read_open_fds())
-                }),
+                get(|| async { format!("{:?}", fd_guard::read_open_fds()) }),
             )
             .route(
                 "/stats",
                 get(move || {
                     let s = t2.snapshot();
-                    async move { format!("{} {} {} {}", s.active, s.rejected, s.accept_errors, s.reject_write_failed) }
+                    async move {
+                        format!(
+                            "{} {} {} {}",
+                            s.active, s.rejected, s.accept_errors, s.reject_write_failed
+                        )
+                    }
                 }),
             )
             .route(
@@ -81,7 +84,13 @@ fn child_server() {
                         s.peers
                             .iter()
                             .map(|p| {
-                                format!("{} {} {} {}\n", p.ip, p.count, p.held_since.as_secs(), p.opened_total)
+                                format!(
+                                    "{} {} {} {}\n",
+                                    p.ip,
+                                    p.count,
+                                    p.held_since.as_secs(),
+                                    p.opened_total
+                                )
                             })
                             .collect::<String>()
                     }
@@ -90,24 +99,28 @@ fn child_server() {
             .route("/noninbound", get(|| async { hold_non_inbound() }))
             .route(
                 "/burst",
-                get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                    // Outbound-style descriptors opened in a burst 200 ms from now
-                    // (so while the inbound salve is in progress), held 1.5 s.
-                    let n: usize = q.get("n").and_then(|v| v.parse().ok()).unwrap_or(0);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        let mut files = Vec::new();
-                        for _ in 0..n {
-                            match std::fs::File::open("/dev/null") {
-                                Ok(f) => files.push(f),
-                                Err(_) => break,
+                get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        // Outbound-style descriptors opened in a burst 200 ms from now
+                        // (so while the inbound salve is in progress), held 1.5 s.
+                        let n: usize = q.get("n").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            let mut files = Vec::new();
+                            for _ in 0..n {
+                                match std::fs::File::open("/dev/null") {
+                                    Ok(f) => files.push(f),
+                                    Err(_) => break,
+                                }
                             }
-                        }
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
-                        drop(files);
-                    });
-                    "scheduled"
-                }),
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            drop(files);
+                        });
+                        "scheduled"
+                    },
+                ),
             )
             .route("/saturate", get(|| async { saturate_table() }))
             .route(
@@ -137,7 +150,8 @@ fn child_server() {
     });
 }
 
-static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> = std::sync::Mutex::new(Vec::new());
+static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// ~110 descripteurs qui ne sont PAS des connexions entrantes : fichiers,
 /// pipes, et sockets sortants vers un écouteur local (les deux bouts sont dans
@@ -235,7 +249,14 @@ struct Cfg {
 
 impl Cfg {
     fn new(soft: u64, hard: u64) -> Cfg {
-        Cfg { soft, hard, target: 0, max: 0, peers: false, budget: true }
+        Cfg {
+            soft,
+            hard,
+            target: 0,
+            max: 0,
+            peers: false,
+            budget: true,
+        }
     }
 }
 
@@ -286,7 +307,10 @@ fn spawn(cfg: Cfg) -> Server {
     // Lowering is always allowed; `runnable` has checked raising is not needed.
     unsafe {
         cmd.pre_exec(move || {
-            let rl = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
+            let rl = libc::rlimit {
+                rlim_cur: soft as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -300,9 +324,15 @@ fn spawn(cfg: Cfg) -> Server {
     let mut line = String::new();
     loop {
         line.clear();
-        assert!(out.read_line(&mut line).unwrap() > 0, "child died before READY");
+        assert!(
+            out.read_line(&mut line).unwrap() > 0,
+            "child died before READY"
+        );
         if let Some(rest) = line.find("READY ").map(|i| &line[i + 6..]) {
-            let v: Vec<u64> = rest.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let v: Vec<u64> = rest
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
             (port, sb, hd, sa) = (v[0] as u16, v[1], v[2], v[3]);
         }
         if let Some(rest) = line.find("PROBLEM ").map(|i| &line[i + 8..]) {
@@ -328,7 +358,10 @@ fn raise_parent_limit() {
     let (soft, hard) = inherited_limits();
     let want = hard.min(2048);
     if soft < want {
-        let rl = libc::rlimit { rlim_cur: want as libc::rlim_t, rlim_max: hard as libc::rlim_t };
+        let rl = libc::rlimit {
+            rlim_cur: want as libc::rlim_t,
+            rlim_max: hard as libc::rlim_t,
+        };
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
     }
 }
@@ -339,9 +372,9 @@ static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 const REQ: &str = "GET {} HTTP/1.1\r\nHost: t\r\nConnection: {}\r\n\r\n";
 
 async fn send_get(s: &mut TcpStream, path: &str, close: bool) {
-    let req = REQ
-        .replacen("{}", path, 1)
-        .replacen("{}", if close { "close" } else { "keep-alive" }, 1);
+    let req =
+        REQ.replacen("{}", path, 1)
+            .replacen("{}", if close { "close" } else { "keep-alive" }, 1);
     s.write_all(req.as_bytes()).await.unwrap();
 }
 
@@ -354,7 +387,11 @@ async fn read_response(s: &mut TcpStream) -> Option<(u16, String, String)> {
             let head = String::from_utf8_lossy(&buf[..end]).to_string();
             let len = head
                 .lines()
-                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
                 .unwrap_or(0);
             if buf.len() >= end + 4 + len {
                 let status = head.split_whitespace().nth(1)?.parse().ok()?;
@@ -402,7 +439,9 @@ async fn eventually_ok(port: u16, path: &str, total: Duration) -> (u16, String, 
 }
 
 fn nums(s: &str) -> Vec<u64> {
-    s.split_whitespace().filter_map(|x| x.parse().ok()).collect()
+    s.split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect()
 }
 
 // ── Les tests ──────────────────────────────────────────────────────────
@@ -417,10 +456,16 @@ async fn the_soft_limit_is_raised_when_the_hard_limit_allows_it() {
     if !runnable("raise", 4096) {
         return;
     }
-    let srv = spawn(Cfg { target: 1024, ..Cfg::new(64, 4096) });
+    let srv = spawn(Cfg {
+        target: 1024,
+        ..Cfg::new(64, 4096)
+    });
     assert_eq!(srv.soft_before, 64);
     assert_eq!(srv.hard, 4096);
-    assert_eq!(srv.soft_after, 1024, "the soft limit was not lifted to min(hard, target)");
+    assert_eq!(
+        srv.soft_after, 1024,
+        "the soft limit was not lifted to min(hard, target)"
+    );
     assert!(!srv.problem);
 
     // Et c'est effectif : 100 connexions simultanées (> 64) répondent toutes.
@@ -447,10 +492,22 @@ async fn a_low_hard_limit_is_respected_and_reported() {
     if !runnable("low-hard", 64) {
         return;
     }
-    let srv = spawn(Cfg { target: 1024, ..Cfg::new(64, 64) });
+    let srv = spawn(Cfg {
+        target: 1024,
+        ..Cfg::new(64, 64)
+    });
     assert_eq!((srv.soft_before, srv.hard, srv.soft_after), (64, 64, 64));
-    assert!(srv.problem, "a limit that could not be lifted must be reported");
-    assert_eq!(get(srv.port, "/health", Duration::from_secs(3)).await.unwrap().0, 200);
+    assert!(
+        srv.problem,
+        "a limit that could not be lifted must be reported"
+    );
+    assert_eq!(
+        get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .unwrap()
+            .0,
+        200
+    );
 }
 
 /// ROUGE sans plafond : les connexions au-delà du plafond reçoivent 200 au lieu
@@ -461,7 +518,10 @@ async fn at_the_cap_new_connections_get_503_and_service_resumes() {
     if !runnable("cap-503", 128) {
         return;
     }
-    let srv = spawn(Cfg { max: 20, ..Cfg::new(128, 128) });
+    let srv = spawn(Cfg {
+        max: 20,
+        ..Cfg::new(128, 128)
+    });
 
     let mut holders = Vec::new();
     for _ in 0..20 {
@@ -506,7 +566,10 @@ async fn the_503_is_framed_exactly_and_the_connection_closes_cleanly() {
     if !runnable("503-framing", 128) {
         return;
     }
-    let srv = spawn(Cfg { max: 1, ..Cfg::new(128, 128) });
+    let srv = spawn(Cfg {
+        max: 1,
+        ..Cfg::new(128, 128)
+    });
     let mut holder = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     send_get(&mut holder, "/health", false).await;
     assert_eq!(read_response(&mut holder).await.unwrap().0, 200);
@@ -521,7 +584,10 @@ async fn the_503_is_framed_exactly_and_the_connection_closes_cleanly() {
     let end = find(&all, b"\r\n\r\n").expect("no end of headers");
     let head = String::from_utf8(all[..end].to_vec()).unwrap();
     let body = &all[end + 4..];
-    assert!(head.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{head}");
+    assert!(
+        head.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "{head}"
+    );
     let declared: usize = head
         .lines()
         .find_map(|l| l.strip_prefix("Content-Length: "))
@@ -529,7 +595,12 @@ async fn the_503_is_framed_exactly_and_the_connection_closes_cleanly() {
         .parse()
         .unwrap();
     assert_eq!(body, b"too many connections, retry soon");
-    assert_eq!(declared, body.len(), "Content-Length {declared} but the body is {} bytes", body.len());
+    assert_eq!(
+        declared,
+        body.len(),
+        "Content-Length {declared} but the body is {} bytes",
+        body.len()
+    );
     drop(holder);
 }
 
@@ -547,7 +618,10 @@ async fn refusals_within_and_beyond_the_linger_bound_all_close_fast() {
     if !runnable("refusal-regimes", 256) {
         return;
     }
-    let srv = spawn(Cfg { max: 1, ..Cfg::new(256, 256) });
+    let srv = spawn(Cfg {
+        max: 1,
+        ..Cfg::new(256, 256)
+    });
     let mut holder = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     send_get(&mut holder, "/health", false).await;
     assert_eq!(read_response(&mut holder).await.unwrap().0, 200);
@@ -574,7 +648,10 @@ async fn refusals_within_and_beyond_the_linger_bound_all_close_fast() {
             complete += 1;
         }
     }
-    println!("FD_LIMIT refusal regimes: {complete} complete 503, {} reset/empty, {hung} hung (of 100)", 100 - complete - hung);
+    println!(
+        "FD_LIMIT refusal regimes: {complete} complete 503, {} reset/empty, {hung} hung (of 100)",
+        100 - complete - hung
+    );
     assert_eq!(hung, 0, "a refused connection hung");
     assert!(complete >= 16, "only {complete} complete 503 out of 100");
     drop(holder);
@@ -608,11 +685,20 @@ async fn dimensioning(name: &str, burst: u64, expect_no_emfile: bool) {
     }
     let srv = spawn(Cfg::new(256, 256));
     let (_, _, held) = eventually_ok(srv.port, "/noninbound", Duration::from_secs(5)).await;
-    let open: u64 = held.trim_start_matches("Open(").trim_end_matches(')').parse().unwrap();
+    let open: u64 = held
+        .trim_start_matches("Open(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap();
     assert!(open >= 110, "non-inbound descriptors held: {held}");
 
     // Outbound descriptors opened in a burst DURING the inbound salve.
-    eventually_ok(srv.port, &format!("/burst?n={burst}"), Duration::from_secs(5)).await;
+    eventually_ok(
+        srv.port,
+        &format!("/burst?n={burst}"),
+        Duration::from_secs(5),
+    )
+    .await;
     let mut tasks = Vec::new();
     for _ in 0..150 {
         let port = srv.port;
@@ -621,7 +707,7 @@ async fn dimensioning(name: &str, burst: u64, expect_no_emfile: bool) {
             let mut buf = Vec::new();
             // Refused connections answer at once; an admitted one stays silent.
             match tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut buf)).await {
-                Err(_) => Some((true, Vec::new(), c)),  // admitted, held open
+                Err(_) => Some((true, Vec::new(), c)), // admitted, held open
                 Ok(Ok(_)) => Some((false, buf, c)),
                 // A reset keeps what was read before it; say so in a failure.
                 Ok(Err(e)) => {
@@ -635,12 +721,17 @@ async fn dimensioning(name: &str, burst: u64, expect_no_emfile: bool) {
     let mut refused = 0;
     let mut bad: Vec<String> = Vec::new();
     for t in tasks {
-        let (is_admitted, bytes, c) = t.await.unwrap().expect("a connection could not even be made");
+        let (is_admitted, bytes, c) = t
+            .await
+            .unwrap()
+            .expect("a connection could not even be made");
         if is_admitted {
             admitted.push(c);
         } else {
             let text = String::from_utf8_lossy(&bytes).to_string();
-            if text.starts_with("HTTP/1.1 503 ") && text.ends_with("too many connections, retry soon") {
+            if text.starts_with("HTTP/1.1 503 ")
+                && text.ends_with("too many connections, retry soon")
+            {
                 refused += 1;
             } else {
                 bad.push(text);
@@ -653,8 +744,16 @@ async fn dimensioning(name: &str, burst: u64, expect_no_emfile: bool) {
         let (_, _, st) = eventually_ok(srv.port, "/stats", Duration::from_secs(5)).await;
         panic!("{} refusals were not a complete 503 (first: {:?}); complete 503: {refused}; admitted {}; server stats [active rejected accept_errors reject_write_failed] = {st}", bad.len(), bad[0], admitted.len());
     }
-    assert!(admitted.len() >= 4, "nothing admitted at all: {}", admitted.len());
-    assert!(!expect_no_emfile || refused >= 40, "only {refused} refusals out of 150 (admitted {})", admitted.len());
+    assert!(
+        admitted.len() >= 4,
+        "nothing admitted at all: {}",
+        admitted.len()
+    );
+    assert!(
+        !expect_no_emfile || refused >= 40,
+        "only {refused} refusals out of 150 (admitted {})",
+        admitted.len()
+    );
 
     // Free a few slots: static files (which need a descriptor) are served now.
     admitted.truncate(admitted.len().saturating_sub(10));
@@ -682,7 +781,10 @@ async fn accept_survives_real_exhaustion_and_resumes() {
     if !runnable("exhaustion", 64) {
         return;
     }
-    let srv = spawn(Cfg { budget: false, ..Cfg::new(64, 64) });
+    let srv = spawn(Cfg {
+        budget: false,
+        ..Cfg::new(64, 64)
+    });
     let mut flood = Vec::new();
     for _ in 0..90 {
         if let Ok(c) = TcpStream::connect(("127.0.0.1", srv.port)).await {
@@ -695,7 +797,10 @@ async fn accept_survives_real_exhaustion_and_resumes() {
     let (_, _, body) = eventually_ok(srv.port, "/static/a.txt", Duration::from_secs(5)).await;
     assert_eq!(body, "static-content");
     let (_, _, stats) = eventually_ok(srv.port, "/stats", Duration::from_secs(5)).await;
-    assert!(nums(&stats)[2] > 0, "no accept error: the exhaustion did not happen ({stats})");
+    assert!(
+        nums(&stats)[2] > 0,
+        "no accept error: the exhaustion did not happen ({stats})"
+    );
 }
 
 /// Mesure quand la table est pleine : le repli (ouvrir `/dev/fd`) échoue en
@@ -707,9 +812,15 @@ async fn the_meter_reports_impossible_when_the_table_is_full_and_never_invents_a
     if !runnable("meter-full-table", 64) {
         return;
     }
-    let srv = spawn(Cfg { budget: false, ..Cfg::new(64, 64) });
+    let srv = spawn(Cfg {
+        budget: false,
+        ..Cfg::new(64, 64)
+    });
     let (_, _, out) = eventually_ok(srv.port, "/saturate", Duration::from_secs(5)).await;
-    assert!(out.contains("via_dir=Unavailable { errno: Some(24) }"), "{out}");
+    assert!(
+        out.contains("via_dir=Unavailable { errno: Some(24) }"),
+        "{out}"
+    );
     let held: u64 = out
         .lines()
         .find_map(|l| l.strip_prefix("held=Open("))
@@ -728,9 +839,17 @@ async fn nothing_is_retained_after_the_clients_close() {
     if !runnable("no-retention", 256) {
         return;
     }
-    let srv = spawn(Cfg { max: 100, peers: true, ..Cfg::new(256, 256) });
+    let srv = spawn(Cfg {
+        max: 100,
+        peers: true,
+        ..Cfg::new(256, 256)
+    });
     let (_, _, base) = eventually_ok(srv.port, "/fds", Duration::from_secs(5)).await;
-    let base: u64 = base.trim_start_matches("Open(").trim_end_matches(')').parse().unwrap();
+    let base: u64 = base
+        .trim_start_matches("Open(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap();
 
     let mut conns = Vec::new();
     for _ in 0..40 {
@@ -745,7 +864,11 @@ async fn nothing_is_retained_after_the_clients_close() {
     loop {
         let (_, _, now) = eventually_ok(srv.port, "/fds", Duration::from_secs(5)).await;
         let (_, _, stats) = eventually_ok(srv.port, "/stats", Duration::from_secs(5)).await;
-        let fds: u64 = now.trim_start_matches("Open(").trim_end_matches(')').parse().unwrap();
+        let fds: u64 = now
+            .trim_start_matches("Open(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
         let active = nums(&stats)[0];
         if fds <= base && active <= 1 {
             break;
@@ -766,7 +889,10 @@ async fn per_peer_stats_report_count_and_age_by_remote_address() {
     if !runnable("per-peer", 256) {
         return;
     }
-    let srv = spawn(Cfg { peers: true, ..Cfg::new(256, 256) });
+    let srv = spawn(Cfg {
+        peers: true,
+        ..Cfg::new(256, 256)
+    });
     let mut held = Vec::new();
     for _ in 0..3 {
         let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
@@ -776,8 +902,15 @@ async fn per_peer_stats_report_count_and_age_by_remote_address() {
     }
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let (_, _, peers) = eventually_ok(srv.port, "/peers", Duration::from_secs(5)).await;
-    let line = peers.lines().find(|l| l.starts_with("127.0.0.1 ")).expect(&peers);
-    let f: Vec<u64> = line.split_whitespace().skip(1).map(|x| x.parse().unwrap()).collect();
+    let line = peers
+        .lines()
+        .find(|l| l.starts_with("127.0.0.1 "))
+        .expect(&peers);
+    let f: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|x| x.parse().unwrap())
+        .collect();
     assert!(f[0] >= 3, "count: {line}");
     assert!(f[1] >= 1, "held-since age in whole seconds: {line}");
     assert!(f[2] >= 3, "opened_total: {line}");
@@ -800,5 +933,8 @@ fn core_scenarios_need_only_a_modest_inherited_hard_limit() {
     // qu'abaisser les limites (<= 256) : si même cela manque, c'est un échec
     // bruyant, pas un saut silencieux.
     let (_, hard) = inherited_limits();
-    assert!(hard >= 256, "the inherited hard limit {hard} is below 256: the core scenarios cannot run");
+    assert!(
+        hard >= 256,
+        "the inherited hard limit {hard} is below 256: the core scenarios cannot run"
+    );
 }
