@@ -463,8 +463,6 @@ pub const MAX_REJECTING: usize = 16;
 /// Nombre maximal d'adresses suivies individuellement ; les autres vont dans
 /// un compteur agrégé « autres ».
 pub const MAX_PEERS: usize = 256;
-/// Ancienneté maximale d'une mesure de l'usage mise en cache pour l'admission.
-const READING_TTL: Duration = Duration::from_millis(50);
 
 /// Plafond dynamique : ce que la limite laisse aux connexions entrantes une
 /// fois retirés les descripteurs qui ne le sont PAS (`non_inbound`, mesurés à
@@ -538,7 +536,6 @@ struct TrackerInner {
     started: Instant,
     per_peer: bool,
     book: Mutex<PeerBook>,
-    reading: Mutex<Option<(Instant, usize)>>,
 }
 
 /// Compteur de connexions entrantes partagé par le listener et le diagnostic.
@@ -584,7 +581,6 @@ impl ConnTracker {
                 started: Instant::now(),
                 per_peer,
                 book: Mutex::new(PeerBook::default()),
-                reading: Mutex::new(None),
             }),
         }
     }
@@ -606,27 +602,19 @@ impl ConnTracker {
     }
 
     /// Descripteurs ouverts qui ne sont NI des connexions admises NI des refus
-    /// en vol (mesurés, mis en cache 50 ms ; le nombre d'entrantes, lui, est
-    /// toujours exact). `Err(errno)` : mesure impossible.
+    /// en vol, mesurés à CHAQUE admission (pas de cache : un cache de 50 ms,
+    /// essayé d'abord, laissait passer ~114 connexions au lieu de ~61 quand une
+    /// salve d'ouvertures hors-entrant précédait de peu une salve entrante —
+    /// mesuré par `tests/fd_limit.rs`). Le nombre d'entrantes, lui, est exact.
+    /// `Err(errno)` : mesure impossible.
     fn non_inbound(&self) -> Result<usize, Option<i32>> {
         let i = &self.inner;
-        let mut slot = i.reading.lock().unwrap();
-        if let Some((at, n)) = *slot {
-            if at.elapsed() < READING_TTL {
-                return Ok(n);
-            }
-        }
         match read_open_fds() {
             FdReading::Open(open) => {
                 let inbound = i.active.load(Ordering::Acquire) + i.rejecting.load(Ordering::Acquire);
-                let n = open.saturating_sub(inbound + 1);
-                *slot = Some((Instant::now(), n));
-                Ok(n)
+                Ok(open.saturating_sub(inbound + 1))
             }
-            FdReading::Unavailable { errno } => {
-                *slot = None;
-                Err(errno)
-            }
+            FdReading::Unavailable { errno } => Err(errno),
         }
     }
 
