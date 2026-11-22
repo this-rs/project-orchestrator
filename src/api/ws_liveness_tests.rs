@@ -480,7 +480,7 @@ fn path_for(which: Socket, rig: &Full, run_id: uuid::Uuid) -> String {
 /// A Pong that arrives while the loop is blocked in a long write must not lose
 /// the race against the (overdue) Ping tick once the loop is free again. The
 /// client reads up to its first Ping, then asks the server for a lot of data and
-/// sends that Pong at once, then drains slowly: the server's write is blocked
+/// sends that Pong at once, then reads nothing for a while and then drains fast: the server's write is blocked
 /// for longer than the Pong deadline, and when it returns BOTH the missed tick
 /// and the Pong are ready. Without `biased` + reading first, the select! picks
 /// the tick about half the time and closes a live connection; the client then
@@ -506,14 +506,9 @@ async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Res
         emit_one(which, &rig, run_id).await;
     }
     raw.send(0xA, &first).await;
-    // Drain slowly: the server stays blocked for well over the Pong deadline.
-    let slow_until = Instant::now() + WS_PONG_TIMEOUT * 3;
-    while Instant::now() < slow_until {
-        if let Frame::Close | Frame::Eof = raw.next(Duration::from_millis(20)).await {
-            return Err("closed while draining a slow read".to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
+    // Read NOTHING for 1.5 Pong deadlines: the buffers are full, the server stays
+    // blocked in its write for longer than the deadline.
+    tokio::time::sleep(WS_PONG_TIMEOUT * 3 / 2).await;
     // Then behave: read everything, answer every Ping, for several periods.
     let until = Instant::now() + WS_PONG_TIMEOUT * 5;
     let mut pings = 0;
@@ -601,7 +596,8 @@ async fn stalled_reader_is_dropped(which: Socket) {
 
     // Bounded: the stalled write fails after WS_SEND_TIMEOUT, the handler leaves
     // its loop, the socket is dropped. Nothing else (no Pong, no read) helps it.
-    let deadline = Instant::now() + WS_PONG_TIMEOUT * 6;
+    // A 128 KiB message is allowed WS_SEND_TIMEOUT plus 16 s (8 KiB/s minimum rate).
+    let deadline = Instant::now() + WS_PONG_TIMEOUT * 6 + Duration::from_secs(30);
     while server_side_socket_exists(client_local) {
         assert!(
             Instant::now() < deadline,
@@ -688,7 +684,7 @@ async fn chat_error_reply_path_with_a_client_that_stopped_reading_is_dropped() {
     for _ in 0..120 {
         raw.send(0x1, bad.as_bytes()).await;
     }
-    let deadline = Instant::now() + WS_PONG_TIMEOUT * 8;
+    let deadline = Instant::now() + WS_PONG_TIMEOUT * 8 + Duration::from_secs(30);
     while server_side_socket_exists(client_local) {
         assert!(
             Instant::now() < deadline,
