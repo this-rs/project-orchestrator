@@ -303,6 +303,7 @@ pub async fn ws_activity(
         }
     };
 
+    let beat = super::ws_liveness::Beat::from_headers(&headers);
     let neo4j = state.orchestrator.neo4j_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
@@ -337,7 +338,7 @@ pub async fn ws_activity(
                 "WS /ws/activity: authenticated, upgrading"
             );
             ws.on_upgrade(move |socket| {
-                handle_activity_ws(socket, state, filters, query.last_seq, claims)
+                handle_activity_ws(socket, state, filters, query.last_seq, claims, beat)
             })
             .into_response()
         }
@@ -386,9 +387,11 @@ async fn handle_activity_ws(
     mut filters: Filters,
     last_seq: Option<u64>,
     claims: Claims,
+    beat: super::ws_liveness::Beat,
 ) {
     super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, None).await;
-    let (mut sender, mut receiver) = socket.split();
+    let (sender_raw, mut receiver) = socket.split();
+    let mut sender = super::ws_liveness::BoundedSink::new(sender_raw);
 
     let hub = state.event_bus.activity().clone();
     let graph = state.orchestrator.neo4j_arc();
@@ -452,8 +455,9 @@ async fn handle_activity_ws(
         }
     }
 
-    let mut ping_interval = interval(Duration::from_secs(30));
+    let mut ping_interval = interval(beat.ping_every);
     ping_interval.tick().await; // skip the immediate first tick
+    let mut liveness = super::ws_liveness::Liveness::new(beat.pong_timeout);
     let mut refresh_interval = interval(INDEX_REFRESH_INTERVAL);
     refresh_interval.tick().await;
     let mut last_forced_refresh = tokio::time::Instant::now();
@@ -509,7 +513,9 @@ async fn handle_activity_ws(
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(payload))) => {
+                        liveness.on_pong(&payload);
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         debug!(%error, "WS /ws/activity: socket error");
@@ -519,7 +525,7 @@ async fn handle_activity_ws(
             }
 
             _ = ping_interval.tick() => {
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if !super::ws_liveness::ping_tick(&mut liveness, &mut sender, "activity").await {
                     break;
                 }
             }
@@ -544,7 +550,7 @@ fn attribute(event: &mut ActivityEvent, index: &AttributionIndex) {
 
 /// Send one JSON frame. Returns `false` when the socket is gone.
 async fn send_json<S>(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    sender: &mut super::ws_liveness::WsSender,
     value: &S,
 ) -> bool
 where

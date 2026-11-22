@@ -27,18 +27,11 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
-use tokio::time::{interval, Duration};
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// How often this connection pings its client — and, while a turn is running,
-/// says so (see the ping arm of the loop). 30 s is what the socket has always
-/// used; a test cannot wait that long for the frame it asserts, so it gets a
-/// shorter beat. Nothing else depends on the value.
-#[cfg(not(test))]
-const WS_PING_EVERY: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const WS_PING_EVERY: Duration = Duration::from_millis(250);
+use super::ws_liveness::{Liveness, WS_PING_EVERY, WS_PONG_TIMEOUT};
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
@@ -226,7 +219,8 @@ async fn handle_ws_chat_loop(
     last_event: i64,
     claims: Claims,
 ) {
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (ws_sender_raw, mut ws_receiver) = socket.split();
+    let mut ws_sender = super::ws_liveness::BoundedSink::new(ws_sender_raw);
 
     let loop_start = tokio::time::Instant::now();
 
@@ -590,6 +584,7 @@ async fn handle_ws_chat_loop(
 
     let mut ping_interval = interval(WS_PING_EVERY);
     ping_interval.tick().await; // skip first immediate tick
+    let mut liveness = Liveness::new(WS_PONG_TIMEOUT);
 
     // Track responded permission request IDs to prevent double-click bugs.
     // If a user clicks Allow/Deny twice, the second response is silently ignored.
@@ -643,6 +638,13 @@ async fn handle_ws_chat_loop(
     let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     loop {
+        // Many writes in this loop ignore their result (`let _ = ...`). A write that
+        // stalled or failed poisons the sink: leave now, whichever path it was on,
+        // and let the socket (and its descriptor) go.
+        if ws_sender.is_broken() {
+            debug!(session_id = %session_id, "Chat WebSocket: a write failed or stalled, closing");
+            break;
+        }
         tokio::select! {
             Some(frame) = ctl_rx.recv() => {
                 if ws_sender.send(Message::Text(frame.into())).await.is_err() {
@@ -789,7 +791,7 @@ async fn handle_ws_chat_loop(
             // client that goes away is seen by the read arm first), i.e. a line
             // nobody can ever prove.
             _ = ping_interval.tick() => {
-                let mut alive = ws_sender.send(Message::Ping(vec![].into())).await.is_ok();
+                let mut alive = super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "chat").await;
                 if alive && chat_manager.is_session_streaming(&session_id).await {
                     let keepalive = serde_json::json!({
                         "type": "streaming_status",
@@ -1200,8 +1202,8 @@ async fn handle_ws_chat_loop(
                         }
                     }
 
-                    Some(Ok(Message::Pong(_))) => {
-                        // Client is alive
+                    Some(Ok(Message::Pong(payload))) => {
+                        liveness.on_pong(&payload);
                     }
 
                     Some(Ok(Message::Close(_))) | None => {

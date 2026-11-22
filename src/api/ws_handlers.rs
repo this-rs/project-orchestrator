@@ -128,6 +128,7 @@ pub async fn ws_events(
         "WS /ws/events upgrade request received"
     );
 
+    let beat = super::ws_liveness::Beat::from_headers(&headers);
     let neo4j = state.orchestrator.neo4j_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
@@ -173,6 +174,7 @@ pub async fn ws_events(
                     layer_filter,
                     chat_subs,
                     claims,
+                    beat,
                 )
             })
             .into_response()
@@ -255,6 +257,7 @@ async fn handle_ws_preauthed(
     layer_filter: Option<HashSet<String>>,
     chat_subs: Vec<(String, broadcast::Receiver<ChatEvent>)>,
     claims: Claims,
+    beat: super::ws_liveness::Beat,
 ) {
     // Wait for client "ready" signal before sending auth_ok
     super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, None).await;
@@ -266,6 +269,7 @@ async fn handle_ws_preauthed(
         layer_filter,
         chat_subs,
         claims,
+        beat,
     )
     .await;
 }
@@ -345,7 +349,7 @@ const GRAPH_BATCH_WINDOW: Duration = Duration::from_millis(100);
 /// Sends `{"kind":"graph_batch","events":[...],"count":N}` to the client.
 /// Returns `true` on success, `false` if the WebSocket send failed.
 async fn flush_graph_batch(
-    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    ws_sender: &mut super::ws_liveness::WsSender,
     batch: &mut Vec<GraphEvent>,
 ) -> bool {
     if batch.is_empty() {
@@ -397,13 +401,16 @@ async fn handle_ws_loop(
     layer_filter: Option<HashSet<String>>,
     mut chat_subs: Vec<(String, broadcast::Receiver<ChatEvent>)>,
     claims: Claims,
+    beat: super::ws_liveness::Beat,
 ) {
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (ws_sender_raw, mut ws_receiver) = socket.split();
+    let mut ws_sender = super::ws_liveness::BoundedSink::new(ws_sender_raw);
     let mut event_rx = state.event_bus.subscribe();
     let mut graph_rx = state.event_bus.subscribe_graph();
 
-    // Ping interval (30s)
-    let mut ping_interval = interval(Duration::from_secs(30));
+    // Ping interval (30s) + the Pong the peer owes for each (see `ws_liveness`)
+    let mut ping_interval = interval(beat.ping_every);
+    let mut liveness = super::ws_liveness::Liveness::new(beat.pong_timeout);
     // Skip the first immediate tick
     ping_interval.tick().await;
 
@@ -512,8 +519,8 @@ async fn handle_ws_loop(
 
             // Send periodic pings to detect dead clients
             _ = ping_interval.tick() => {
-                if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
-                    debug!("Ping failed, client disconnected");
+                if !super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "events").await {
+                    debug!("Ping failed or unanswered, closing");
                     break;
                 }
             }
@@ -521,8 +528,8 @@ async fn handle_ws_loop(
             // Handle incoming messages from the client (Pong, Close)
             msg = ws_receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Pong(_))) => {
-                        // Client is alive
+                    Some(Ok(Message::Pong(payload))) => {
+                        liveness.on_pong(&payload);
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         debug!("WebSocket client disconnected");

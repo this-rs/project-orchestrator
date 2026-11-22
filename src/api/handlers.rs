@@ -225,6 +225,76 @@ pub struct HealthResponse {
     pub services: Option<ServiceHealthStatus>,
     /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
     pub storage_capabilities: StoreCapabilities,
+    /// File descriptors and inbound connections (see `fd_guard`). Absent where
+    /// the process cannot read them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceUsage>,
+}
+
+/// Descriptor usage and inbound connection counters.
+#[derive(Serialize)]
+pub struct ResourceUsage {
+    /// `null` when the measurement is impossible (see `fd_measure_error`).
+    pub open_fds: Option<usize>,
+    /// Soft limit; `null` when unlimited.
+    pub fd_soft_limit: Option<u64>,
+    /// `open_fds / fd_soft_limit` in percent; `null` when unlimited OR when the
+    /// measurement is impossible (never invented).
+    pub fd_percent: Option<u32>,
+    /// `true` from 80 %, and ALSO when the measurement is impossible.
+    pub fd_alert: bool,
+    /// Why the measurement is impossible (errno), if it is.
+    pub fd_measure_error: Option<String>,
+    pub connections: usize,
+    /// Inbound cap in force right now; 0 = no cap.
+    pub max_connections: usize,
+    /// Inbound connections refused with 503 since start.
+    pub connections_rejected: u64,
+    /// `accept` failures (EMFILE...) since start.
+    pub accept_errors: u64,
+}
+
+#[cfg(unix)]
+fn resource_usage() -> Option<ResourceUsage> {
+    use crate::fd_guard::{fd_status, global, FdStatus, UNLIMITED};
+    let status = fd_status();
+    let snap = global().map(|t| t.snapshot());
+    let (open_fds, fd_soft_limit, fd_percent, fd_measure_error) = match status {
+        FdStatus::Usage(u) => {
+            let limited = u.soft_limit != UNLIMITED;
+            (
+                Some(u.open),
+                limited.then_some(u.soft_limit),
+                limited.then(|| (u.ratio() * 100.0) as u32),
+                None,
+            )
+        }
+        FdStatus::Unavailable { errno } => (
+            None,
+            None,
+            None,
+            Some(format!(
+                "measurement impossible (errno {})",
+                errno.map_or("?".to_string(), |e| e.to_string())
+            )),
+        ),
+    };
+    Some(ResourceUsage {
+        open_fds,
+        fd_soft_limit,
+        fd_percent,
+        fd_alert: status.alert(),
+        fd_measure_error,
+        connections: snap.as_ref().map_or(0, |s| s.active),
+        max_connections: snap.as_ref().map_or(0, |s| s.max),
+        connections_rejected: snap.as_ref().map_or(0, |s| s.rejected),
+        accept_errors: snap.as_ref().map_or(0, |s| s.accept_errors),
+    })
+}
+
+#[cfg(not(unix))]
+fn resource_usage() -> Option<ResourceUsage> {
+    None
 }
 
 /// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
@@ -288,6 +358,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
                 nats: nats_status.to_string(),
             }),
             storage_capabilities: state.orchestrator.neo4j().capabilities(),
+            resources: resource_usage(),
         }),
     )
 }
@@ -8769,6 +8840,18 @@ pub(crate) mod tests {
 
         for key in ["status", "version", "services", "storage_capabilities"] {
             assert!(obj.contains_key(key), "missing top-level key `{key}`");
+        }
+
+        // Descriptor usage is part of the payload on unix (diagnostic, 80 % alert).
+        #[cfg(unix)]
+        {
+            let res = obj["resources"]
+                .as_object()
+                .expect("`resources` is an object");
+            assert!(res["open_fds"].as_u64().unwrap_or(1) > 0);
+            for key in ["fd_alert", "connections", "max_connections", "connections_rejected"] {
+                assert!(res.contains_key(key), "missing resources key `{key}`");
+            }
         }
 
         // `services.neo4j` is a frontend contract: kept even though the backend
