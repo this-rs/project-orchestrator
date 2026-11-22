@@ -1407,8 +1407,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let nofile = {
         // Hold /dev/fd open from the start: measuring must not need a free descriptor.
         fd_guard::init_fd_meter();
+        let report = fd_guard::raise_nofile_limit_and_log();
+        // After the limit is lifted, so the line describes the final state.
         fd_guard::log_meter_at_startup();
-        fd_guard::raise_nofile_limit_and_log()
+        report
     };
 
     // ────────────────────────────────────────────────────────────────────
@@ -2731,6 +2733,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             fd_guard::spawn_fd_monitor(std::time::Duration::from_secs(60), tracker.clone());
         // `tap_io` (a no-op) gives the listener the `Connected<SocketAddr>`
         // impl that `ConnectInfo<SocketAddr>` needs.
+        // Quota-loopback connections serve short requests only (see `fd_guard`).
+        let app = app.layer(axum::middleware::from_fn_with_state(
+            tracker.clone(),
+            fd_guard::quota_guard,
+        ));
         let listener = fd_guard::GuardedListener::new(listener, tracker).tap_io(|_| {});
         axum::serve(
             listener,

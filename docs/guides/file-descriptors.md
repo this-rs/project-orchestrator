@@ -22,20 +22,24 @@
 - Inbound connections are capped: cap = soft limit - (descriptors that are not
   inbound connections, measured at each admission) - 64 reserve (floor 4), and
   optionally `ORCHESTRATOR_MAX_CONNECTIONS` as a lower ceiling. When the meter
-  is blind the cap falls back to `limit - max(64, 25 %)`. Beyond the cap a
-  connection gets a complete `503` with `Retry-After: 1` and is closed;
-  established connections (WebSocket, SSE) are never cut. Loopback peers keep a
-  quota of `ORCHESTRATOR_LOOPBACK_RESERVE` (default 8, clamped to half the 64
-  margin, logged at startup) connections OVER the cap, so the health probe, the
-  desktop app and local MCP clients are not locked out. It is a TEMPORARY
-  overshoot: a connection admitted on the quota is closed by the guard after
-  `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10), so long-lived local
-  WebSockets or keep-alives cannot hold the quota and exclude the probe for good
-  (a local client that keeps reconnecting can still occupy it). A quota rather
-  than a second health listener: no extra port, every local client benefits. A
-  LAN health probe is not covered. The cap is sized from a measurement, not a
-  guarantee: a sudden burst of non-inbound descriptors larger than the reserve
-  can still hit EMFILE; accept then retries every 100 ms.
+  is blind the cap falls back to `limit - max(64, 25 %)` (floor 16). Beyond the
+  cap a connection gets a complete `503` with `Retry-After: 1` and is closed;
+  established connections (WebSocket, SSE) are never cut. The cap is sized from
+  a measurement, not a guarantee: a sudden burst of non-inbound descriptors
+  larger than the reserve can still hit EMFILE; accept then retries every 100 ms.
+- Loopback quota. Loopback peers (the health probe, the desktop app, local MCP
+  clients) keep a quota of `ORCHESTRATOR_LOOPBACK_RESERVE` (default 8, clamped to
+  half the 64 margin, logged at startup) connections OVER the cap. The quota is
+  for SHORT REQUESTS ONLY, and nothing ever cuts a request in progress:
+  every response on a quota connection carries `Connection: close` (the
+  connection closes after its response, no keep-alive); a WebSocket upgrade or an
+  SSE on a quota connection gets a clean `503` (the desktop therefore never
+  reaches `onopen` through the quota and its reconnect backoff keeps growing);
+  as a safety net against slow-loris, a quota connection that has sent NO request
+  after `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1) is closed,
+  on the read side only. Silent local connections can therefore hold the quota
+  for that long. A LAN health probe is not covered. A quota rather than a second
+  health listener: no extra port, every local client benefits.
 - `ORCHESTRATOR_CONN_STATS=1` logs, every 60 s, the top peers by remote address
   (connections, time since the first one of the current series, connections
   admitted). It is bounded (256 peers, then an aggregate counter) and forgets a

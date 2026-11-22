@@ -107,6 +107,18 @@ fn child_server() {
                 }),
             )
             .route(
+                "/slow",
+                get(|| async {
+                    // A slow but ACTIVE request: nothing may cut it half way.
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    "done"
+                }),
+            )
+            .route(
+                "/stream",
+                get(|| async { ([("content-type", "text/event-stream")], "data: hello\n\n") }),
+            )
+            .route(
                 "/monitor",
                 get(|| async {
                     let r = fd_guard::monitor_report();
@@ -148,6 +160,10 @@ fn child_server() {
                 get(|ConnectInfo(a): ConnectInfo<SocketAddr>| async move { a.ip().to_string() }),
             )
             .nest_service("/static", tower_http::services::ServeDir::new(dir));
+        let app = app.layer(axum::middleware::from_fn_with_state(
+            tracker.clone(),
+            fd_guard::quota_guard,
+        ));
         let std_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = std_l.local_addr().unwrap().port();
         let listener = fd_guard::GuardedListener::new(std_l, tracker).tap_io(|_| {});
@@ -420,6 +436,11 @@ async fn send_get(s: &mut TcpStream, path: &str, close: bool) {
     let req =
         REQ.replacen("{}", path, 1)
             .replacen("{}", if close { "close" } else { "keep-alive" }, 1);
+    s.write_all(req.as_bytes()).await.unwrap();
+}
+
+async fn send_get_with(s: &mut TcpStream, path: &str, headers: &str) {
+    let req = format!("GET {path} HTTP/1.1\r\nHost: t\r\n{headers}\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
 }
 
@@ -967,9 +988,8 @@ async fn per_peer_stats_report_count_and_age_by_remote_address() {
 /// Au plafond, la sonde de santé passe encore : le quota LOOPBACK admet des
 /// connexions au-delà du plafond (les LAN n'y ont pas droit : voir le test
 /// unitaire du suivi). Choix : un quota réservé plutôt qu'un listener de santé
-/// séparé, parce que la sonde, l'application desktop et les clients MCP locaux
-/// sont tous en loopback et que cela n'ajoute ni port ni configuration.
-/// ROUGE sans le quota : `/health` reçoit un 503 comme tout le reste.
+/// séparé (aucun port ni configuration ; la sonde, le desktop et le MCP local
+/// sont en loopback). ROUGE sans le quota : `/health` reçoit un 503.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn at_the_cap_health_still_answers_through_the_loopback_quota() {
     let _g = ONE_AT_A_TIME.lock().await;
@@ -981,7 +1001,6 @@ async fn at_the_cap_health_still_answers_through_the_loopback_quota() {
         loopback: 4,
         ..Cfg::new(128, 128)
     });
-    // Five long-lived connections fill the cap.
     let mut holders = Vec::new();
     for _ in 0..5 {
         let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
@@ -989,21 +1008,102 @@ async fn at_the_cap_health_still_answers_through_the_loopback_quota() {
         assert_eq!(read_response(&mut c).await.unwrap().0, 200);
         holders.push(c);
     }
-    // At the cap, health is still served (quota slot), and again, and again.
-    for _ in 0..10 {
+    for _ in 0..20 {
         let r = get(srv.port, "/health", Duration::from_secs(3))
             .await
             .expect("no answer at the cap");
         assert_eq!(r.0, 200, "health refused at the cap: {:?}", r.1);
     }
-    // The quota is bounded: 4 more idle loopback connections use it up, then 503.
-    let mut quota = Vec::new();
-    for _ in 0..4 {
+    drop(holders);
+}
+
+/// Le quota ne sert qu'aux REQUÊTES COURTES, et rien n'y coupe une requête en
+/// cours. Cap 3 occupé par 3 connexions normales ; 8 de quota ; âge 1 s.
+///  - une réponse sur le quota porte `Connection: close` et la connexion se ferme ;
+///  - un upgrade WebSocket ou une SSE sur le quota reçoit un 503 propre (le desktop
+///    n'y a donc jamais de `onopen`, son backoff grandit) ; sur une connexion
+///    normale, les mêmes requêtes passent ;
+///  - une requête LENTE mais active (2,5 s) sur le quota, plus longue que l'âge,
+///    n'est pas coupée ;
+///  - 8 connexions locales qui n'envoient rien épuisent le quota, la sonde est
+///    refusée, puis le filet de sécurité (lecture seulement) les ferme et la sonde
+///    repasse.
+/// ROUGE sans middleware (pas de 503, pas de `Connection: close`), sans
+/// `Connection: close`, ou si le filet coupe une requête commencée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loopback_quota_serves_short_requests_only_and_never_cuts_a_request_in_progress() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("quota-short-requests", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        max: 3,
+        loopback: 8,
+        loopback_age_ms: Some(1000),
+        ..Cfg::new(128, 128)
+    });
+    let mut holders = Vec::new();
+    for _ in 0..3 {
         let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
         send_get(&mut c, "/health", false).await;
         assert_eq!(read_response(&mut c).await.unwrap().0, 200);
-        quota.push(c);
+        holders.push(c);
     }
+
+    // A short request on the quota: Connection: close, then the connection closes.
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    send_get_with(&mut c, "/health", "").await; // keep-alive requested (HTTP/1.1 default)
+    let (status, head, _) = read_response(&mut c).await.unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut rest))
+        .await
+        .expect("the connection stayed open after its response")
+        .ok();
+    assert!(rest.is_empty());
+
+    // A WebSocket upgrade, and an SSE, on the quota: a clean 503.
+    for (path, headers) in [
+        ("/health", "Connection: Upgrade\r\nUpgrade: websocket\r\n"),
+        ("/stream", "Accept: text/event-stream\r\n"),
+        ("/stream", ""), // SSE chosen by the handler, no Accept header
+    ] {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get_with(&mut c, path, headers).await;
+        let (status, head, body) = read_response(&mut c).await.unwrap();
+        assert_eq!(status, 503, "{path} {headers:?}: {head}");
+        assert!(head.to_ascii_lowercase().contains("retry-after"), "{head}");
+        assert!(body.contains("quota"), "{body}");
+    }
+
+    // The very same requests on a NORMAL connection are not refused.
+    send_get_with(
+        &mut holders[0],
+        "/health",
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n",
+    )
+    .await;
+    assert_eq!(read_response(&mut holders[0]).await.unwrap().0, 200);
+
+    // A slow but active request, longer than the 1 s age, is not cut.
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    send_get_with(&mut c, "/slow", "").await;
+    let r = tokio::time::timeout(Duration::from_secs(8), read_response(&mut c))
+        .await
+        .expect("no answer")
+        .expect("a slow request on the quota was cut");
+    assert_eq!((r.0, r.2.as_str()), (200, "done"));
+
+    // Eight silent local connections use the whole quota: the probe is refused...
+    let mut silent = Vec::new();
+    for _ in 0..8 {
+        silent.push(TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         get(srv.port, "/health", Duration::from_secs(3))
             .await
@@ -1011,8 +1111,25 @@ async fn at_the_cap_health_still_answers_through_the_loopback_quota() {
             .0,
         503
     );
-    drop(quota);
-    drop(holders);
+    // ...until the safety net (read only, nothing was sent) closes them.
+    eventually_ok(srv.port, "/health", Duration::from_secs(6)).await;
+    for c in silent.iter_mut() {
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf)).await;
+        assert!(
+            matches!(n, Ok(Ok(0)) | Ok(Err(_))),
+            "a silent quota connection outlived the net"
+        );
+    }
+    // The normal connections were never touched.
+    for c in holders.iter_mut() {
+        send_get(c, "/health", false).await;
+        assert_eq!(
+            read_response(c).await.unwrap().0,
+            200,
+            "a normal connection was cut"
+        );
+    }
 }
 
 /// Mètre indisponible SANS table pleine (`/dev/fd` absent : conteneur, bac à
@@ -1058,66 +1175,6 @@ async fn an_unavailable_meter_falls_back_to_the_static_cap_and_does_not_refuse_e
         held.push(c);
     }
     drop(held);
-}
-
-/// Le quota loopback est un DÉPASSEMENT TEMPORAIRE : 8 connexions locales
-/// longues l'épuisent, mais le garde les ferme à l'échéance et la sonde repasse.
-/// ROUGE sans échéance : `/health` reste refusé tant que les 8 tiennent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn eight_long_local_connections_do_not_lock_the_probe_out_for_good() {
-    let _g = ONE_AT_A_TIME.lock().await;
-    if !runnable("quota-expiry", 128) {
-        return;
-    }
-    let srv = spawn(Cfg {
-        max: 3,
-        loopback: 8,
-        loopback_age_ms: Some(1500),
-        ..Cfg::new(128, 128)
-    });
-    let mut holders = Vec::new();
-    for _ in 0..3 {
-        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
-        send_get(&mut c, "/health", false).await;
-        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
-        holders.push(c);
-    }
-    // Eight long-lived LOOPBACK connections (keep-alive, idle) use the whole quota.
-    let mut quota = Vec::new();
-    for _ in 0..8 {
-        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
-        send_get(&mut c, "/health", false).await;
-        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
-        quota.push(c);
-    }
-    // Quota exhausted: the probe is refused for now...
-    assert_eq!(
-        get(srv.port, "/health", Duration::from_secs(3))
-            .await
-            .unwrap()
-            .0,
-        503
-    );
-    // ...and answers again once the temporary overshoot expired, though the 3
-    // normal holders and the 8 clients are still connected on their side.
-    eventually_ok(srv.port, "/health", Duration::from_secs(8)).await;
-    // The quota connections were closed by the server, the 3 normal ones were not.
-    for c in quota.iter_mut() {
-        let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf)).await;
-        assert!(
-            matches!(n, Ok(Ok(0)) | Ok(Err(_))),
-            "a quota connection outlived its age"
-        );
-    }
-    for c in holders.iter_mut() {
-        send_get(c, "/health", false).await;
-        assert_eq!(
-            read_response(c).await.unwrap().0,
-            200,
-            "a normal connection was cut"
-        );
-    }
 }
 
 /// Mètre aveugle SANS table pleine : le moniteur est DÉGRADÉ (warn à chaque

@@ -481,79 +481,99 @@ fn path_for(which: Socket, rig: &Full, run_id: uuid::Uuid) -> String {
     }
 }
 
-/// A Pong that arrives while the loop is blocked in a long write must not lose
-/// the race against the (overdue) Ping tick once the loop is free again. The
-/// client reads up to its first Ping, then asks the server for a lot of data and
-/// sends that Pong at once, then reads nothing for a while and then drains fast: the server's write is blocked
-/// for longer than the Pong deadline, and when it returns BOTH the missed tick
-/// and the Pong are ready. Without `biased` + reading first, the select! picks
-/// the tick about half the time and closes a live connection; the client then
-/// keeps answering for several periods and must still be connected.
-async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Result<(), String> {
-    // A looser Pong deadline than the other tests: the point here is the order in
-    // which a ready Pong and an overdue tick are served, not machine speed.
+/// Tests that block a server write (the stall tests, the error-path test, the race
+/// tests) run one at a time: the race tests detect "the server is blocked" through
+/// the process-wide [`BLOCKED_WRITES`] counter, which only means something if no
+/// other test blocks a write meanwhile.
+static BLOCKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A Pong that is READY while the loop is blocked in a long write must not lose
+/// the race against the (overdue) Ping tick once the loop is free again.
+///
+/// Six clients connect to one server and read up to their first Ping. The server is
+/// then asked for a lot of data while they read NOTHING; the test waits until the
+/// server REPORTS that all six writes are blocked (the `BLOCKED_WRITES` counter
+/// of `BoundedSink`: a measured precondition, not a sleep), and only then do the
+/// clients answer their Ping. The Pongs sit unread in the server's socket for
+/// 1.5 Pong deadlines; when the clients start reading, the loop frees up with BOTH
+/// the overdue tick and the Pong ready. Without `biased` + reading first, the
+/// select! picks the tick and closes a live connection.
+async fn pong_race(which: Socket) {
+    use super::ws_liveness::BLOCKED_WRITES;
+    use std::sync::atomic::Ordering::SeqCst;
+    const N: usize = 6;
+    let _g = BLOCKING.lock().await;
+    // A looser Pong deadline than the other tests: the point is the ORDER in which
+    // a ready Pong and an overdue tick are served, not machine speed.
     let race_pong = Duration::from_millis(2500);
     let rig = full_rig().await;
     let run_id = uuid::Uuid::new_v4();
-    let sock = tokio::net::TcpSocket::new_v4().unwrap();
-    sock.set_recv_buffer_size(4096).unwrap();
-    let tcp = sock.connect(rig.addr).await.unwrap();
-    let mut raw = Raw::upgrade_with(tcp, rig.addr, &path_for(which, &rig, run_id), 2500).await;
-    raw.send(0x1, b"ready").await;
-    // Up to the first Ping.
-    let first = loop {
-        match raw.next(Duration::from_secs(3)).await {
-            Frame::Ping(p) => break p,
-            Frame::Close | Frame::Eof | Frame::Quiet => return Err("no Ping".to_string()),
-            Frame::Other => {}
-        }
-    };
-    // Make the server's next write block, and answer the Ping at the same time.
+    let mut raws = Vec::new();
+    let mut firsts = Vec::new();
+    for _ in 0..N {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        let tcp = sock.connect(rig.addr).await.unwrap();
+        let mut raw = Raw::upgrade_with(tcp, rig.addr, &path_for(which, &rig, run_id), 2500).await;
+        raw.send(0x1, b"ready").await;
+        let first = loop {
+            match raw.next(Duration::from_secs(3)).await {
+                Frame::Ping(p) => break p,
+                Frame::Close | Frame::Eof | Frame::Quiet => panic!("{which:?}: no first Ping"),
+                Frame::Other => {}
+            }
+        };
+        raws.push(raw);
+        firsts.push(first);
+    }
+    // Make every server write block; the clients read nothing.
+    let before = BLOCKED_WRITES.load(SeqCst);
     for _ in 0..60 {
         emit_one(which, &rig, run_id).await;
     }
-    // Precondition: answer only once the server is blocked in its write (the
-    // client reads nothing, the buffers are full). Answering at once let the
-    // /ws/run loop read the Pong BEFORE it started writing, so the race was never
-    // set up (the first version passed under the tick-first mutation for /ws/run).
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    raw.send(0xA, &first).await;
-    // Read NOTHING for 1.5 Pong deadlines: the buffers are full, the server stays
-    // blocked in its write for longer than the deadline.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while BLOCKED_WRITES.load(SeqCst) < before + N as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "{which:?}: precondition not met, the server never reported {N} blocked writes \
+             (saw {})",
+            BLOCKED_WRITES.load(SeqCst) - before
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The server IS blocked: answer now, still without reading.
+    for (raw, first) in raws.iter_mut().zip(&firsts) {
+        raw.send(0xA, first).await;
+    }
     tokio::time::sleep(race_pong * 3 / 2).await;
     // Then behave: read everything, answer every Ping, for several periods.
-    let until = Instant::now() + race_pong * 3;
-    let mut pings = 0;
-    while Instant::now() < until {
-        match raw.next(WS_PING_EVERY * 4).await {
-            Frame::Ping(p) => {
-                pings += 1;
-                raw.send(0xA, &p).await;
+    let results =
+        futures::future::join_all(raws.iter_mut().map(|raw| async move {
+            let until = Instant::now() + race_pong * 3;
+            let mut pings = 0;
+            while Instant::now() < until {
+                match raw.next(WS_PING_EVERY * 4).await {
+                    Frame::Ping(p) => {
+                        pings += 1;
+                        raw.send(0xA, &p).await;
+                    }
+                    Frame::Close | Frame::Eof => return Err(
+                        "a live connection was closed (the Pong lost the race against the tick)"
+                            .to_string(),
+                    ),
+                    Frame::Other | Frame::Quiet => {}
+                }
             }
-            Frame::Close | Frame::Eof => {
-                return Err(
-                    "a live connection was closed (the Pong lost the race against the tick)"
-                        .to_string(),
-                )
+            if pings < 2 {
+                return Err(format!("heartbeat did not resume ({pings} pings)"));
             }
-            Frame::Other | Frame::Quiet => {}
-        }
-    }
-    if pings < 2 {
-        return Err(format!("heartbeat did not resume ({pings} pings)"));
-    }
-    Ok(())
-}
-
-async fn pong_race_trials(which: Socket) {
-    let results = futures::future::join_all(
-        (0..6).map(|_| pong_in_flight_during_a_blocked_write_is_not_lost(which)),
-    )
-    .await;
+            Ok(())
+        }))
+        .await;
     let failures: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
     assert!(
         failures.is_empty(),
-        "{which:?}: {} of 6 trials failed: {failures:?}",
+        "{which:?}: {} of {N} connections failed: {failures:?}",
         failures.len()
     );
 }
@@ -561,7 +581,7 @@ async fn pong_race_trials(which: Socket) {
 macro_rules! race_tests {
     ($($name:ident => $s:expr;)*) => {
         $(#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn $name() { pong_race_trials($s).await }) *
+        async fn $name() { pong_race($s).await }) *
     };
 }
 
@@ -573,6 +593,7 @@ race_tests! {
 }
 
 async fn stalled_reader_is_dropped(which: Socket) {
+    let _g = BLOCKING.lock().await;
     let rig = full_rig().await;
     let run_id = uuid::Uuid::new_v4();
     let (path, ready) = match which {
@@ -678,6 +699,7 @@ async fn a_blocked_sink_fails_after_its_limit() {
 /// descripteurs libérés, dans un délai borné.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chat_error_reply_path_with_a_client_that_stopped_reading_is_dropped() {
+    let _g = BLOCKING.lock().await;
     let rig = full_rig().await;
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();

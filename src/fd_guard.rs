@@ -41,15 +41,22 @@ pub const ENV_MAX_CONNECTIONS: &str = "ORCHESTRATOR_MAX_CONNECTIONS";
 /// l'application desktop et les clients MCP locaux passent toujours.
 pub const ENV_LOOPBACK_RESERVE: &str = "ORCHESTRATOR_LOOPBACK_RESERVE";
 pub const DEFAULT_LOOPBACK_RESERVE: usize = 8;
-/// Variable d'environnement : durée maximale (secondes) d'une connexion admise
-/// sur le quota loopback (défaut [`DEFAULT_LOOPBACK_MAX_AGE`]).
+/// Variable d'environnement : délai (secondes, minimum 1) au bout duquel une
+/// connexion admise sur le quota loopback qui n'a envoyé AUCUNE requête est
+/// fermée (défaut [`DEFAULT_LOOPBACK_MAX_AGE`]).
 pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS";
-/// Une connexion admise sur le quota loopback est un DÉPASSEMENT TEMPORAIRE : le
-/// garde la ferme au bout de cette durée, de sorte que des WebSocket ou des
-/// keep-alive locaux ne puissent pas occuper le quota et exclure la sonde de
-/// santé. Choix retenu plutôt que « quota réservé aux requêtes courtes »,
-/// qui exigerait de lire la requête avant d'admettre.
+/// Le quota loopback ne sert qu'à des REQUÊTES COURTES :
+/// - toute réponse sur une connexion du quota porte `Connection: close` (pas de
+///   keep-alive : la connexion se ferme APRÈS sa réponse) ;
+/// - un upgrade WebSocket ou une SSE sur le quota est refusé en 503 propre, donc
+///   le desktop, dont le backoff repart à 1 s à chaque ouverture réussie, n'y
+///   obtient jamais de `onopen` et son backoff grandit ;
+/// - rien ne coupe jamais une requête commencée ni une réponse en cours ;
+/// - filet de sécurité (slowloris) : une connexion du quota qui n'a envoyé aucune
+///   requête au bout de ce délai est fermée EN LECTURE seulement.
 pub const DEFAULT_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(10);
+/// Plancher du délai ci-dessus.
+pub const MIN_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Le quota est borné sous la marge [`RESERVE_FDS`] : il consomme de cette marge.
 pub fn clamp_loopback_reserve(n: usize) -> usize {
@@ -481,7 +488,15 @@ pub fn monitor_report() -> MonitorReport {
 pub fn log_meter_at_startup() {
     let status = fd_status();
     if status.degraded() {
-        tracing::warn!("File descriptors: {}", status.describe());
+        tracing::warn!(
+            "File descriptors {}: {}",
+            if status.alert() {
+                "ALERT"
+            } else {
+                "meter DEGRADED"
+            },
+            status.describe()
+        );
     } else {
         tracing::info!("File descriptors: {}", status.describe());
     }
@@ -627,6 +642,8 @@ struct TrackerInner {
     loopback_reserve: AtomicUsize,
     loopback_in_use: AtomicUsize,
     loopback_max_age_ms: AtomicU64,
+    /// Pairs des connexions admises sur le quota loopback, et leur état.
+    quota_conns: Mutex<HashMap<SocketAddr, Arc<QuotaState>>>,
     rejecting: AtomicUsize,
     last_log_ms: AtomicU64,
     started: Instant,
@@ -640,12 +657,26 @@ pub struct ConnTracker {
     inner: Arc<TrackerInner>,
 }
 
+/// Durée en millisecondes, sans troncature silencieuse.
+fn millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// État d'une connexion du quota loopback.
+#[derive(Debug, Default)]
+pub struct QuotaState {
+    /// Une requête a été reçue (en-têtes lus) : plus aucune coupure, jamais.
+    pub request_seen: std::sync::atomic::AtomicBool,
+}
+
 /// Une admission : ce qu'il faut pour rendre la place au lâcher du flux.
 struct Admission {
     ip: IpAddr,
     tracked: bool,
     /// Admise sur le quota loopback, au-delà du plafond.
     reserved: bool,
+    /// Pair de la connexion (renseigné à l'acceptation, pour le quota).
+    peer: Option<SocketAddr>,
 }
 
 impl ConnTracker {
@@ -676,7 +707,8 @@ impl ConnTracker {
                 reject_write_failed: AtomicU64::new(0),
                 loopback_reserve: AtomicUsize::new(0),
                 loopback_in_use: AtomicUsize::new(0),
-                loopback_max_age_ms: AtomicU64::new(DEFAULT_LOOPBACK_MAX_AGE.as_millis() as u64),
+                loopback_max_age_ms: AtomicU64::new(millis_u64(DEFAULT_LOOPBACK_MAX_AGE)),
+                quota_conns: Mutex::new(HashMap::new()),
                 rejecting: AtomicUsize::new(0),
                 last_log_ms: AtomicU64::new(0),
                 started: Instant::now(),
@@ -692,11 +724,27 @@ impl ConnTracker {
         self.inner.loopback_reserve.store(n, Ordering::Relaxed);
     }
 
-    /// Durée maximale d'une connexion admise sur le quota loopback.
+    /// Délai avant fermeture d'une connexion du quota sans requête (minimum 1 s :
+    /// une valeur plus basse est relevée, avec un `warn`).
     pub fn set_loopback_max_age(&self, age: Duration) {
+        let age = if age < MIN_LOOPBACK_MAX_AGE {
+            tracing::warn!(
+                requested_ms = millis_u64(age),
+                used_ms = millis_u64(MIN_LOOPBACK_MAX_AGE),
+                "{ENV_LOOPBACK_MAX_AGE_SECS} raised to the 1 s minimum"
+            );
+            MIN_LOOPBACK_MAX_AGE
+        } else {
+            age
+        };
         self.inner
             .loopback_max_age_ms
-            .store(age.as_millis() as u64, Ordering::Relaxed);
+            .store(millis_u64(age), Ordering::Relaxed);
+    }
+
+    /// L'état d'une connexion du quota (pour le middleware), si `peer` en est une.
+    pub fn quota_state(&self, peer: &SocketAddr) -> Option<Arc<QuotaState>> {
+        self.inner.quota_conns.lock().unwrap().get(peer).cloned()
     }
 
     pub fn loopback_max_age(&self) -> Duration {
@@ -845,6 +893,7 @@ impl ConnTracker {
             ip,
             tracked,
             reserved,
+            peer: None,
         })
     }
 
@@ -853,6 +902,9 @@ impl ConnTracker {
         i.active.fetch_sub(1, Ordering::AcqRel);
         if a.reserved {
             i.loopback_in_use.fetch_sub(1, Ordering::AcqRel);
+            if let Some(peer) = a.peer {
+                i.quota_conns.lock().unwrap().remove(&peer);
+            }
         }
         if i.per_peer {
             let mut book = i.book.lock().unwrap();
@@ -1058,21 +1110,23 @@ pub struct GuardedStream {
     inner: TcpStream,
     admission: Admission,
     tracker: ConnTracker,
-    /// Connexion admise sur le quota loopback : fermée à l'échéance.
-    limit: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// Connexion du quota loopback : sa minuterie de filet de sécurité et son état.
+    quota: Option<(Arc<QuotaState>, std::pin::Pin<Box<tokio::time::Sleep>>)>,
 }
 
 impl GuardedStream {
-    /// `Err(TimedOut)` une fois l'échéance du quota loopback atteinte. La minuterie
-    /// est sondée avec le contexte de l'appelant : une connexion inactive est
-    /// réveillée à l'échéance, pas seulement à la prochaine E/S.
-    fn check_limit(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    /// Filet de sécurité du quota (slowloris), EN LECTURE seulement : une
+    /// connexion du quota qui n'a envoyé aucune requête à l'échéance est fermée.
+    /// Dès qu'une requête a été vue, plus jamais rien ne la coupe (ni lecture, ni
+    /// écriture). La minuterie est sondée avec le contexte de l'appelant : une
+    /// connexion silencieuse est réveillée à l'échéance.
+    fn check_idle(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         use std::future::Future;
-        if let Some(timer) = self.limit.as_mut() {
-            if timer.as_mut().poll(cx).is_ready() {
+        if let Some((state, timer)) = self.quota.as_mut() {
+            if timer.as_mut().poll(cx).is_ready() && !state.request_seen.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "loopback quota connection reached its maximum age",
+                    "loopback quota connection sent no request in time",
                 ));
             }
         }
@@ -1092,7 +1146,7 @@ impl AsyncRead for GuardedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Err(e) = self.check_limit(cx) {
+        if let Err(e) = self.check_idle(cx) {
             return Poll::Ready(Err(e));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -1105,9 +1159,6 @@ impl AsyncWrite for GuardedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Err(e) = self.check_limit(cx) {
-            return Poll::Ready(Err(e));
-        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1136,16 +1187,29 @@ impl axum::serve::Listener for GuardedListener {
         loop {
             match self.inner.accept().await {
                 Ok((stream, peer)) => match self.tracker.admit(peer.ip()) {
-                    Some(admission) => {
-                        let limit = admission
-                            .reserved
-                            .then(|| Box::pin(tokio::time::sleep(self.tracker.loopback_max_age())));
+                    Some(mut admission) => {
+                        let quota = if admission.reserved {
+                            admission.peer = Some(peer);
+                            let state = Arc::new(QuotaState::default());
+                            self.tracker
+                                .inner
+                                .quota_conns
+                                .lock()
+                                .unwrap()
+                                .insert(peer, state.clone());
+                            Some((
+                                state,
+                                Box::pin(tokio::time::sleep(self.tracker.loopback_max_age())),
+                            ))
+                        } else {
+                            None
+                        };
                         return (
                             GuardedStream {
                                 inner: stream,
                                 admission,
                                 tracker: self.tracker.clone(),
-                                limit,
+                                quota,
                             },
                             peer,
                         );
@@ -1168,6 +1232,64 @@ impl axum::serve::Listener for GuardedListener {
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.inner.local_addr()
     }
+}
+
+/// Le 503 propre d'un upgrade WebSocket ou d'une SSE sur le quota loopback.
+fn quota_refusal() -> axum::response::Response {
+    use axum::http::{header, HeaderValue, StatusCode};
+    let mut r = axum::response::Response::new(axum::body::Body::from(
+        "the loopback quota only serves short requests, retry on a normal connection",
+    ));
+    *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    r.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    r
+}
+
+/// Middleware du quota loopback (à poser autour du routeur, avec
+/// `from_fn_with_state(tracker, quota_guard)` et `ConnectInfo<SocketAddr>`).
+/// Sur une connexion admise AU-DELÀ du plafond : une requête vue désarme le filet
+/// de sécurité ; un upgrade WebSocket ou une SSE est refusé en 503 ; toute autre
+/// réponse porte `Connection: close`, donc hyper ferme APRÈS la réponse. Sur une
+/// connexion ordinaire, ou sans `ConnectInfo`, il ne fait rien.
+pub async fn quota_guard(
+    axum::extract::State(tracker): axum::extract::State<ConnTracker>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let state = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .and_then(|ci| tracker.quota_state(&ci.0));
+    let Some(state) = state else {
+        return next.run(req).await;
+    };
+    state.request_seen.store(true, Ordering::Release);
+    let header_is = |name: header::HeaderName, f: &dyn Fn(&str) -> bool| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(f)
+    };
+    let upgrade = header_is(header::UPGRADE, &|v| v.eq_ignore_ascii_case("websocket"));
+    let sse = header_is(header::ACCEPT, &|v| v.contains("text/event-stream"));
+    if upgrade || sse {
+        return quota_refusal();
+    }
+    let mut resp = next.run(req).await;
+    if resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"))
+    {
+        return quota_refusal();
+    }
+    resp.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
 }
 
 #[cfg(test)]

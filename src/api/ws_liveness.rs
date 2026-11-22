@@ -244,6 +244,12 @@ where
 /// Le côté écriture d'une socket de ce service.
 pub type WsSender = BoundedSink<SplitSink<WebSocket, Message>>;
 
+/// Test seulement : nombre d'écritures de sockets du service qui sont passées en
+/// attente (tampon d'émission plein). Un test qui veut un serveur BLOQUÉ dans son
+/// écriture attend que ce compteur monte, au lieu de dormir et d'espérer.
+#[cfg(test)]
+pub static BLOCKED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Une écriture qui n'aboutit pas dans [`WS_SEND_TIMEOUT`] PLUS le temps qu'un
 /// débit minimal de [`WS_MIN_WRITE_RATE`] octets/s mettrait à écrire le message,
 /// sans jamais dépasser [`WS_MAX_SEND_TIMEOUT`] (5 minutes),
@@ -270,13 +276,18 @@ pub struct BoundedSink<S> {
     stall: Option<Pin<Box<Sleep>>>,
     /// Taille du dernier message accepté : elle allonge le délai.
     last_len: usize,
+    /// Compte dans [`BLOCKED_WRITES`] (les sockets du service, pas les tests unitaires).
+    #[cfg_attr(not(test), allow(dead_code))]
+    track: bool,
     /// Set by the first failed or stalled write: every later operation fails at once.
     broken: bool,
 }
 
 impl<S> BoundedSink<S> {
     pub fn new(inner: S) -> Self {
-        Self::with_limit(inner, WS_SEND_TIMEOUT)
+        let mut sink = Self::with_limit(inner, WS_SEND_TIMEOUT);
+        sink.track = true;
+        sink
     }
     pub fn with_limit(inner: S, limit: Duration) -> Self {
         Self {
@@ -284,6 +295,7 @@ impl<S> BoundedSink<S> {
             limit,
             stall: None,
             last_len: 0,
+            track: false,
             broken: false,
         }
     }
@@ -318,6 +330,12 @@ where
                 Poll::Ready(r)
             }
             Poll::Pending => {
+                #[cfg(test)]
+                {
+                    if self.track && self.stall.is_none() {
+                        BLOCKED_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 let proportional =
                     self.limit + Duration::from_secs((self.last_len / WS_MIN_WRITE_RATE) as u64);
                 // Never more than the absolute ceiling (unless the base itself is higher).
