@@ -1290,12 +1290,14 @@ fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> Option<serd
 /// explicit, never a silently amputated stream. Only events of this session are
 /// replayed: the journal is a single durable cursor space shared by all
 /// sessions, so a session's client sees only its own events.
-async fn replay_from_journal(
-    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+async fn replay_from_journal<S>(
+    ws_sender: &mut S,
     journal: &crate::events::chat_transport::JournalTransport,
     session_id: &str,
     since: i64,
-) {
+) where
+    S: futures::Sink<Message> + Unpin,
+{
     let since = u64::try_from(since.max(0)).unwrap_or(0);
     match journal.replay(since) {
         Ok(events) => {
