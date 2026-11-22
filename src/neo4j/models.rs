@@ -1066,19 +1066,25 @@ pub struct StepNode {
     pub persona: Option<String>,
 }
 
-/// What deleting a task removed along with it.
+/// What deleting a task removed along with it, and what it let go.
 ///
-/// A task owns its steps and the decisions recorded on it
-/// (`(Task)-[:INFORMED_BY]->(Decision)`): deleting the task deletes them, as
-/// deleting a plan or a project does. That used to happen behind a `()`: the
-/// caller learned of the lost decisions when reading one answered 404
-/// (issue #1189). The cascade is unchanged; it is now reported.
+/// A task owns its steps: deleting the task deletes them. Its decisions
+/// (`(Task)-[:INFORMED_BY]->(Decision)`) outlive it: the edge is removed, the
+/// decision and its AFFECTS edges stay, and it then belongs to no task — a
+/// decision records why something was decided, which a cleaned-up task does
+/// not undo. They used to be deleted silently (issue #1189), then deleted and
+/// reported (#1223); they are now detached and reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDeletion {
     /// Steps deleted with the task.
     pub steps_deleted: usize,
-    /// Decisions deleted with the task.
+    /// Decisions deleted with the task. Always empty since the decisions
+    /// survive their task; kept so the wire contract stays additive.
+    #[serde(default)]
     pub deleted_decision_ids: Vec<Uuid>,
+    /// Decisions that were the task's and now belong to no task.
+    #[serde(default)]
+    pub detached_decision_ids: Vec<Uuid>,
 }
 
 /// Status of a step

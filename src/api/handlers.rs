@@ -667,7 +667,7 @@ pub async fn update_plan_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete a plan and all its related data
+/// Delete a plan, its tasks, steps and constraints (its tasks' decisions are detached, not destroyed)
 pub async fn delete_plan(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
@@ -733,23 +733,27 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
-/// What `DELETE /api/tasks/{id}` removed.
+/// What `DELETE /api/tasks/{id}` removed, and what it let go.
 #[derive(Debug, Serialize)]
 pub struct DeleteTaskResponse {
     pub deleted: bool,
     /// Steps deleted with the task.
     pub steps_deleted: usize,
-    /// Decisions deleted with the task (`deleted_decision_ids.len()`).
+    /// Decisions deleted with the task (`deleted_decision_ids.len()`): 0 since
+    /// the decisions survive their task. Kept so the contract stays additive.
     pub decisions_deleted: usize,
+    /// Always empty now; kept so the contract stays additive.
     pub deleted_decision_ids: Vec<Uuid>,
+    /// The task's decisions: they still exist, with their AFFECTS, and now
+    /// belong to no task.
+    pub detached_decision_ids: Vec<Uuid>,
 }
 
-/// Delete a task and all its related data.
+/// Delete a task and its steps; its decisions are detached, not deleted.
 ///
-/// The task's steps and decisions go with it — the same ownership rule as
-/// deleting a plan or a project. The answer used to be an empty 204, so the
-/// loss of the decisions was discovered later, by a 404 (issue #1189): it now
-/// says how many went and which ones.
+/// The steps go with the task. The decisions survive it (issue #1189): the
+/// link to the task is removed, the decision and its AFFECTS stay, and the
+/// answer names them in `detached_decision_ids`.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
@@ -763,7 +767,8 @@ pub async fn delete_task(
         %task_id,
         steps_deleted = report.steps_deleted,
         decisions_deleted = report.deleted_decision_ids.len(),
-        "task deleted with its steps and decisions"
+        decisions_detached = report.detached_decision_ids.len(),
+        "task deleted with its steps, its decisions detached"
     );
     state
         .event_bus
@@ -773,6 +778,7 @@ pub async fn delete_task(
         steps_deleted: report.steps_deleted,
         decisions_deleted: report.deleted_decision_ids.len(),
         deleted_decision_ids: report.deleted_decision_ids,
+        detached_decision_ids: report.detached_decision_ids,
     }))
 }
 
@@ -15505,20 +15511,21 @@ pub(crate) mod tests {
         assert_eq!(step.status, crate::neo4j::models::StepStatus::Skipped);
     }
 
-    /// DELETE /api/tasks/{id} takes the task's steps and decisions with it. It
-    /// used to do so behind an empty 204: the caller learned of the lost
-    /// decisions when `decision get` answered 404.
+    /// DELETE /api/tasks/{id} takes the task's steps with it and lets its
+    /// decisions go: they survive, detached, and the answer names them. They
+    /// used to be deleted behind an empty 204 (the caller learned of it when
+    /// `decision get` answered 404), then deleted and reported (#1223).
     #[tokio::test]
-    async fn deleting_a_task_says_which_decisions_went_with_it() {
+    async fn deleting_a_task_says_which_decisions_it_detached() {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let task_id = seeded_task(&graph).await;
         let bystander = seeded_task(&graph).await;
         let (app, _bus) = test_app_parts(graph.clone()).await;
 
         let decision = serde_json::json!({ "description": "d", "rationale": "r" });
-        let mut lost = Vec::new();
+        let mut freed = Vec::new();
         for _ in 0..2 {
-            lost.push(
+            freed.push(
                 posted_id(
                     &app,
                     &format!("/api/tasks/{task_id}/decisions"),
@@ -15548,25 +15555,37 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp_json(resp).await;
         assert_eq!(json["deleted"], true);
-        assert_eq!(json["decisions_deleted"], 2);
         assert_eq!(json["steps_deleted"], 1);
-        let mut reported: Vec<String> = json["deleted_decision_ids"]
+        // Additive contract: the old fields are still there, and say nothing
+        // was deleted.
+        assert_eq!(json["decisions_deleted"], 0);
+        assert_eq!(json["deleted_decision_ids"], serde_json::json!([]));
+        let mut reported: Vec<String> = json["detached_decision_ids"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         reported.sort();
-        lost.sort();
-        assert_eq!(reported, lost);
+        freed.sort();
+        assert_eq!(reported, freed);
 
-        // What the answer says is what happened.
-        for id in &lost {
-            assert!(graph
-                .get_decision(id.parse().unwrap())
+        // What the answer says is what happened: the decisions are still
+        // read, through the API, and belong to no task.
+        for id in &freed {
+            let resp = app
+                .clone()
+                .oneshot(auth_get(&format!("/api/decisions/{id}")))
                 .await
-                .unwrap()
-                .is_none());
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "decision {id}");
+            let uuid: Uuid = id.parse().unwrap();
+            assert!(graph
+                .task_decisions
+                .read()
+                .await
+                .values()
+                .all(|ds| !ds.contains(&uuid)));
         }
         assert!(graph
             .get_decision(kept.parse().unwrap())
@@ -15696,11 +15715,12 @@ pub(crate) mod tests {
         let line = events
             .iter()
             .find(|l| {
-                l.contains("task deleted with its steps and decisions")
+                l.contains("task deleted with its steps, its decisions detached")
                     && l.contains(&task_id.to_string())
             })
             .unwrap_or_else(|| panic!("no deletion line for {task_id} in {events:?}"));
-        assert!(line.contains("decisions_deleted=2"), "{line}");
+        assert!(line.contains("decisions_detached=2"), "{line}");
+        assert!(line.contains("decisions_deleted=0"), "{line}");
         assert!(line.contains("steps_deleted=1"), "{line}");
     }
 

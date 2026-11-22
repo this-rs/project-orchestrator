@@ -986,7 +986,8 @@ pub trait PlanStore: Send + Sync {
     /// Unlink a plan from its project
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
 
-    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    /// Delete a plan, its tasks, steps and constraints. The tasks' decisions survive: detached
+    /// (and kept in the plan's project by `HAS_DECISION`), as in `delete_task`.
     async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
 
     // ========================================================================
@@ -1078,8 +1079,8 @@ pub trait PlanStore: Send + Sync {
         prompt_cache: Option<&str>,
     ) -> Result<()>;
 
-    /// Delete a task and all its related data (steps, decisions), and report
-    /// what went with it. An id that names no task deletes nothing and reports
+    /// Delete a task and its steps, detach its decisions (they survive, with
+    /// their AFFECTS, and belong to no task), and report both. An id that names no task deletes nothing and reports
     /// an empty [`TaskDeletion`](crate::neo4j::models::TaskDeletion).
     async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion>;
 
