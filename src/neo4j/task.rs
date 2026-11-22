@@ -748,8 +748,8 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Delete a task and all its related data (steps, decisions), and report
-    /// what went with it.
+    /// Delete a task and its steps, detach its decisions (they survive, with
+    /// no task), and report both.
     pub async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion> {
         // Delete all steps belonging to this task. The aggregation yields one
         // row even when nothing matches, so the count is always read.
@@ -768,20 +768,35 @@ impl Neo4jClient {
             None => 0,
         };
 
-        // Delete all decisions belonging to this task; their ids are read
-        // before the delete, in the same statement.
+        // The task's decisions survive it (issue #1189): only the
+        // `(Task)-[:INFORMED_BY]->(Decision)` edge goes, the decision and its
+        // AFFECTS edges stay. A decision recorded with `create_decision` has
+        // NO direct project edge: its project is reached only through that
+        // INFORMED_BY edge (Project -> Plan -> Task -> Decision), which every
+        // project-scoped read relies on. So, BEFORE the edge goes and in the
+        // SAME statement (atomic), the task's project, when it has one, is
+        // linked to the decision by `HAS_DECISION` (what `create_decision_global`
+        // writes when a project is given); otherwise the decision would survive
+        // but vanish from its project's lists and searches. A task whose plan
+        // has no project gets no such edge (there is no project to keep it in).
+        // MERGE keeps it idempotent and shared with a second task's decision.
+        // The decision then has no task, if this was its only one; with a second
+        // INFORMED_BY task it stays linked to that one. Ids are read in the same
+        // statement; the aggregation yields one row even when nothing matches.
         let q = query(
             r#"
-            MATCH (t:Task {id: $id})-[:INFORMED_BY]->(d:Decision)
-            WITH collect(DISTINCT d) AS decisions
-            WITH decisions, [d IN decisions | d.id] AS ids
-            FOREACH (d IN decisions | DETACH DELETE d)
+            MATCH (t:Task {id: $id})-[r:INFORMED_BY]->(d:Decision)
+            OPTIONAL MATCH (proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t)
+            WITH r, d, collect(DISTINCT proj) AS projects
+            FOREACH (p IN projects | MERGE (p)-[:HAS_DECISION]->(d))
+            WITH collect(r) AS links, collect(DISTINCT d.id) AS ids
+            FOREACH (r IN links | DELETE r)
             RETURN ids
             "#,
         )
         .param("id", task_id.to_string());
         let mut result = self.graph.execute(q).await?;
-        let deleted_decision_ids = match result.next().await? {
+        let detached_decision_ids = match result.next().await? {
             Some(row) => row
                 .get::<Vec<String>>("ids")?
                 .iter()
@@ -802,7 +817,8 @@ impl Neo4jClient {
 
         Ok(crate::neo4j::models::TaskDeletion {
             steps_deleted,
-            deleted_decision_ids,
+            deleted_decision_ids: Vec::new(),
+            detached_decision_ids,
         })
     }
 

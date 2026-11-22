@@ -303,6 +303,7 @@ pub async fn ws_activity(
         }
     };
 
+    let beat = super::ws_liveness::Beat::from_headers(&headers);
     let neo4j = state.orchestrator.neo4j_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
@@ -337,7 +338,7 @@ pub async fn ws_activity(
                 "WS /ws/activity: authenticated, upgrading"
             );
             ws.on_upgrade(move |socket| {
-                handle_activity_ws(socket, state, filters, query.last_seq, claims)
+                handle_activity_ws(socket, state, filters, query.last_seq, claims, beat)
             })
             .into_response()
         }
@@ -386,9 +387,11 @@ async fn handle_activity_ws(
     mut filters: Filters,
     last_seq: Option<u64>,
     claims: Claims,
+    beat: super::ws_liveness::Beat,
 ) {
     super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, None).await;
-    let (mut sender, mut receiver) = socket.split();
+    let (sender_raw, mut receiver) = socket.split();
+    let mut sender = super::ws_liveness::BoundedSink::new(sender_raw);
 
     let hub = state.event_bus.activity().clone();
     let graph = state.orchestrator.neo4j_arc();
@@ -452,78 +455,84 @@ async fn handle_activity_ws(
         }
     }
 
-    let mut ping_interval = interval(Duration::from_secs(30));
+    let mut ping_interval = interval(beat.ping_every);
     ping_interval.tick().await; // skip the immediate first tick
+    let mut liveness = super::ws_liveness::Liveness::new(beat.pong_timeout);
     let mut refresh_interval = interval(INDEX_REFRESH_INTERVAL);
     refresh_interval.tick().await;
     let mut last_forced_refresh = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
-            received = rx.recv() => {
-                match received {
-                    Ok(mut event) => {
-                        if event.seq <= sent_seq {
-                            continue;
-                        }
-                        sent_seq = event.seq;
-                        attribute(&mut event, &index);
-                        // A run or session we have never seen (started after the
-                        // last refresh): look again, at most once every couple of
-                        // seconds, so a burst of unknown ids cannot hammer Neo4j.
-                        if filters.is_scoped()
-                            && !index.knows(&event)
-                            && event.category != ActivityCategory::Entity
-                            && last_forced_refresh.elapsed() >= UNKNOWN_ID_REFRESH_FLOOR
-                        {
-                            index.refresh(&graph, chat.as_ref()).await;
-                            last_forced_refresh = tokio::time::Instant::now();
-                            attribute(&mut event, &index);
-                        }
-                        let project_id = index.project_of(&event);
-                        let session_slug = index.slug_of_session(&event.entity_id).map(str::to_string);
-                        if filters.accepts(&event, project_id, session_slug.as_deref())
-                            && !send_json(&mut sender, &ActivityFrame::Activity { event: &event }).await
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "WS /ws/activity: client lagged, dropping events");
-                        if !send_json(&mut sender, &ActivityFrame::LagDropped { skipped }).await {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("WS /ws/activity: activity channel closed");
-                        break;
-                    }
+        // `biased`: read what the client sent BEFORE judging a missed Pong, so a
+        // Pong that arrived while the loop was busy is never lost to the tick.
+        biased;
+
+
+        incoming = receiver.next() => {
+            match incoming {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Pong(payload))) => {
+                    liveness.on_pong(&payload);
                 }
-            }
-
-            _ = refresh_interval.tick() => {
-                index.refresh(&graph, chat.as_ref()).await;
-                last_forced_refresh = tokio::time::Instant::now();
-            }
-
-            incoming = receiver.next() => {
-                match incoming {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
-                        debug!(%error, "WS /ws/activity: socket error");
-                        break;
-                    }
-                }
-            }
-
-            _ = ping_interval.tick() => {
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    debug!(%error, "WS /ws/activity: socket error");
                     break;
                 }
             }
         }
+
+        _ = ping_interval.tick() => {
+            if !super::ws_liveness::ping_tick(&mut liveness, &mut sender, "activity").await {
+                break;
+            }
+        }
+        received = rx.recv() => {
+            match received {
+                Ok(mut event) => {
+                    if event.seq <= sent_seq {
+                        continue;
+                    }
+                    sent_seq = event.seq;
+                    attribute(&mut event, &index);
+                    // A run or session we have never seen (started after the
+                    // last refresh): look again, at most once every couple of
+                    // seconds, so a burst of unknown ids cannot hammer Neo4j.
+                    if filters.is_scoped()
+                        && !index.knows(&event)
+                        && event.category != ActivityCategory::Entity
+                        && last_forced_refresh.elapsed() >= UNKNOWN_ID_REFRESH_FLOOR
+                    {
+                        index.refresh(&graph, chat.as_ref()).await;
+                        last_forced_refresh = tokio::time::Instant::now();
+                        attribute(&mut event, &index);
+                    }
+                    let project_id = index.project_of(&event);
+                    let session_slug = index.slug_of_session(&event.entity_id).map(str::to_string);
+                    if filters.accepts(&event, project_id, session_slug.as_deref())
+                        && !send_json(&mut sender, &ActivityFrame::Activity { event: &event }).await
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "WS /ws/activity: client lagged, dropping events");
+                    if !send_json(&mut sender, &ActivityFrame::LagDropped { skipped }).await {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!("WS /ws/activity: activity channel closed");
+                    break;
+                }
+            }
+        }
+
+        _ = refresh_interval.tick() => {
+            index.refresh(&graph, chat.as_ref()).await;
+            last_forced_refresh = tokio::time::Instant::now();
+        }}
     }
 
     debug!(email = %claims.email, "WS /ws/activity disconnected");
@@ -543,10 +552,7 @@ fn attribute(event: &mut ActivityEvent, index: &AttributionIndex) {
 }
 
 /// Send one JSON frame. Returns `false` when the socket is gone.
-async fn send_json<S>(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    value: &S,
-) -> bool
+async fn send_json<S>(sender: &mut super::ws_liveness::WsSender, value: &S) -> bool
 where
     S: Serialize,
 {
