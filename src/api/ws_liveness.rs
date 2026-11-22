@@ -279,6 +279,10 @@ pub struct BoundedSink<S> {
     /// Compte dans [`BLOCKED_WRITES`] (les sockets du service, pas les tests unitaires).
     #[cfg_attr(not(test), allow(dead_code))]
     track: bool,
+    /// Ce puits a déjà été compté dans [`BLOCKED_WRITES`] : une socket qui se bloque,
+    /// se débloque puis se rebloque ne compte qu'une fois.
+    #[cfg_attr(not(test), allow(dead_code))]
+    counted: bool,
     /// Set by the first failed or stalled write: every later operation fails at once.
     broken: bool,
 }
@@ -296,6 +300,7 @@ impl<S> BoundedSink<S> {
             stall: None,
             last_len: 0,
             track: false,
+            counted: false,
             broken: false,
         }
     }
@@ -332,7 +337,8 @@ where
             Poll::Pending => {
                 #[cfg(test)]
                 {
-                    if self.track && self.stall.is_none() {
+                    if self.track && !self.counted {
+                        self.counted = true;
                         BLOCKED_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }

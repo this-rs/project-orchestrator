@@ -51,8 +51,9 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 /// - un upgrade WebSocket ou une SSE sur le quota est refusé en 503 propre, donc
 ///   le desktop, dont le backoff repart à 1 s à chaque ouverture réussie, n'y
 ///   obtient jamais de `onopen` et son backoff grandit ;
-/// - rien ne coupe une requête dont les en-têtes sont complets ni une réponse en
-///   cours (une réponse longue non-SSE n'est donc PAS bornée sur le quota) ;
+/// - rien ne coupe une requête dont hyper a analysé l'en-tête (il n'appelle le
+///   service qu'alors ; le corps peut arriver lentement) ni une réponse en cours
+///   (une réponse longue non-SSE n'est donc PAS bornée sur le quota) ;
 /// - HTTP/2 en clair (h2c, sans `Connection: close`) est refusé sur le quota ;
 /// - filet de sécurité (slowloris) : une connexion du quota dont les en-têtes ne
 ///   sont pas complets (rien reçu, ou en-têtes partiels) au bout de ce délai est
@@ -1127,11 +1128,15 @@ pub struct GuardedStream {
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 impl GuardedStream {
-    /// Filet de sécurité du quota (slowloris), EN LECTURE seulement : une
-    /// connexion du quota qui n'a envoyé aucune requête à l'échéance est fermée.
-    /// Dès qu'une requête a été vue, plus jamais rien ne la coupe (ni lecture, ni
-    /// écriture). La minuterie est sondée avec le contexte de l'appelant : une
-    /// connexion silencieuse est réveillée à l'échéance.
+    /// Filet de sécurité du quota (slowloris), EN LECTURE seulement, et seulement
+    /// quand aucun octet n'est disponible (appelé sur `Pending`) : une connexion du
+    /// quota dont hyper n'a pas encore analysé la ligne et les en-têtes de requête
+    /// (rien reçu, ou en-têtes partiels) à l'échéance est fermée. Hyper n'appelle le
+    /// service qu'une fois l'en-tête complet : c'est alors que `request_seen` est
+    /// posé (par le middleware), et plus jamais rien ne coupe la connexion — ni
+    /// lecture, ni écriture, même si le corps de la requête arrive lentement. La
+    /// minuterie est sondée avec le contexte de l'appelant : une connexion silencieuse
+    /// est réveillée à l'échéance.
     fn check_idle(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         use std::future::Future;
         if let Some((state, timer)) = self.quota.as_mut() {
@@ -1271,24 +1276,6 @@ impl axum::serve::Listener for GuardedListener {
     }
 }
 
-/// `true` si `text/event-stream` est le SEUL type accepté. Les POST du transport
-/// MCP « Streamable HTTP » envoient `Accept: application/json, text/event-stream`
-/// (la spécification l'impose) : ils acceptent aussi du JSON et doivent être servis.
-pub fn accepts_only_sse(accept: &str) -> bool {
-    let mut any = false;
-    for part in accept.split(',') {
-        let media = part.split(';').next().unwrap_or("").trim();
-        if media.is_empty() {
-            continue;
-        }
-        if !media.eq_ignore_ascii_case("text/event-stream") {
-            return false;
-        }
-        any = true;
-    }
-    any
-}
-
 fn header_matches(
     headers: &axum::http::HeaderMap,
     name: &'static str,
@@ -1337,8 +1324,12 @@ pub async fn quota_guard(
     let upgrade = header_matches(req.headers(), "upgrade", |v| {
         v.eq_ignore_ascii_case("websocket")
     });
-    let sse = header_matches(req.headers(), "accept", accepts_only_sse);
-    if upgrade || sse {
+    // An SSE is NOT refused on its request headers (`Accept`): the MCP Streamable
+    // HTTP transport sends `Accept: text/event-stream` on its GET, which the handler
+    // answers 405 ("no server stream"), and a POST carries
+    // `Accept: application/json, text/event-stream`. A response that IS an event
+    // stream is refused below, by its `Content-Type`.
+    if upgrade {
         return quota_refusal();
     }
     let mut resp = next.run(req).await;
@@ -1494,17 +1485,6 @@ mod tests {
         assert_eq!(clamp_loopback_reserve(8), 8);
         assert_eq!(clamp_loopback_reserve(1000), RESERVE_FDS as usize / 2);
         assert_eq!(clamp_loopback_reserve(0), 0);
-    }
-
-    #[test]
-    fn only_a_pure_event_stream_accept_is_an_sse_request() {
-        assert!(accepts_only_sse("text/event-stream"));
-        assert!(accepts_only_sse(" Text/Event-Stream ; q=1 "));
-        // The MCP Streamable HTTP transport sends this on every POST: it must be served.
-        assert!(!accepts_only_sse("application/json, text/event-stream"));
-        assert!(!accepts_only_sse("text/event-stream, */*"));
-        assert!(!accepts_only_sse("*/*"));
-        assert!(!accepts_only_sse(""));
     }
 
     #[test]

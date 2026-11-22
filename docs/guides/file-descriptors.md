@@ -32,17 +32,18 @@
   half the 64 margin, logged at startup) connections OVER the cap. The quota is
   for SHORT REQUESTS ONLY. Every response on a quota connection carries
   `Connection: close` (the connection closes after its response, no keep-alive);
-  a WebSocket upgrade, or a request whose `Accept` is ONLY `text/event-stream`, or
-  a response whose `Content-Type` is `text/event-stream`, gets a clean `503` (the
+  a WebSocket upgrade, or a response whose `Content-Type` is `text/event-stream`,
+  gets a clean `503` (the
   desktop therefore never reaches `onopen` through the quota and its reconnect
-  backoff keeps growing). An MCP Streamable HTTP POST
-  (`Accept: application/json, text/event-stream`) is served. HTTP/2 in clear text
+  backoff keeps growing). The MCP Streamable HTTP requests are served: a POST
+  (`Accept: application/json, text/event-stream`), and the GET
+  (`Accept: text/event-stream`) whose 405 tells the client there is no server stream. HTTP/2 in clear text
   (h2c) is refused on the quota: it has no `Connection: close`, and hyper-util's
   `http2` feature is enabled in this build (checked with
-  `cargo tree -e features -i hyper-util`). Nothing cuts a request whose headers are
-  complete, nor a response in progress: a LONG non-SSE response on a quota
+  `cargo tree -e features -i hyper-util`). Nothing cuts a request once hyper has parsed its head (it calls the service only
+  then; the body may arrive slowly), nor a response in progress: a LONG non-SSE response on a quota
   connection is not bounded. As a safety net against slow-loris, a quota
-  connection whose request headers are not complete (nothing received, or partial
+  connection whose request head is not complete (nothing received, or partial
   headers) after `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1) is
   closed, on the read side only and only when no byte is available. Silent local
   connections can therefore hold the quota for that long. A LAN health probe is

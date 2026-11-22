@@ -106,7 +106,19 @@ fn child_server() {
                     }
                 }),
             )
-            .route("/mcp", axum::routing::post(|| async { "ok" }))
+            .route(
+                "/mcp",
+                axum::routing::post(|| async { "ok" }).get(|| async {
+                    // The MCP handler answers a GET with 405: "no server stream".
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED
+                }),
+            )
+            .route(
+                "/mcp-stream",
+                axum::routing::post(|| async {
+                    ([("content-type", "text/event-stream")], "data: hello\n\n")
+                }),
+            )
             .route(
                 "/slow",
                 get(|| async {
@@ -1183,12 +1195,42 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
     hello.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
     c.write_all(&hello).await.unwrap();
     let mut got = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut got)).await;
+    // The server must CLOSE the connection (EOF, or a reset): a connection left open
+    // and mute would hold its quota slot.
+    let closed = tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut got)).await;
+    assert!(
+        closed.is_ok(),
+        "the h2c connection was left open and mute on the quota"
+    );
     assert!(
         got.is_empty(),
         "h2c was served on the quota (answered {} bytes: {:?})",
         got.len(),
         String::from_utf8_lossy(&got[..got.len().min(40)])
+    );
+    // And its quota slot is given back: a new request on the quota is served.
+    let r = get(srv.port, "/health", Duration::from_secs(3))
+        .await
+        .expect("no answer after h2c");
+    assert_eq!(
+        r.0, 200,
+        "the quota slot of the refused h2c connection was not given back"
+    );
+
+    // The MCP GET (Accept: text/event-stream only) is NOT a stream request: the
+    // handler's 405 reaches the client ("no server stream") instead of a 503.
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    send_get_with(&mut c, "/mcp", "Accept: text/event-stream\r\n").await;
+    assert_eq!(read_response(&mut c).await.unwrap().0, 405);
+    // A POST whose RESPONSE is an event stream is refused (guard of the Content-Type check).
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let req = "POST /mcp-stream HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\
+               Accept: application/json, text/event-stream\r\n\r\n{}";
+    c.write_all(req.as_bytes()).await.unwrap();
+    let (status, _, body) = read_response(&mut c).await.unwrap();
+    assert_eq!(
+        status, 503,
+        "an SSE response was served on the quota: {body}"
     );
     drop(holders);
 }
