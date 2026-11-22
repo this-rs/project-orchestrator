@@ -787,6 +787,16 @@ jobs:
           set -o pipefail
           cargo test --features obrain-backend --lib storage::migrator 2>&1 | tee /tmp/migrator.log
           grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/migrator.log
+      # Fail-closed publication components (storage::publish, not wired into startup): the
+      # positional filter of the step above does not match them, so they get their own step.
+      # Update the expected count below when tests are added or removed. The filter is a
+      # SUBSTRING of the test path (it would also match e.g. `storage::publisher`).
+      - name: Run the publication component tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --lib storage::publish 2>&1 | tee /tmp/publish.log
+          # Exact count: a silently filtered or removed test fails the step.
+          grep -E 'test result: ok\. 92 passed; 0 failed' /tmp/publish.log
       - name: Run the task-and-step portage tests
         run: |
           set -o pipefail
