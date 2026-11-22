@@ -26,15 +26,15 @@ const WAIT: Duration = Duration::from_secs(10);
 type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-struct Rig {
-    sid: String,
-    addr: std::net::SocketAddr,
+pub(super) struct Rig {
+    pub(super) sid: String,
+    pub(super) addr: std::net::SocketAddr,
 }
 
 /// A server (no-auth mode) over a store holding one chat session, registered
 /// live as streaming — or idle — without any CLI: the handler reads the
 /// session's own flag, it never asks the CLI whether it is alive.
-async fn rig(streaming: bool) -> Rig {
+pub(super) async fn rig(streaming: bool) -> Rig {
     let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let session = test_chat_session(None);
     graph.create_chat_session(&session).await.unwrap();

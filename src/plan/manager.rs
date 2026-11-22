@@ -264,8 +264,7 @@ impl PlanManager {
         Ok(())
     }
 
-    /// Delete a task and all its related data (steps, decisions), and report
-    /// what went with it.
+    /// Delete a task and its steps, detach its decisions, and report both.
     pub async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion> {
         let report = self.neo4j.delete_task(task_id).await?;
         self.emit(CrudEvent::new(

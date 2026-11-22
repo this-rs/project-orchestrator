@@ -231,6 +231,104 @@ pub struct HealthResponse {
     pub storage_capabilities: StoreCapabilities,
 }
 
+/// Descriptor usage and inbound connection counters. NOT part of the public
+/// `/health` payload (numbers that calibrate a saturation attack): served to
+/// authenticated users by `GET /api/diagnostics/resources`. `/health` only turns
+/// `"degraded"` when the descriptor alert is up OR the meter is blind.
+#[derive(Serialize)]
+pub struct ResourceUsage {
+    /// `null` when the measurement is impossible (see `fd_measure_error`).
+    pub open_fds: Option<usize>,
+    /// Soft limit; `null` when unlimited.
+    pub fd_soft_limit: Option<u64>,
+    /// `open_fds / fd_soft_limit` in percent; `null` when unlimited OR when the
+    /// measurement is impossible (never invented).
+    pub fd_percent: Option<u32>,
+    /// `true` from 80 %, and ALSO when the measurement is impossible.
+    pub fd_alert: bool,
+    /// Why the measurement is unavailable (errno), if it is: "impossible" when the
+    /// table is full (also raises `fd_alert`), "unavailable" otherwise (static cap
+    /// in use, status degraded, no saturation alert).
+    pub fd_measure_error: Option<String>,
+    pub connections: usize,
+    /// Inbound cap in force right now; 0 = no cap.
+    pub max_connections: usize,
+    /// Inbound connections refused with 503 since start.
+    pub connections_rejected: u64,
+    /// `accept` failures (EMFILE...) since start.
+    pub accept_errors: u64,
+}
+
+#[cfg(unix)]
+fn resource_usage() -> Option<ResourceUsage> {
+    use crate::fd_guard::{fd_status, global, FdStatus, UNLIMITED};
+    let status = fd_status();
+    let snap = global().map(|t| t.snapshot_counters());
+    let (open_fds, fd_soft_limit, fd_percent, fd_measure_error) = match status {
+        FdStatus::Usage(u) => {
+            let limited = u.soft_limit != UNLIMITED;
+            (
+                Some(u.open),
+                limited.then_some(u.soft_limit),
+                limited.then(|| (u.ratio() * 100.0) as u32),
+                None,
+            )
+        }
+        // The same wording as the log: "impossible" only when the table is full,
+        // "unavailable" (static cap in use) for any other reason.
+        FdStatus::Unavailable { .. } => (None, None, None, Some(status.describe())),
+    };
+    Some(ResourceUsage {
+        open_fds,
+        fd_soft_limit,
+        fd_percent,
+        fd_alert: status.alert(),
+        fd_measure_error,
+        connections: snap.as_ref().map_or(0, |s| s.active),
+        max_connections: global().and_then(|t| t.effective_cap()).unwrap_or(0),
+        connections_rejected: snap.as_ref().map_or(0, |s| s.rejected),
+        accept_errors: snap.as_ref().map_or(0, |s| s.accept_errors),
+    })
+}
+
+#[cfg(not(unix))]
+fn resource_usage() -> Option<ResourceUsage> {
+    None
+}
+
+/// The `/health` status: `unhealthy` without Neo4j, `degraded` when Meilisearch
+/// is down OR the descriptor meter is degraded (alert, or blind: see `fd_guard`),
+/// `ok` otherwise.
+pub fn health_status(neo4j_ok: bool, meili_ok: bool, fd_degraded: bool) -> &'static str {
+    if neo4j_ok && meili_ok && !fd_degraded {
+        "ok"
+    } else if neo4j_ok {
+        "degraded"
+    } else {
+        "unhealthy"
+    }
+}
+
+/// `/health` turns `degraded` on the 80 % alert OR when the meter is blind
+/// (one `/dev/fd` listing, no counters).
+#[cfg(unix)]
+fn fd_degraded() -> bool {
+    crate::fd_guard::fd_status().degraded()
+}
+
+#[cfg(not(unix))]
+fn fd_degraded() -> bool {
+    false
+}
+
+/// `GET /api/diagnostics/resources` (authenticated): descriptor usage and inbound
+/// connection counters (see `fd_guard`).
+pub async fn resource_diagnostics() -> Result<Json<ResourceUsage>, StatusCode> {
+    resource_usage()
+        .map(Json)
+        .ok_or(StatusCode::NOT_IMPLEMENTED)
+}
+
 /// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
 ///
 /// Returns:
@@ -259,13 +357,9 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
             .map(|emitter| emitter.transport_state()),
     );
 
-    let status = if neo4j_ok && meili_ok {
-        "ok"
-    } else if neo4j_ok {
-        "degraded"
-    } else {
-        "unhealthy"
-    };
+    // Only a state, never the numbers: the descriptor alert, or a blind meter,
+    // degrades the status.
+    let status = health_status(neo4j_ok, meili_ok, fd_degraded());
 
     let http_status = if neo4j_ok {
         StatusCode::OK
@@ -578,7 +672,7 @@ pub async fn update_plan_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete a plan and all its related data
+/// Delete a plan, its tasks, steps and constraints (its tasks' decisions are detached, not destroyed)
 pub async fn delete_plan(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
@@ -644,23 +738,27 @@ pub async fn get_task(
     Ok(Json(body))
 }
 
-/// What `DELETE /api/tasks/{id}` removed.
+/// What `DELETE /api/tasks/{id}` removed, and what it let go.
 #[derive(Debug, Serialize)]
 pub struct DeleteTaskResponse {
     pub deleted: bool,
     /// Steps deleted with the task.
     pub steps_deleted: usize,
-    /// Decisions deleted with the task (`deleted_decision_ids.len()`).
+    /// Decisions deleted with the task (`deleted_decision_ids.len()`): 0 since
+    /// the decisions survive their task. Kept so the contract stays additive.
     pub decisions_deleted: usize,
+    /// Always empty now; kept so the contract stays additive.
     pub deleted_decision_ids: Vec<Uuid>,
+    /// The task's decisions: they still exist, with their AFFECTS, and now
+    /// belong to no task.
+    pub detached_decision_ids: Vec<Uuid>,
 }
 
-/// Delete a task and all its related data.
+/// Delete a task and its steps; its decisions are detached, not deleted.
 ///
-/// The task's steps and decisions go with it — the same ownership rule as
-/// deleting a plan or a project. The answer used to be an empty 204, so the
-/// loss of the decisions was discovered later, by a 404 (issue #1189): it now
-/// says how many went and which ones.
+/// The steps go with the task. The decisions survive it (issue #1189): the
+/// link to the task is removed, the decision and its AFFECTS stay, and the
+/// answer names them in `detached_decision_ids`.
 pub async fn delete_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
@@ -674,7 +772,8 @@ pub async fn delete_task(
         %task_id,
         steps_deleted = report.steps_deleted,
         decisions_deleted = report.deleted_decision_ids.len(),
-        "task deleted with its steps and decisions"
+        decisions_detached = report.detached_decision_ids.len(),
+        "task deleted with its steps, its decisions detached"
     );
     state
         .event_bus
@@ -684,6 +783,7 @@ pub async fn delete_task(
         steps_deleted: report.steps_deleted,
         decisions_deleted: report.deleted_decision_ids.len(),
         deleted_decision_ids: report.deleted_decision_ids,
+        detached_decision_ids: report.detached_decision_ids,
     }))
 }
 
@@ -8778,6 +8878,17 @@ pub(crate) mod tests {
             assert!(obj.contains_key(key), "missing top-level key `{key}`");
         }
 
+        // The public payload carries no descriptor or connection numbers.
+        for key in [
+            "resources",
+            "open_fds",
+            "max_connections",
+            "connections_rejected",
+        ] {
+            assert!(!obj.contains_key(key), "`{key}` must not be public");
+        }
+        assert!(!String::from_utf8_lossy(&body).contains("open_fds"));
+
         // `services.neo4j` is a frontend contract: kept even though the backend
         // is now selected through the storage factory.
         let services = obj["services"]
@@ -8796,6 +8907,65 @@ pub(crate) mod tests {
             caps["vector_search"].as_bool().unwrap_or(false),
             "mock backend declares vector_search"
         );
+    }
+
+    /// A blind (or alerting) descriptor meter degrades `/health`; nothing else about
+    /// the numbers is exposed.
+    #[test]
+    fn health_is_degraded_when_the_descriptor_meter_is_blind() {
+        assert_eq!(health_status(true, true, false), "ok");
+        assert_eq!(health_status(true, true, true), "degraded");
+        assert_eq!(health_status(true, false, false), "degraded");
+        assert_eq!(health_status(false, true, true), "unhealthy");
+        #[cfg(unix)]
+        {
+            use crate::fd_guard::FdStatus;
+            // The meter's own verdict feeds `fd_degraded()`: blind = degraded.
+            assert!(FdStatus::Unavailable { errno: Some(2) }.degraded());
+        }
+    }
+
+    /// The descriptor numbers are behind authentication.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_diagnostics_require_authentication() {
+        use crate::neo4j::mock::MockGraphStore;
+        let router =
+            crate::test_helpers::router_with_auth(std::sync::Arc::new(MockGraphStore::new())).await;
+
+        let anonymous = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/diagnostics/resources")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let authed = router
+            .oneshot(
+                axum::http::Request::get("/api/diagnostics/resources")
+                    .header("authorization", crate::test_helpers::test_bearer_token())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(authed.into_body(), 10_000)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for key in [
+            "fd_alert",
+            "connections",
+            "max_connections",
+            "connections_rejected",
+        ] {
+            assert!(json.get(key).is_some(), "missing resources key `{key}`");
+        }
     }
 
     // ── delegate_task: the spawn envelope (decision A17) ───────────────────
@@ -15348,20 +15518,21 @@ pub(crate) mod tests {
         assert_eq!(step.status, crate::neo4j::models::StepStatus::Skipped);
     }
 
-    /// DELETE /api/tasks/{id} takes the task's steps and decisions with it. It
-    /// used to do so behind an empty 204: the caller learned of the lost
-    /// decisions when `decision get` answered 404.
+    /// DELETE /api/tasks/{id} takes the task's steps with it and lets its
+    /// decisions go: they survive, detached, and the answer names them. They
+    /// used to be deleted behind an empty 204 (the caller learned of it when
+    /// `decision get` answered 404), then deleted and reported (#1223).
     #[tokio::test]
-    async fn deleting_a_task_says_which_decisions_went_with_it() {
+    async fn deleting_a_task_says_which_decisions_it_detached() {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let task_id = seeded_task(&graph).await;
         let bystander = seeded_task(&graph).await;
         let (app, _bus) = test_app_parts(graph.clone()).await;
 
         let decision = serde_json::json!({ "description": "d", "rationale": "r" });
-        let mut lost = Vec::new();
+        let mut freed = Vec::new();
         for _ in 0..2 {
-            lost.push(
+            freed.push(
                 posted_id(
                     &app,
                     &format!("/api/tasks/{task_id}/decisions"),
@@ -15391,25 +15562,37 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp_json(resp).await;
         assert_eq!(json["deleted"], true);
-        assert_eq!(json["decisions_deleted"], 2);
         assert_eq!(json["steps_deleted"], 1);
-        let mut reported: Vec<String> = json["deleted_decision_ids"]
+        // Additive contract: the old fields are still there, and say nothing
+        // was deleted.
+        assert_eq!(json["decisions_deleted"], 0);
+        assert_eq!(json["deleted_decision_ids"], serde_json::json!([]));
+        let mut reported: Vec<String> = json["detached_decision_ids"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         reported.sort();
-        lost.sort();
-        assert_eq!(reported, lost);
+        freed.sort();
+        assert_eq!(reported, freed);
 
-        // What the answer says is what happened.
-        for id in &lost {
-            assert!(graph
-                .get_decision(id.parse().unwrap())
+        // What the answer says is what happened: the decisions are still
+        // read, through the API, and belong to no task.
+        for id in &freed {
+            let resp = app
+                .clone()
+                .oneshot(auth_get(&format!("/api/decisions/{id}")))
                 .await
-                .unwrap()
-                .is_none());
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "decision {id}");
+            let uuid: Uuid = id.parse().unwrap();
+            assert!(graph
+                .task_decisions
+                .read()
+                .await
+                .values()
+                .all(|ds| !ds.contains(&uuid)));
         }
         assert!(graph
             .get_decision(kept.parse().unwrap())
@@ -15539,11 +15722,12 @@ pub(crate) mod tests {
         let line = events
             .iter()
             .find(|l| {
-                l.contains("task deleted with its steps and decisions")
+                l.contains("task deleted with its steps, its decisions detached")
                     && l.contains(&task_id.to_string())
             })
             .unwrap_or_else(|| panic!("no deletion line for {task_id} in {events:?}"));
-        assert!(line.contains("decisions_deleted=2"), "{line}");
+        assert!(line.contains("decisions_detached=2"), "{line}");
+        assert!(line.contains("decisions_deleted=0"), "{line}");
         assert!(line.contains("steps_deleted=1"), "{line}");
     }
 

@@ -13306,7 +13306,9 @@ mod post_turn {
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::Step;
 
-    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+    /// A pending task of the project, linked to the session `linked_to` (the reminder
+    /// only lists the tasks linked to the session).
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid, linked_to: Option<&str>) {
         use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
         let plan = PlanNode::new_for_project(
             "Active Plan".into(),
@@ -13323,6 +13325,20 @@ mod post_turn {
         let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
         task.status = TaskStatus::Pending;
         graph.create_task(plan.id, &task).await.unwrap();
+        if let Some(sid) = linked_to {
+            graph
+                .session_links
+                .write()
+                .await
+                .entry(sid.parse().unwrap())
+                .or_default()
+                .linked_tasks
+                .push(crate::neo4j::models::LinkedTaskInfo {
+                    id: task.id,
+                    title: String::new(),
+                    source: "auto".into(),
+                });
+        }
     }
 
     #[tokio::test]
@@ -13344,7 +13360,7 @@ mod post_turn {
             ],
         )
         .await;
-        seed_pending_tasks(&r.graph, r.project.id).await;
+        seed_pending_tasks(&r.graph, r.project.id, Some(&r.sid)).await;
         r.manager.send_message(&r.sid, "go on").await.unwrap();
         let recovery = next_event(&mut r.rx, |e| {
             matches!(e, ChatEvent::CompactionRecovery { .. })
@@ -13468,7 +13484,7 @@ mod post_turn {
             ],
         )
         .await;
-        seed_pending_tasks(&r.graph, r.project.id).await;
+        seed_pending_tasks(&r.graph, r.project.id, Some(&r.sid)).await;
         r.manager.send_message(&r.sid, "commit it").await.unwrap();
         for _ in 0..400 {
             if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
@@ -13497,7 +13513,7 @@ mod post_turn {
             vec![vec![steps::done(&caps())], vec![steps::done(&caps())]],
         )
         .await;
-        seed_pending_tasks(&r.graph, r.project.id).await;
+        seed_pending_tasks(&r.graph, r.project.id, None).await;
         // The session is opened AS a child of a conversation (an `Agent` call), the way
         // `subagents.rs` opens one — not converted after the fact: the objective counters
         // are built when the agent session is adopted, which happens at open.
@@ -13512,6 +13528,8 @@ mod post_turn {
             .to_json_string(),
         );
         let child = r.manager.create_session(&req).await.unwrap();
+        // Even a task linked to the child itself: a spawned session tracks no objective.
+        seed_pending_tasks(&r.graph, r.project.id, Some(&child.session_id)).await;
         r.manager
             .send_message(&child.session_id, "do the thing")
             .await
