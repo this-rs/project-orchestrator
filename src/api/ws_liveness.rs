@@ -90,6 +90,17 @@ pub const WS_PONG_TIMEOUT: Duration = Duration::from_millis(600);
 /// tampon d'envoi et une écriture sans borne ne rendrait jamais la main.
 pub const WS_SEND_TIMEOUT: Duration = WS_PONG_TIMEOUT;
 
+/// Débit minimal toléré d'une écriture qui avance (octets par seconde).
+pub const WS_MIN_WRITE_RATE: usize = 8 * 1024;
+
+fn message_len(m: &Message) -> usize {
+    match m {
+        Message::Text(t) => t.len(),
+        Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(),
+        Message::Close(_) => 0,
+    }
+}
+
 /// Le pair n'a pas répondu à un `Ping` dans le délai.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PongOverdue {
@@ -203,7 +214,16 @@ where
 /// Le côté écriture d'une socket de ce service.
 pub type WsSender = BoundedSink<SplitSink<WebSocket, Message>>;
 
-/// Une écriture qui ne progresse plus depuis [`WS_SEND_TIMEOUT`] échoue.
+/// Une écriture qui n'aboutit pas dans [`WS_SEND_TIMEOUT`] PLUS le temps qu'un
+/// débit minimal de [`WS_MIN_WRITE_RATE`] octets/s mettrait à écrire le message
+/// échoue. Le délai est donc proportionnel à la taille : un message de plusieurs
+/// Mo vers un client lent MAIS qui avance (au moins ce débit) n'est pas coupé ;
+/// un client qui ne lit plus l'est. La minuterie repart à zéro à chaque fin
+/// d'étape réussie (message écrit ou vidé). Pourquoi pas « réarmer à chaque
+/// octet écrit » : le `SplitSink` d'une `WebSocket` n'expose pas la progression
+/// d'une écriture en cours (elle est atomique de son point de vue), seul le
+/// transport la connaît ; la proportionnalité à la taille en est l'approximation
+/// observable ici.
 ///
 /// Un client qui CESSE DE LIRE remplit le tampon d'émission TCP : un
 /// `send(...).await` non borné ne rend alors jamais la main, la boucle de la
@@ -217,6 +237,8 @@ pub struct BoundedSink<S> {
     inner: S,
     limit: Duration,
     stall: Option<Pin<Box<Sleep>>>,
+    /// Taille du dernier message accepté : elle allonge le délai.
+    last_len: usize,
     /// Set by the first failed or stalled write: every later operation fails at once.
     broken: bool,
 }
@@ -230,6 +252,7 @@ impl<S> BoundedSink<S> {
             inner,
             limit,
             stall: None,
+            last_len: 0,
             broken: false,
         }
     }
@@ -264,7 +287,8 @@ where
                 Poll::Ready(r)
             }
             Poll::Pending => {
-                let limit = self.limit;
+                let limit =
+                    self.limit + Duration::from_secs((self.last_len / WS_MIN_WRITE_RATE) as u64);
                 let timer = self
                     .stall
                     .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
@@ -300,6 +324,7 @@ where
                 "WebSocket sink already failed",
             )));
         }
+        me.last_len = message_len(&item);
         let r = Pin::new(&mut me.inner).start_send(item);
         if r.is_err() {
             me.broken = true;

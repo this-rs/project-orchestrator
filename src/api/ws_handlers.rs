@@ -432,121 +432,124 @@ async fn handle_ws_loop(
 
     loop {
         tokio::select! {
-            // Forward CRUD events (local + NATS-bridged) immediately
-            result = event_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        if !passes_filters(&event, &entity_filter, &project_filter) {
-                            continue;
-                        }
+        // `biased`: read what the client sent BEFORE judging a missed Pong, so a
+        // Pong that arrived while the loop was busy is never lost to the tick.
+        biased;
 
-                        match serde_json::to_string(&event) {
-                            Ok(json) => {
-                                if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                                    debug!("WebSocket send failed, client disconnected");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to serialize CrudEvent: {}", e);
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "WebSocket CRUD client lagged, skipping events");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        debug!("CRUD event bus closed, shutting down WebSocket");
-                        break;
-                    }
+
+        // Handle incoming messages from the client (Pong, Close)
+        msg = ws_receiver.next() => {
+            match msg {
+                Some(Ok(Message::Pong(payload))) => {
+                    liveness.on_pong(&payload);
                 }
-            }
-
-            // Collect graph events into batch buffer
-            result = graph_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        if !passes_graph_filters(&event, &layer_filter, &project_filter) {
-                            continue;
-                        }
-
-                        graph_batch.push(event);
-
-                        // Start the batch window timer on first event
-                        if !batch_timer_active {
-                            batch_timer.as_mut().reset(tokio::time::Instant::now() + GRAPH_BATCH_WINDOW);
-                            batch_timer_active = true;
-                        }
-
-                        // Flush immediately if batch is full
-                        if graph_batch.len() >= GRAPH_BATCH_MAX_SIZE {
-                            if !flush_graph_batch(&mut ws_sender, &mut graph_batch).await {
-                                break;
-                            }
-                            batch_timer_active = false;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "WebSocket graph client lagged, skipping events");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        debug!("Graph event bus closed, shutting down WebSocket");
-                        break;
-                    }
-                }
-            }
-
-            // Flush the graph batch when the window expires
-            _ = &mut batch_timer, if batch_timer_active => {
-                if !flush_graph_batch(&mut ws_sender, &mut graph_batch).await {
+                Some(Ok(Message::Close(_))) | None => {
+                    debug!("WebSocket client disconnected");
                     break;
                 }
-                batch_timer_active = false;
-            }
-
-            // Forward a multiplexed chat event for one of the named sessions.
-            // Sent immediately: a `tool_use` the user is watching must not wait
-            // behind the graph batch window.
-            Some((session_id, chat_event)) = next_mux_chat_event(&mut chat_subs) => {
-                match chat_frame(&session_id, &chat_event) {
-                    Ok(frame) => {
-                        if ws_sender.send(Message::Text(frame.into())).await.is_err() {
-                            debug!(%session_id, "WebSocket send failed on a chat frame");
-                            break;
-                        }
-                    }
-                    Err(e) => warn!(%session_id, "Failed to serialize a chat frame: {}", e),
-                }
-            }
-
-            // Send periodic pings to detect dead clients
-            _ = ping_interval.tick() => {
-                if !super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "events").await {
-                    debug!("Ping failed or unanswered, closing");
+                Some(Err(e)) => {
+                    debug!("WebSocket error: {}", e);
                     break;
                 }
-            }
-
-            // Handle incoming messages from the client (Pong, Close)
-            msg = ws_receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Pong(payload))) => {
-                        liveness.on_pong(&payload);
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!("WebSocket client disconnected");
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        debug!("WebSocket error: {}", e);
-                        break;
-                    }
-                    _ => {
-                        // Ignore text/binary messages from clients
-                    }
+                _ => {
+                    // Ignore text/binary messages from clients
                 }
             }
         }
+
+        // Send periodic pings to detect dead clients
+        _ = ping_interval.tick() => {
+            if !super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "events").await {
+                debug!("Ping failed or unanswered, closing");
+                break;
+            }
+        }
+        // Forward CRUD events (local + NATS-bridged) immediately
+        result = event_rx.recv() => {
+            match result {
+                Ok(event) => {
+                    if !passes_filters(&event, &entity_filter, &project_filter) {
+                        continue;
+                    }
+
+                    match serde_json::to_string(&event) {
+                        Ok(json) => {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                debug!("WebSocket send failed, client disconnected");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to serialize CrudEvent: {}", e);
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "WebSocket CRUD client lagged, skipping events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!("CRUD event bus closed, shutting down WebSocket");
+                    break;
+                }
+            }
+        }
+
+        // Collect graph events into batch buffer
+        result = graph_rx.recv() => {
+            match result {
+                Ok(event) => {
+                    if !passes_graph_filters(&event, &layer_filter, &project_filter) {
+                        continue;
+                    }
+
+                    graph_batch.push(event);
+
+                    // Start the batch window timer on first event
+                    if !batch_timer_active {
+                        batch_timer.as_mut().reset(tokio::time::Instant::now() + GRAPH_BATCH_WINDOW);
+                        batch_timer_active = true;
+                    }
+
+                    // Flush immediately if batch is full
+                    if graph_batch.len() >= GRAPH_BATCH_MAX_SIZE {
+                        if !flush_graph_batch(&mut ws_sender, &mut graph_batch).await {
+                            break;
+                        }
+                        batch_timer_active = false;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "WebSocket graph client lagged, skipping events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!("Graph event bus closed, shutting down WebSocket");
+                    break;
+                }
+            }
+        }
+
+        // Flush the graph batch when the window expires
+        _ = &mut batch_timer, if batch_timer_active => {
+            if !flush_graph_batch(&mut ws_sender, &mut graph_batch).await {
+                break;
+            }
+            batch_timer_active = false;
+        }
+
+        // Forward a multiplexed chat event for one of the named sessions.
+        // Sent immediately: a `tool_use` the user is watching must not wait
+        // behind the graph batch window.
+        Some((session_id, chat_event)) = next_mux_chat_event(&mut chat_subs) => {
+            match chat_frame(&session_id, &chat_event) {
+                Ok(frame) => {
+                    if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                        debug!(%session_id, "WebSocket send failed on a chat frame");
+                        break;
+                    }
+                }
+                Err(e) => warn!(%session_id, "Failed to serialize a chat frame: {}", e),
+            }
+        }}
     }
 
     debug!("WebSocket connection closed");

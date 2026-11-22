@@ -439,6 +439,132 @@ fn crud(entity_type: EntityType, payload: serde_json::Value) -> CrudEvent {
     }
 }
 
+/// One big application message for `which`, produced server-side.
+async fn emit_one(which: Socket, rig: &Full, run_id: uuid::Uuid) {
+    match which {
+        Socket::Events | Socket::Activity => rig
+            .bus
+            .emit(crud(EntityType::Project, serde_json::json!({ "p": big() }))),
+        Socket::Run => {
+            let ev = crate::runner::RunnerEvent::PlanStarted {
+                run_id,
+                plan_id: uuid::Uuid::new_v4(),
+                plan_title: big(),
+                total_tasks: 1,
+                total_waves: 1,
+                prediction: None,
+            };
+            rig.bus
+                .emit(crud(EntityType::Runner, serde_json::to_value(&ev).unwrap()))
+        }
+        Socket::Chat => {
+            rig.manager
+                .emit_on_session(
+                    &rig.sid,
+                    crate::chat::ChatEvent::UserMessage { content: big() },
+                )
+                .await
+        }
+    }
+}
+
+fn path_for(which: Socket, rig: &Full, run_id: uuid::Uuid) -> String {
+    match which {
+        Socket::Events => "/ws/events".to_string(),
+        Socket::Activity => "/ws/activity".to_string(),
+        Socket::Run => format!("/ws/run/{run_id}"),
+        Socket::Chat => format!("/ws/chat/{}?last_event=999999999999999", rig.sid),
+    }
+}
+
+/// A Pong that arrives while the loop is blocked in a long write must not lose
+/// the race against the (overdue) Ping tick once the loop is free again. The
+/// client reads up to its first Ping, then asks the server for a lot of data and
+/// sends that Pong at once, then drains slowly: the server's write is blocked
+/// for longer than the Pong deadline, and when it returns BOTH the missed tick
+/// and the Pong are ready. Without `biased` + reading first, the select! picks
+/// the tick about half the time and closes a live connection; the client then
+/// keeps answering for several periods and must still be connected.
+async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Result<(), String> {
+    let rig = full_rig().await;
+    let run_id = uuid::Uuid::new_v4();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let tcp = sock.connect(rig.addr).await.unwrap();
+    let mut raw = Raw::upgrade(tcp, rig.addr, &path_for(which, &rig, run_id)).await;
+    raw.send(0x1, b"ready").await;
+    // Up to the first Ping.
+    let first = loop {
+        match raw.next(Duration::from_secs(3)).await {
+            Frame::Ping(p) => break p,
+            Frame::Close | Frame::Eof | Frame::Quiet => return Err("no Ping".to_string()),
+            Frame::Other => {}
+        }
+    };
+    // Make the server's next write block, and answer the Ping at the same time.
+    for _ in 0..60 {
+        emit_one(which, &rig, run_id).await;
+    }
+    raw.send(0xA, &first).await;
+    // Drain slowly: the server stays blocked for well over the Pong deadline.
+    let slow_until = Instant::now() + WS_PONG_TIMEOUT * 3;
+    while Instant::now() < slow_until {
+        if let Frame::Close | Frame::Eof = raw.next(Duration::from_millis(20)).await {
+            return Err("closed while draining a slow read".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    // Then behave: read everything, answer every Ping, for several periods.
+    let until = Instant::now() + WS_PONG_TIMEOUT * 5;
+    let mut pings = 0;
+    while Instant::now() < until {
+        match raw.next(WS_PING_EVERY * 4).await {
+            Frame::Ping(p) => {
+                pings += 1;
+                raw.send(0xA, &p).await;
+            }
+            Frame::Close | Frame::Eof => {
+                return Err(
+                    "a live connection was closed (the Pong lost the race against the tick)"
+                        .to_string(),
+                )
+            }
+            Frame::Other | Frame::Quiet => {}
+        }
+    }
+    if pings < 2 {
+        return Err(format!("heartbeat did not resume ({pings} pings)"));
+    }
+    Ok(())
+}
+
+async fn pong_race_trials(which: Socket) {
+    let results = futures::future::join_all(
+        (0..6).map(|_| pong_in_flight_during_a_blocked_write_is_not_lost(which)),
+    )
+    .await;
+    let failures: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+    assert!(
+        failures.is_empty(),
+        "{which:?}: {} of 6 trials failed: {failures:?}",
+        failures.len()
+    );
+}
+
+macro_rules! race_tests {
+    ($($name:ident => $s:expr;)*) => {
+        $(#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() { pong_race_trials($s).await }) *
+    };
+}
+
+race_tests! {
+    events_pong_in_flight_is_not_lost_to_the_tick => Socket::Events;
+    activity_pong_in_flight_is_not_lost_to_the_tick => Socket::Activity;
+    run_pong_in_flight_is_not_lost_to_the_tick => Socket::Run;
+    chat_pong_in_flight_is_not_lost_to_the_tick => Socket::Chat;
+}
+
 async fn stalled_reader_is_dropped(which: Socket) {
     let rig = full_rig().await;
     let run_id = uuid::Uuid::new_v4();
@@ -469,31 +595,7 @@ async fn stalled_reader_is_dropped(which: Socket) {
 
     // The server produces far more than the socket buffers hold; the client reads NOTHING.
     for _ in 0..200 {
-        match which {
-            Socket::Events | Socket::Activity => rig
-                .bus
-                .emit(crud(EntityType::Project, serde_json::json!({ "p": big() }))),
-            Socket::Run => {
-                let ev = crate::runner::RunnerEvent::PlanStarted {
-                    run_id,
-                    plan_id: uuid::Uuid::new_v4(),
-                    plan_title: big(),
-                    total_tasks: 1,
-                    total_waves: 1,
-                    prediction: None,
-                };
-                rig.bus
-                    .emit(crud(EntityType::Runner, serde_json::to_value(&ev).unwrap()))
-            }
-            Socket::Chat => {
-                rig.manager
-                    .emit_on_session(
-                        &rig.sid,
-                        crate::chat::ChatEvent::UserMessage { content: big() },
-                    )
-                    .await
-            }
-        }
+        emit_one(which, &rig, run_id).await;
         tokio::task::yield_now().await;
     }
 
@@ -595,4 +697,77 @@ async fn chat_error_reply_path_with_a_client_that_stopped_reading_is_dropped() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(raw);
+}
+
+/// A sink whose flush takes `delay` (it advances, slowly) after each message.
+struct SlowFlush {
+    delay: Duration,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl futures::Sink<Message> for SlowFlush {
+    type Error = axum::Error;
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn start_send(mut self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+        let d = self.delay;
+        self.sleep = Some(Box::pin(tokio::time::sleep(d)));
+        Ok(())
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        use std::future::Future;
+        let this = self.get_mut();
+        if let Some(sleep) = this.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+        }
+        this.sleep = None;
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A multi-megabyte message to a slow client that IS advancing (a mobile link)
+/// is not cut: the allowed time grows with the message (8 KiB/s minimum rate).
+/// A client slower than that, or stopped, is. Red with a flat 60 s total bound.
+#[tokio::test(start_paused = true)]
+async fn a_big_message_to_a_slow_but_advancing_client_is_not_cut() {
+    use futures::SinkExt;
+    let big = Message::Text("x".repeat(1_000_000).into()); // 122 s extra at 8 KiB/s
+    let mut ok = super::ws_liveness::BoundedSink::with_limit(
+        SlowFlush {
+            delay: Duration::from_secs(100),
+            sleep: None,
+        },
+        Duration::from_secs(5),
+    );
+    let t0 = Instant::now();
+    ok.send(big.clone())
+        .await
+        .expect("a slow client that advances must not be cut");
+    assert_eq!(t0.elapsed(), Duration::from_secs(100));
+
+    let mut stuck = super::ws_liveness::BoundedSink::with_limit(
+        SlowFlush {
+            delay: Duration::from_secs(500),
+            sleep: None,
+        },
+        Duration::from_secs(5),
+    );
+    let t0 = Instant::now();
+    assert!(stuck.send(big).await.is_err());
+    assert_eq!(t0.elapsed(), Duration::from_secs(5 + 122));
 }

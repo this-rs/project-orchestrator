@@ -43,6 +43,11 @@ fn child_server() {
     let budget = std::env::var("FD_BUDGET").as_deref() != Ok("0");
     let dir = std::env::var("FD_DIR").unwrap();
 
+    if let Ok(path) = std::env::var("FD_METER_PATH") {
+        // Simulates a sandbox where /dev/fd is absent or unreadable.
+        fd_guard::override_meter_path_for_tests(&path);
+    }
+    let loopback = env_num("FD_LOOPBACK").unwrap_or(0) as usize;
     fd_guard::init_fd_meter();
     let report = fd_guard::raise_nofile_limit(target);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -56,6 +61,7 @@ fn child_server() {
         } else {
             fd_guard::ConnTracker::new(max, peers)
         };
+        tracker.set_loopback_reserve(loopback);
         let t2 = tracker.clone();
         let t3 = tracker.clone();
         let app = axum::Router::new()
@@ -239,6 +245,11 @@ impl Drop for Server {
 }
 
 struct Cfg {
+    /// Loopback connections admitted over the cap (0 in the cap tests, which
+    /// connect from loopback themselves).
+    loopback: u64,
+    /// Another directory for the descriptor meter (an unavailable one).
+    meter_path: Option<&'static str>,
     soft: u64,
     hard: u64,
     target: u64,
@@ -250,6 +261,8 @@ struct Cfg {
 impl Cfg {
     fn new(soft: u64, hard: u64) -> Cfg {
         Cfg {
+            loopback: 0,
+            meter_path: None,
             soft,
             hard,
             target: 0,
@@ -279,6 +292,14 @@ fn runnable(name: &str, need_hard: u64) -> bool {
         println!("FD_LIMIT scenario RAN: {name} (needs hard >= {need_hard}, inherited {inherited}; ran so far {n})");
         true
     } else {
+        // In CI a skipped scenario is a failure, not a quiet pass: the runner must
+        // provide the hard limit (or the scenario be removed on purpose).
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "scenario `{name}` needs a hard RLIMIT_NOFILE of {need_hard}, the runner has {inherited}: \
+                 raise the runner's hard limit (CI is set, so skipping is not allowed)"
+            );
+        }
         let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         println!("FD_LIMIT scenario SKIPPED: {name}: required hard limit {need_hard}, inherited hard limit {inherited} (skipped so far {n})");
         eprintln!("FD_LIMIT scenario SKIPPED: {name}: required hard limit {need_hard}, inherited {inherited}");
@@ -292,12 +313,16 @@ fn spawn(cfg: Cfg) -> Server {
     let exe = std::env::current_exe().unwrap();
     let (soft, hard) = (cfg.soft, cfg.hard);
     let mut cmd = Command::new(exe);
+    if let Some(path) = cfg.meter_path {
+        cmd.env("FD_METER_PATH", path);
+    }
     cmd.args(["child_server", "--exact", "--nocapture", "--test-threads=1"])
         .env("FD_CHILD", "1")
         .env("FD_TARGET", cfg.target.to_string())
         .env("FD_MAX", cfg.max.to_string())
         .env("FD_PEERS", if cfg.peers { "1" } else { "0" })
         .env("FD_BUDGET", if cfg.budget { "1" } else { "0" })
+        .env("FD_LOOPBACK", cfg.loopback.to_string())
         .env("FD_DIR", &dir.0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -916,6 +941,102 @@ async fn per_peer_stats_report_count_and_age_by_remote_address() {
     assert!(f[2] >= 3, "opened_total: {line}");
     let (_, _, who) = eventually_ok(srv.port, "/who", Duration::from_secs(5)).await;
     assert_eq!(who, "127.0.0.1");
+    drop(held);
+}
+
+/// Au plafond, la sonde de santé passe encore : le quota LOOPBACK admet des
+/// connexions au-delà du plafond (les LAN n'y ont pas droit : voir le test
+/// unitaire du suivi). Choix : un quota réservé plutôt qu'un listener de santé
+/// séparé, parce que la sonde, l'application desktop et les clients MCP locaux
+/// sont tous en loopback et que cela n'ajoute ni port ni configuration.
+/// ROUGE sans le quota : `/health` reçoit un 503 comme tout le reste.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_the_cap_health_still_answers_through_the_loopback_quota() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("health-at-cap", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        max: 5,
+        loopback: 4,
+        ..Cfg::new(128, 128)
+    });
+    // Five long-lived connections fill the cap.
+    let mut holders = Vec::new();
+    for _ in 0..5 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        holders.push(c);
+    }
+    // At the cap, health is still served (quota slot), and again, and again.
+    for _ in 0..10 {
+        let r = get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .expect("no answer at the cap");
+        assert_eq!(r.0, 200, "health refused at the cap: {:?}", r.1);
+    }
+    // The quota is bounded: 4 more idle loopback connections use it up, then 503.
+    let mut quota = Vec::new();
+    for _ in 0..4 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        quota.push(c);
+    }
+    assert_eq!(
+        get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .unwrap()
+            .0,
+        503
+    );
+    drop(quota);
+    drop(holders);
+}
+
+/// Mètre indisponible SANS table pleine (`/dev/fd` absent : conteneur, bac à
+/// sable) : on retombe sur le plafond statique, on ne refuse pas tout. ROUGE si
+/// « mesure impossible » vaut plafond 0 : même `/health` répondrait 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unavailable_meter_falls_back_to_the_static_cap_and_does_not_refuse_everything() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    raise_parent_limit();
+    if !runnable("meter-unavailable", 256) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        meter_path: Some("/nonexistent/meter"),
+        ..Cfg::new(256, 256)
+    });
+    assert_eq!(
+        get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .unwrap()
+            .0,
+        200
+    );
+    // 100 concurrent connections: all admitted (static cap 192), none refused.
+    let mut tasks = Vec::new();
+    for _ in 0..100 {
+        let port = srv.port;
+        tasks.push(tokio::spawn(async move {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            send_get(&mut c, "/health", false).await;
+            let r = tokio::time::timeout(Duration::from_secs(5), read_response(&mut c)).await;
+            (r.ok().flatten().map(|r| r.0), c)
+        }));
+    }
+    let mut held = Vec::new();
+    for t in tasks {
+        let (status, c) = t.await.unwrap();
+        assert_eq!(
+            status,
+            Some(200),
+            "a connection was refused with the meter unavailable"
+        );
+        held.push(c);
+    }
     drop(held);
 }
 

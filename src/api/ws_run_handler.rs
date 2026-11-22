@@ -148,83 +148,86 @@ async fn handle_run_ws(
 
     loop {
         tokio::select! {
-            // Forward CrudEvents that are RunnerEvents for this run
-            result = crud_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        // Try to extract RunnerEvent from the CrudEvent
-                        if let Some(runner_event) = extract_runner_event(&event, run_id) {
-                            // On TaskStarted, discover new sessions
-                            if matches!(runner_event, RunnerEvent::TaskStarted { .. }) {
-                                discover_sessions(&state, run_id, &mut tracked_sessions, &mut known_session_ids).await;
-                            }
+        // `biased`: read what the client sent BEFORE judging a missed Pong, so a
+        // Pong that arrived while the loop was busy is never lost to the tick.
+        biased;
 
-                            let envelope = RunWsEvent::RunnerEvent { event: &runner_event };
-                            if !send_json(&mut ws_sender, &envelope).await {
-                                break;
-                            }
 
-                            // On PlanCompleted, send final status and close
-                            if matches!(runner_event, RunnerEvent::PlanCompleted { .. }) {
-                                send_run_status(&mut ws_sender, run_id, &tracked_sessions).await;
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("WS run {}: CrudEvent receiver lagged by {} events", run_id, n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("WS run {}: CrudEvent channel closed", run_id);
-                        break;
-                    }
+        // Handle client messages (ping/pong, close)
+        msg = ws_receiver.next() => {
+            match msg {
+                Some(Ok(Message::Close(_))) | None => {
+                    debug!("WS run {}: client disconnected", run_id);
+                    break;
                 }
-            }
-
-            // Poll all tracked chat sessions for ChatEvents
-            Some((session_key, chat_event)) = poll_chat_sessions(&mut tracked_sessions) => {
-                if let Some(tracked) = tracked_sessions.get(&session_key) {
-                    let envelope = RunWsEvent::ChatEvent {
-                        task_id: tracked.task_id,
-                        session_id: tracked.session_id.clone(),
-                        event: &chat_event,
-                    };
-                    if !send_json(&mut ws_sender, &envelope).await {
-                        break;
-                    }
+                Some(Ok(Message::Pong(payload))) => {
+                    liveness.on_pong(&payload);
                 }
-            }
-
-            // Periodic discovery of new sessions (wave N+1)
-            _ = discovery_interval.tick() => {
-                discover_sessions(&state, run_id, &mut tracked_sessions, &mut known_session_ids).await;
-            }
-
-            // Handle client messages (ping/pong, close)
-            msg = ws_receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!("WS run {}: client disconnected", run_id);
-                        break;
-                    }
-                    Some(Ok(Message::Pong(payload))) => {
-                        liveness.on_pong(&payload);
-                    }
-                    Some(Ok(_)) => {} // Ignore other messages
-                    Some(Err(e)) => {
-                        debug!("WS run {}: error: {}", run_id, e);
-                        break;
-                    }
-                }
-            }
-
-            // Keep-alive ping
-            _ = ping_interval.tick() => {
-                if !super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "run").await {
+                Some(Ok(_)) => {} // Ignore other messages
+                Some(Err(e)) => {
+                    debug!("WS run {}: error: {}", run_id, e);
                     break;
                 }
             }
         }
+
+        // Keep-alive ping
+        _ = ping_interval.tick() => {
+            if !super::ws_liveness::ping_tick(&mut liveness, &mut ws_sender, "run").await {
+                break;
+            }
+        }
+        // Forward CrudEvents that are RunnerEvents for this run
+        result = crud_rx.recv() => {
+            match result {
+                Ok(event) => {
+                    // Try to extract RunnerEvent from the CrudEvent
+                    if let Some(runner_event) = extract_runner_event(&event, run_id) {
+                        // On TaskStarted, discover new sessions
+                        if matches!(runner_event, RunnerEvent::TaskStarted { .. }) {
+                            discover_sessions(&state, run_id, &mut tracked_sessions, &mut known_session_ids).await;
+                        }
+
+                        let envelope = RunWsEvent::RunnerEvent { event: &runner_event };
+                        if !send_json(&mut ws_sender, &envelope).await {
+                            break;
+                        }
+
+                        // On PlanCompleted, send final status and close
+                        if matches!(runner_event, RunnerEvent::PlanCompleted { .. }) {
+                            send_run_status(&mut ws_sender, run_id, &tracked_sessions).await;
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("WS run {}: CrudEvent receiver lagged by {} events", run_id, n);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!("WS run {}: CrudEvent channel closed", run_id);
+                    break;
+                }
+            }
+        }
+
+        // Poll all tracked chat sessions for ChatEvents
+        Some((session_key, chat_event)) = poll_chat_sessions(&mut tracked_sessions) => {
+            if let Some(tracked) = tracked_sessions.get(&session_key) {
+                let envelope = RunWsEvent::ChatEvent {
+                    task_id: tracked.task_id,
+                    session_id: tracked.session_id.clone(),
+                    event: &chat_event,
+                };
+                if !send_json(&mut ws_sender, &envelope).await {
+                    break;
+                }
+            }
+        }
+
+        // Periodic discovery of new sessions (wave N+1)
+        _ = discovery_interval.tick() => {
+            discover_sessions(&state, run_id, &mut tracked_sessions, &mut known_session_ids).await;
+        }}
     }
 
     debug!("WS run {} disconnected ({})", run_id, claims.email);

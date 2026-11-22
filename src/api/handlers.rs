@@ -225,13 +225,12 @@ pub struct HealthResponse {
     pub services: Option<ServiceHealthStatus>,
     /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
     pub storage_capabilities: StoreCapabilities,
-    /// File descriptors and inbound connections (see `fd_guard`). Absent where
-    /// the process cannot read them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<ResourceUsage>,
 }
 
-/// Descriptor usage and inbound connection counters.
+/// Descriptor usage and inbound connection counters. NOT part of the public
+/// `/health` payload (numbers that calibrate a saturation attack): served to
+/// authenticated users by `GET /api/diagnostics/resources`. `/health` only turns
+/// `"degraded"` when the descriptor alert is up.
 #[derive(Serialize)]
 pub struct ResourceUsage {
     /// `null` when the measurement is impossible (see `fd_measure_error`).
@@ -297,6 +296,14 @@ fn resource_usage() -> Option<ResourceUsage> {
     None
 }
 
+/// `GET /api/diagnostics/resources` (authenticated): descriptor usage and inbound
+/// connection counters (see `fd_guard`).
+pub async fn resource_diagnostics() -> Result<Json<ResourceUsage>, StatusCode> {
+    resource_usage()
+        .map(Json)
+        .ok_or(StatusCode::NOT_IMPLEMENTED)
+}
+
 /// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
 ///
 /// Returns:
@@ -325,7 +332,9 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
             .map(|emitter| emitter.transport_state()),
     );
 
-    let status = if neo4j_ok && meili_ok {
+    // Only a state, never the numbers: the descriptor alert degrades the status.
+    let fd_alert = resource_usage().is_some_and(|r| r.fd_alert);
+    let status = if neo4j_ok && meili_ok && !fd_alert {
         "ok"
     } else if neo4j_ok {
         "degraded"
@@ -358,7 +367,6 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
                 nats: nats_status.to_string(),
             }),
             storage_capabilities: state.orchestrator.neo4j().capabilities(),
-            resources: resource_usage(),
         }),
     )
 }
@@ -8842,22 +8850,16 @@ pub(crate) mod tests {
             assert!(obj.contains_key(key), "missing top-level key `{key}`");
         }
 
-        // Descriptor usage is part of the payload on unix (diagnostic, 80 % alert).
-        #[cfg(unix)]
-        {
-            let res = obj["resources"]
-                .as_object()
-                .expect("`resources` is an object");
-            assert!(res["open_fds"].as_u64().unwrap_or(1) > 0);
-            for key in [
-                "fd_alert",
-                "connections",
-                "max_connections",
-                "connections_rejected",
-            ] {
-                assert!(res.contains_key(key), "missing resources key `{key}`");
-            }
+        // The public payload carries no descriptor or connection numbers.
+        for key in [
+            "resources",
+            "open_fds",
+            "max_connections",
+            "connections_rejected",
+        ] {
+            assert!(!obj.contains_key(key), "`{key}` must not be public");
         }
+        assert!(!String::from_utf8_lossy(&body).contains("open_fds"));
 
         // `services.neo4j` is a frontend contract: kept even though the backend
         // is now selected through the storage factory.
@@ -8877,6 +8879,49 @@ pub(crate) mod tests {
             caps["vector_search"].as_bool().unwrap_or(false),
             "mock backend declares vector_search"
         );
+    }
+
+    /// The descriptor numbers are behind authentication.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_diagnostics_require_authentication() {
+        use crate::neo4j::mock::MockGraphStore;
+        let router =
+            crate::test_helpers::router_with_auth(std::sync::Arc::new(MockGraphStore::new())).await;
+
+        let anonymous = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/diagnostics/resources")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let authed = router
+            .oneshot(
+                axum::http::Request::get("/api/diagnostics/resources")
+                    .header("authorization", crate::test_helpers::test_bearer_token())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(authed.into_body(), 10_000)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for key in [
+            "fd_alert",
+            "connections",
+            "max_connections",
+            "connections_rejected",
+        ] {
+            assert!(json.get(key).is_some(), "missing resources key `{key}`");
+        }
     }
 
     // ── delegate_task: the spawn envelope (decision A17) ───────────────────

@@ -36,6 +36,11 @@ pub const ENV_NOFILE_TARGET: &str = "ORCHESTRATOR_NOFILE_TARGET";
 /// Variable d'environnement : plafond de connexions entrantes simultanées
 /// (`0` = pas de plafond). Défaut : voir [`default_max_connections`].
 pub const ENV_MAX_CONNECTIONS: &str = "ORCHESTRATOR_MAX_CONNECTIONS";
+/// Variable d'environnement : nombre de connexions de LOOPBACK admises AU-DELÀ
+/// du plafond (défaut [`DEFAULT_LOOPBACK_RESERVE`]), pour que la sonde de santé,
+/// l'application desktop et les clients MCP locaux passent toujours.
+pub const ENV_LOOPBACK_RESERVE: &str = "ORCHESTRATOR_LOOPBACK_RESERVE";
+pub const DEFAULT_LOOPBACK_RESERVE: usize = 8;
 /// Variable d'environnement : `1`/`true` active le suivi par adresse distante.
 pub const ENV_CONN_STATS: &str = "ORCHESTRATOR_CONN_STATS";
 /// Seuil d'alerte (fraction de la limite souple).
@@ -255,6 +260,24 @@ struct DirHandle(*mut libc::DIR);
 unsafe impl Send for DirHandle {}
 
 static METER: Mutex<Option<DirHandle>> = Mutex::new(None);
+/// Where descriptors are listed. Only tests change it (to simulate a sandbox
+/// where `/dev/fd` is absent or unreadable).
+static METER_PATH: Mutex<Option<String>> = Mutex::new(None);
+
+fn meter_path() -> String {
+    METER_PATH
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "/dev/fd".to_string())
+}
+
+/// Point the meter at another directory (tests: an unavailable meter).
+#[doc(hidden)]
+pub fn override_meter_path_for_tests(path: &str) {
+    *METER_PATH.lock().unwrap() = Some(path.to_string());
+    *METER.lock().unwrap() = None;
+}
 
 /// Ouvre `/dev/fd` UNE FOIS, au démarrage, et le garde ouvert : mesurer ne
 /// consomme alors aucun descripteur, y compris quand la table est pleine —
@@ -267,7 +290,9 @@ pub fn init_fd_meter() {
     if guard.is_some() {
         return;
     }
-    let path = std::ffi::CString::new("/dev/fd").unwrap();
+    let Ok(path) = std::ffi::CString::new(meter_path()) else {
+        return;
+    };
     // SAFETY: valid NUL-terminated path.
     let dir = unsafe { libc::opendir(path.as_ptr()) };
     if !dir.is_null() {
@@ -312,7 +337,7 @@ fn read_via_held_dir() -> Option<usize> {
 /// table est pleine. C'est le chemin de repli, et ce que faisait la première
 /// version du module.
 pub fn measure_via_read_dir() -> FdReading {
-    match std::fs::read_dir("/dev/fd") {
+    match std::fs::read_dir(meter_path()) {
         Ok(rd) => FdReading::Open(rd.count().saturating_sub(1)),
         Err(e) => FdReading::Unavailable {
             errno: e.raw_os_error(),
@@ -347,7 +372,24 @@ impl FdUsage {
     }
 }
 
-/// Usage mesuré, ou « mesure impossible » (qui est lui-même une alerte).
+/// EMFILE / ENFILE : la table est pleine, c'est une saturation. Tout autre
+/// errno (ENOENT, EACCES : conteneur, bac à sable sans `/dev/fd`) veut dire
+/// « je ne sais pas mesurer », pas « saturé ».
+pub fn is_saturation_errno(errno: Option<i32>) -> bool {
+    matches!(errno, Some(e) if e == libc::EMFILE || e == libc::ENFILE)
+}
+
+/// Plafond statique, sans mesure : la limite moins `max(64, 25 %)`, plancher 16.
+/// C'est le repli quand le mètre est indisponible sans que la table soit pleine.
+pub fn static_cap(soft_limit: u64) -> usize {
+    if soft_limit == UNLIMITED {
+        return usize::MAX;
+    }
+    let reserve = (soft_limit / 4).max(RESERVE_FDS);
+    (soft_limit.saturating_sub(reserve)).max(16) as usize
+}
+
+/// Usage mesuré, ou « mesure impossible ». Seul EMFILE/ENFILE est une alerte.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FdStatus {
     Usage(FdUsage),
@@ -358,7 +400,7 @@ impl FdStatus {
     pub fn alert(&self) -> bool {
         match self {
             FdStatus::Usage(u) => u.alert(),
-            FdStatus::Unavailable { .. } => true,
+            FdStatus::Unavailable { errno } => is_saturation_errno(*errno),
         }
     }
     /// Texte du journal. Jamais de pourcentage quand la mesure est impossible.
@@ -370,8 +412,12 @@ impl FdStatus {
                 NofileReport::fmt_limit(u.soft_limit),
                 (u.ratio() * 100.0) as u32
             ),
+            FdStatus::Unavailable { errno } if is_saturation_errno(*errno) => format!(
+                "measurement impossible (errno {}): the descriptor table is full",
+                errno.map_or("?".to_string(), |e| e.to_string())
+            ),
             FdStatus::Unavailable { errno } => format!(
-                "measurement impossible (errno {}): the descriptor table is probably full",
+                "measurement unavailable (errno {}): static cap in use, no saturation signal",
                 errno.map_or("?".to_string(), |e| e.to_string())
             ),
         }
@@ -466,6 +512,8 @@ pub fn spawn_fd_monitor(period: Duration, tracker: ConnTracker) -> tokio::task::
 /// entrante admise : refus en vol (≤ 16 + la connexion en cours d'acceptation),
 /// fichiers statiques servis, sockets sortants neufs.
 pub const RESERVE_FDS: u64 = 64;
+/// Limite supposée quand `getrlimit` échoue (défaut d'un job launchd).
+pub const UNKNOWN_LIMIT_FALLBACK: u64 = 256;
 /// Plancher du plafond calculé : jamais en dessous.
 pub const MIN_CAP: usize = 4;
 /// Refus simultanés au plus (chacun tient un descripteur jusqu'à sa fermeture).
@@ -541,6 +589,9 @@ struct TrackerInner {
     rejected: AtomicU64,
     accept_errors: AtomicU64,
     reject_write_failed: AtomicU64,
+    /// Connexions loopback admises au-delà du plafond, et leur borne.
+    loopback_reserve: AtomicUsize,
+    loopback_in_use: AtomicUsize,
     rejecting: AtomicUsize,
     last_log_ms: AtomicU64,
     started: Instant,
@@ -558,6 +609,8 @@ pub struct ConnTracker {
 struct Admission {
     ip: IpAddr,
     tracked: bool,
+    /// Admise sur le quota loopback, au-delà du plafond.
+    reserved: bool,
 }
 
 impl ConnTracker {
@@ -586,6 +639,8 @@ impl ConnTracker {
                 rejected: AtomicU64::new(0),
                 accept_errors: AtomicU64::new(0),
                 reject_write_failed: AtomicU64::new(0),
+                loopback_reserve: AtomicUsize::new(0),
+                loopback_in_use: AtomicUsize::new(0),
                 rejecting: AtomicUsize::new(0),
                 last_log_ms: AtomicU64::new(0),
                 started: Instant::now(),
@@ -596,7 +651,22 @@ impl ConnTracker {
     }
 
     /// Réglage depuis l'environnement ; le plafond dynamique est toujours actif.
+    /// Quota de connexions loopback admises au-delà du plafond (0 = aucun).
+    pub fn set_loopback_reserve(&self, n: usize) {
+        self.inner.loopback_reserve.store(n, Ordering::Relaxed);
+    }
+
     pub fn from_env(soft_limit: u64) -> Self {
+        // `getrlimit` failed (soft_limit 0): do not stay on the floor cap for the
+        // life of the process. Assume the launchd default and say so.
+        let soft_limit = if soft_limit == 0 {
+            tracing::warn!(
+                "File descriptor limit unreadable: assuming {UNKNOWN_LIMIT_FALLBACK} for the connection cap"
+            );
+            UNKNOWN_LIMIT_FALLBACK
+        } else {
+            soft_limit
+        };
         let max = std::env::var(ENV_MAX_CONNECTIONS)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -604,7 +674,13 @@ impl ConnTracker {
         let per_peer = std::env::var(ENV_CONN_STATS)
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
-        Self::with_budget(max, soft_limit, per_peer)
+        let tracker = Self::with_budget(max, soft_limit, per_peer);
+        let reserve = std::env::var(ENV_LOOPBACK_RESERVE)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_LOOPBACK_RESERVE);
+        tracker.set_loopback_reserve(reserve);
+        tracker
     }
 
     pub fn per_peer_enabled(&self) -> bool {
@@ -639,7 +715,11 @@ impl ConnTracker {
                 .filter(|&s| s != UNLIMITED)
                 .map(|soft| match self.non_inbound() {
                     Ok(n) => dynamic_cap(soft, n),
-                    Err(_) => 0,
+                    // Table full: refuse. Any other reason the meter is blind
+                    // (no /dev/fd): fall back to the static cap, as without a
+                    // measurement, instead of refusing everything.
+                    Err(errno) if is_saturation_errno(errno) => 0,
+                    Err(_) => static_cap(soft),
                 });
         match (configured, dynamic) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -653,9 +733,22 @@ impl ConnTracker {
         // Réserver une place avant de regarder le plafond : deux accept
         // concurrents ne peuvent pas dépasser ensemble.
         let before = i.active.fetch_add(1, Ordering::AcqRel);
+        let mut reserved = false;
         if cap.is_some_and(|c| before >= c) {
-            i.active.fetch_sub(1, Ordering::AcqRel);
-            return None;
+            // Over the cap: only the loopback quota gets through (health probe,
+            // desktop app, local MCP clients), so that the cap can never lock
+            // the service out of its own health check.
+            let loopback = ip.to_canonical().is_loopback();
+            let quota = i.loopback_reserve.load(Ordering::Relaxed);
+            if loopback && quota > 0 && i.loopback_in_use.fetch_add(1, Ordering::AcqRel) < quota {
+                reserved = true;
+            } else {
+                if loopback && quota > 0 {
+                    i.loopback_in_use.fetch_sub(1, Ordering::AcqRel);
+                }
+                i.active.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            }
         }
         i.admitted.fetch_add(1, Ordering::Relaxed);
         let mut tracked = false;
@@ -682,12 +775,19 @@ impl ConnTracker {
                 book.others += 1;
             }
         }
-        Some(Admission { ip, tracked })
+        Some(Admission {
+            ip,
+            tracked,
+            reserved,
+        })
     }
 
     fn release(&self, a: &Admission) {
         let i = &self.inner;
         i.active.fetch_sub(1, Ordering::AcqRel);
+        if a.reserved {
+            i.loopback_in_use.fetch_sub(1, Ordering::AcqRel);
+        }
         if i.per_peer {
             let mut book = i.book.lock().unwrap();
             if a.tracked {
@@ -736,7 +836,7 @@ impl ConnTracker {
 
     /// Journal limité : au plus une ligne par 5 s (une salve de milliers de
     /// refus ne doit pas noyer le journal).
-    fn log_limited(&self, what: &'static str, detail: String) {
+    fn log_limited(&self, what: &'static str, detail: impl FnOnce() -> String) {
         let i = &self.inner;
         let now_ms = i.started.elapsed().as_millis() as u64 + 1;
         let last = i.last_log_ms.load(Ordering::Relaxed);
@@ -745,7 +845,8 @@ impl ConnTracker {
             tracing::warn!(
                 rejected_total = i.rejected.load(Ordering::Relaxed),
                 accept_errors_total = i.accept_errors.load(Ordering::Relaxed),
-                "{what}: {detail}"
+                "{what}: {}",
+                detail()
             );
         }
     }
@@ -787,15 +888,24 @@ pub fn reject_response() -> Vec<u8> {
 fn reject(tracker: &ConnTracker, stream: TcpStream, peer: SocketAddr) {
     let i = &tracker.inner;
     i.rejected.fetch_add(1, Ordering::Relaxed);
-    tracker.log_limited(
-        "Inbound connection cap reached, refusing with 503",
-        format!(
-            "{} active (cap {:?}), latest peer {}",
-            i.active.load(Ordering::Relaxed),
-            tracker.effective_cap(),
-            peer.ip()
-        ),
-    );
+    // The peer address is logged ONLY when per-peer statistics are enabled
+    // (ORCHESTRATOR_CONN_STATS): it is personal data nobody opted into.
+    tracker.log_limited("Inbound connection cap reached, refusing with 503", || {
+        if i.per_peer {
+            format!(
+                "{} active (cap {:?}), latest peer {}",
+                i.active.load(Ordering::Relaxed),
+                tracker.effective_cap(),
+                peer.ip()
+            )
+        } else {
+            format!(
+                "{} active (cap {:?})",
+                i.active.load(Ordering::Relaxed),
+                tracker.effective_cap()
+            )
+        }
+    });
     // Straight on the socket: tokio's `try_write` would refuse (WouldBlock)
     // before the reactor has reported the socket writable, which a freshly
     // accepted one has not yet (measured: empty refusals in a burst).
@@ -939,7 +1049,7 @@ impl axum::serve::Listener for GuardedListener {
                         .inner
                         .accept_errors
                         .fetch_add(1, Ordering::Relaxed);
-                    self.tracker.log_limited("accept error", e.to_string());
+                    self.tracker.log_limited("accept error", || e.to_string());
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             }
@@ -1012,6 +1122,54 @@ mod tests {
             panic!()
         };
         assert!(down <= base + 2, "{base} -> {down}");
+    }
+
+    #[test]
+    fn only_emfile_is_a_saturation_other_errnos_fall_back_to_the_static_cap() {
+        assert!(is_saturation_errno(Some(libc::EMFILE)));
+        assert!(is_saturation_errno(Some(libc::ENFILE)));
+        assert!(!is_saturation_errno(Some(libc::ENOENT)));
+        assert!(!is_saturation_errno(Some(libc::EACCES)));
+        assert!(!is_saturation_errno(None));
+        assert!(!FdStatus::Unavailable {
+            errno: Some(libc::ENOENT)
+        }
+        .alert());
+        assert!(FdStatus::Unavailable {
+            errno: Some(libc::EMFILE)
+        }
+        .alert());
+        assert_eq!(static_cap(256), 192);
+        assert_eq!(static_cap(64), 16);
+        assert_eq!(static_cap(UNLIMITED), usize::MAX);
+    }
+
+    #[test]
+    fn loopback_gets_a_reserved_quota_over_the_cap_others_do_not() {
+        let t = ConnTracker::new(2, false);
+        t.set_loopback_reserve(2);
+        let lan: IpAddr = "192.168.1.42".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let lo6: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let _a = t.admit(lan).unwrap();
+        let _b = t.admit(lan).unwrap();
+        assert!(t.admit(lan).is_none(), "a LAN peer is refused at the cap");
+        let c = t.admit(lo).expect("loopback passes over the cap");
+        let _d = t.admit(lo6).expect("a v4-mapped loopback too");
+        assert!(t.admit(lo).is_none(), "the quota is bounded");
+        t.release(&c);
+        assert!(t.admit(lo).is_some(), "a released quota slot is reusable");
+        assert!(t.admit(lan).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_limit_does_not_pin_the_cap_to_its_floor() {
+        init_fd_meter();
+        // getrlimit failed upstream: soft_after is 0. The cap must not be MIN_CAP
+        // for the life of the process.
+        let t = ConnTracker::from_env(0);
+        assert_eq!(t.inner.soft_limit, Some(UNKNOWN_LIMIT_FALLBACK));
+        assert!(t.effective_cap().is_some());
     }
 
     #[test]

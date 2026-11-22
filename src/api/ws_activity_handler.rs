@@ -464,72 +464,75 @@ async fn handle_activity_ws(
 
     loop {
         tokio::select! {
-            received = rx.recv() => {
-                match received {
-                    Ok(mut event) => {
-                        if event.seq <= sent_seq {
-                            continue;
-                        }
-                        sent_seq = event.seq;
-                        attribute(&mut event, &index);
-                        // A run or session we have never seen (started after the
-                        // last refresh): look again, at most once every couple of
-                        // seconds, so a burst of unknown ids cannot hammer Neo4j.
-                        if filters.is_scoped()
-                            && !index.knows(&event)
-                            && event.category != ActivityCategory::Entity
-                            && last_forced_refresh.elapsed() >= UNKNOWN_ID_REFRESH_FLOOR
-                        {
-                            index.refresh(&graph, chat.as_ref()).await;
-                            last_forced_refresh = tokio::time::Instant::now();
-                            attribute(&mut event, &index);
-                        }
-                        let project_id = index.project_of(&event);
-                        let session_slug = index.slug_of_session(&event.entity_id).map(str::to_string);
-                        if filters.accepts(&event, project_id, session_slug.as_deref())
-                            && !send_json(&mut sender, &ActivityFrame::Activity { event: &event }).await
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "WS /ws/activity: client lagged, dropping events");
-                        if !send_json(&mut sender, &ActivityFrame::LagDropped { skipped }).await {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("WS /ws/activity: activity channel closed");
-                        break;
-                    }
+        // `biased`: read what the client sent BEFORE judging a missed Pong, so a
+        // Pong that arrived while the loop was busy is never lost to the tick.
+        biased;
+
+
+        incoming = receiver.next() => {
+            match incoming {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Pong(payload))) => {
+                    liveness.on_pong(&payload);
                 }
-            }
-
-            _ = refresh_interval.tick() => {
-                index.refresh(&graph, chat.as_ref()).await;
-                last_forced_refresh = tokio::time::Instant::now();
-            }
-
-            incoming = receiver.next() => {
-                match incoming {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Pong(payload))) => {
-                        liveness.on_pong(&payload);
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
-                        debug!(%error, "WS /ws/activity: socket error");
-                        break;
-                    }
-                }
-            }
-
-            _ = ping_interval.tick() => {
-                if !super::ws_liveness::ping_tick(&mut liveness, &mut sender, "activity").await {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    debug!(%error, "WS /ws/activity: socket error");
                     break;
                 }
             }
         }
+
+        _ = ping_interval.tick() => {
+            if !super::ws_liveness::ping_tick(&mut liveness, &mut sender, "activity").await {
+                break;
+            }
+        }
+        received = rx.recv() => {
+            match received {
+                Ok(mut event) => {
+                    if event.seq <= sent_seq {
+                        continue;
+                    }
+                    sent_seq = event.seq;
+                    attribute(&mut event, &index);
+                    // A run or session we have never seen (started after the
+                    // last refresh): look again, at most once every couple of
+                    // seconds, so a burst of unknown ids cannot hammer Neo4j.
+                    if filters.is_scoped()
+                        && !index.knows(&event)
+                        && event.category != ActivityCategory::Entity
+                        && last_forced_refresh.elapsed() >= UNKNOWN_ID_REFRESH_FLOOR
+                    {
+                        index.refresh(&graph, chat.as_ref()).await;
+                        last_forced_refresh = tokio::time::Instant::now();
+                        attribute(&mut event, &index);
+                    }
+                    let project_id = index.project_of(&event);
+                    let session_slug = index.slug_of_session(&event.entity_id).map(str::to_string);
+                    if filters.accepts(&event, project_id, session_slug.as_deref())
+                        && !send_json(&mut sender, &ActivityFrame::Activity { event: &event }).await
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "WS /ws/activity: client lagged, dropping events");
+                    if !send_json(&mut sender, &ActivityFrame::LagDropped { skipped }).await {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!("WS /ws/activity: activity channel closed");
+                    break;
+                }
+            }
+        }
+
+        _ = refresh_interval.tick() => {
+            index.refresh(&graph, chat.as_ref()).await;
+            last_forced_refresh = tokio::time::Instant::now();
+        }}
     }
 
     debug!(email = %claims.email, "WS /ws/activity disconnected");
