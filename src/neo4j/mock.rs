@@ -1038,7 +1038,11 @@ mod tests {
         let store = MockGraphStore::new();
         let (project, plan) = (Uuid::new_v4(), Uuid::new_v4());
         let (t1, t2, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        store.project_plans.write().await.insert(project, vec![plan]);
+        store
+            .project_plans
+            .write()
+            .await
+            .insert(project, vec![plan]);
         store.plan_tasks.write().await.insert(plan, vec![t1, t2]);
         store.decisions.write().await.insert(
             d,

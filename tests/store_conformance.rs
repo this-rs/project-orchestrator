@@ -1014,7 +1014,10 @@ pub mod conformance {
             .await
             .unwrap();
         assert_eq!(task_of(&before), Some(Some(task.id)), "linked before");
-        assert!(in_project(store, p.id, &decision).await, "in project before");
+        assert!(
+            in_project(store, p.id, &decision).await,
+            "in project before"
+        );
 
         let report = store.delete_task(task.id).await.unwrap();
         assert_eq!(report.detached_decision_ids, vec![decision.id]);
