@@ -2171,7 +2171,8 @@ mod tests {
             "RESULTED_IN lu avant d'être durable"
         );
         reprise.unwrap();
-        ecrit.expect("RESULTED_IN : écriture bloquée après la reprise")
+        ecrit
+            .expect("RESULTED_IN : écriture bloquée après la reprise")
             .unwrap()
             .unwrap();
         assert_eq!(store.get_plan_commits(plan.id).await.unwrap().len(), 1);
@@ -2214,7 +2215,8 @@ mod tests {
             "TOUCHES lu (fichier) avant d'être durable"
         );
         reprise.unwrap();
-        ecrit.expect("TOUCHES : écriture bloquée après la reprise")
+        ecrit
+            .expect("TOUCHES : écriture bloquée après la reprise")
             .unwrap()
             .unwrap();
         assert_eq!(store.get_commit_files_porte("lent").unwrap().len(), 1);
