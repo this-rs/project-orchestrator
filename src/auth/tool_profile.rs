@@ -607,6 +607,9 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/agents",
     "/api/alerts",
     "/api/attention",
+    // the process's own descriptor and connection counters (GET /api/diagnostics/resources):
+    // an operator's diagnostic, no kept tool calls it
+    "/api/diagnostics",
     // the retrieval ledger is process-global: a query is often the user's own
     // prompt, so a restricted session reading it would read the other sessions'
     // questions. The aggregate is for the operator, not for the agent.
@@ -1454,6 +1457,7 @@ mod tests {
             "/api/agents",
             "/api/alerts",
             "/api/attention",
+            "/api/diagnostics/resources",
             "/api/agent/providers",
             "/api/documents",
             "/api/feedback",

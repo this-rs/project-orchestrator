@@ -465,6 +465,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Auth (protected — user info)
         // ================================================================
         .route("/auth/me", get(auth_handlers::get_me))
+        // Descriptor usage / inbound connection counters (numbers kept off the public /health).
+        .route(
+            "/api/diagnostics/resources",
+            get(handlers::resource_diagnostics),
+        )
         // ================================================================
         // MCP tokens (issue/list/revoke/purge — auth for the remote MCP transport)
         // ================================================================
