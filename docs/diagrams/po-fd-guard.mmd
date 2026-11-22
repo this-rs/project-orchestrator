@@ -1,12 +1,12 @@
 %% name: po-fd-guard
 %% covers: backend:src/fd_guard.rs backend:src/api/ws_liveness.rs
-%% verified: b055ba8c
+%% verified: b41e3f0b
 %% ---
 %% PROUVE : ce que le service fait de ses descripteurs de fichiers et de ses sockets WebSocket
 %%   (PR #1269, branche fix/fd-limit) : limite relevée au démarrage, mesure par un /dev/fd gardé
 %%   ouvert, plafond de connexions entrantes dynamique avec 503 complet, quota loopback réservé
 %%   aux requêtes courtes, Pong exigé et écritures bornées sur /ws/chat, /ws/events, /ws/activity,
-%%   /ws/run. Relu contre le code de la branche fix/fd-limit (b055ba8c).
+%%   /ws/run. Relu contre le code de la branche fix/fd-limit (b41e3f0b).
 %% ---
 %% SOURCES LUES :
 %%   src/fd_guard.rs, src/api/ws_liveness.rs, src/lib.rs (start_server), src/api/handlers.rs
