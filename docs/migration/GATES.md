@@ -51,7 +51,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine (imposé dans `copy`) démontrés sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; source non gelée : gel opérationnel exigé ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
 | G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **non conçu** |
-| G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` (fusionné par #1248) | **rouge** : sélection de la source implémentée et testée (migrateur factice) ; les écritures faites sur obrain après la bascule sont **perdues** pour la source, ni recopiées ni réconciliées ; un test de bout en bout ne suffirait pas : il faut une réconciliation sans perte, ou un refus du rollback dès qu'une écriture post-bascule existe |
+| G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge** : sélection de la source implémentée et testée (migrateur factice) ; les écritures faites sur obrain après la bascule sont **perdues** pour la source, ni recopiées ni réconciliées ; un test de bout en bout ne suffirait pas : il faut une réconciliation sans perte, ou un refus du rollback dès qu'une écriture post-bascule existe |
 | G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) |
 
 ## Détail des portes automatisées
@@ -181,14 +181,14 @@ démontre pas une copie « strictement identique » à la source. Trois points p
 2. **Datetimes : la troncature à la microseconde vient de la représentation choisie et des
    lecteurs, pas du stockage d'obrain.** Au rev épinglé `82467ff`, `Timestamp` stocke des
    **nanosecondes** (`obrain-common/src/types/timestamp.rs` l.17) ; seul `ZonedDatetime` stocke des
-   microsecondes (`zoned_datetime.rs` l.19-20). La copie convertit vers `ZonedDatetime`, et les
+   microsecondes (`zoned_datetime.rs` l.16-17, champ `utc_micros` l.44). La copie convertit vers `ZonedDatetime`, et les
    décodeurs de PO lisent par `as_micros` : c'est là que les nanosecondes se perdent. Une piste
    « instant en `Timestamp` nanosecondes plus décalage » ne vaudrait que pour les `DateTime` à
    décalage fixe : `DateTimeZoneId` (nom de fuseau) et `LocalDateTime` (sans fuseau) sont refusés
    aujourd'hui et ne seraient pas préservés par elle. Rien n'est démontré sans perte. La troncature
-   actuelle est **comptée** (`CopyReport::sub_microsecond_datetimes`), journalisée (`tracing::warn!`)
+   actuelle est **comptée** (`CopyReport::sub_microsecond_datetimes`), journalisée (`tracing::warn!`, dont le texte « obrain stores no finer » est faux, comme les commentaires de `conv.rs` l.40 et l.213-215 et de `migrate.rs` l.300 : `Timestamp` stocke des nanosecondes)
    et consignée dans le marqueur de fin (champ additif `narrowings.sub_microsecond_datetimes`). La
-   politique d'acceptation n'est PAS changée par ce lot, et **ce point n'est pas réglé** : la parité
+   politique d'acceptation n'est PAS changée (`conv.rs` accepte la troncature), et **ce point n'est pas réglé** : la parité
    des dates n'est pas démontrée. Prototype testé seulement (non branché) : un entier annexe
    `<clé>__nanos` rend l'aller-retour exact. Il ne suffit pas à la parité : les décodeurs de PO
    lisent la valeur principale en microsecondes ; tris, filtres, contraintes et mises à jour peuvent
@@ -223,8 +223,10 @@ démontre pas une copie « strictement identique » à la source. Trois points p
    **Non détecté** : une mise à jour de propriétés qui ne change aucun compte ; un ajout compensé
    par une suppression du même type ; un second hôte PO sur le même Neo4j. La production exige un
    **gel opérationnel des écrivains externes** pendant la copie. « Zéro perte démontrée » n'est
-   PAS affirmé : sont démontrés, sur les tests sans Neo4j, la détection des cas ci-dessus et le
-   refus des écarts de comptes, d'empreinte et de quarantaine.
+   PAS affirmé. Sont démontrés par des tests sans Neo4j (en CI) : le refus d'une source dont les
+   comptes ont bougé et le refus d'une copie que PO ouvre en quarantaine. Le refus d'un nœud
+   supprimé pendant la copie n'est testé qu'avec un Neo4j jetable
+   (`a_node_deleted_during_the_copy_fails_it_by_name`, `--ignored`, hors CI).
 
 Rejouer : voir l'en-tête de `tests/obrain_migrateur.rs` (Neo4j jetable sur 27688, jamais 7687).
 
@@ -242,13 +244,16 @@ La porte de justesse décisive avant la bascule. Non conçue.
 Fusionné par #1248 (`src/storage/migrate.rs`, `src/storage/mod.rs`).
 
 **Sélection de la source** par variable de configuration : implémentée et testée avec un
-migrateur factice. La source n'est jamais modifiée par PO (par construction du trait
+migrateur factice. La source n'est jamais modifiée par PO (par contrat du trait
 `Migrator`).
 
 **Écritures post-bascule** : les écritures faites sur obrain après la bascule ne sont ni
 recopiées ni réconciliées vers Neo4j — elles sont **perdues** pour la source. Cette perte
-est annoncée dans le message de rollback et par un marqueur (`.po-migration-rolled-back`),
-refusée en rollback sans `from` si la cible contient des données, mais :
+est annoncée dans le message de rollback (le marqueur `.po-migration-rolled-back` ne porte
+qu'un horodatage et signale l'autre sens : les écritures faites sur la source pendant le
+rollback manquent à la cible si on la ressert). Un rollback sans `from` est refusé si la cible
+contient des données (`rollback_without_from_refuses_a_non_empty_obrain_target`,
+`storage::mod`), mais la perte reste :
 - **non détectée** par comparaison de contenu ;
 - **non testée** sur des données réelles (aucun test ne crée d'écriture après la bascule
   pour vérifier qu'elle manque côté source) ;
@@ -279,5 +284,5 @@ journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 
   vert-avec rejoué, relecture indépendante, contrat et doc, à jour de la base, CI verte.
 - Le cliquet G2 ne rétrécit pas ; un retrait voulu est une décision écrite ici, et la porte
   le refusera quand même tant que la base contient la ligne.
-- La bascule en production n'est pas une porte de plus : elle exige G4, G6, G7, G8 et G9
+- La bascule en production n'est pas une porte de plus : elle exige G4, G6, G7, G8, G9, G10 et G11
   vertes, et la levée de la directive du 20/11.
