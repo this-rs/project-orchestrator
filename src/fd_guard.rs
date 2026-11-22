@@ -107,11 +107,13 @@ pub fn nofile_limits() -> io::Result<(u64, u64)> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // `rlim_t` is u64 on Linux and macOS but narrower on some targets.
+    #[allow(clippy::unnecessary_cast)]
     let norm = |v: libc::rlim_t| {
         if v == libc::RLIM_INFINITY {
             UNLIMITED
         } else {
-            u64::from(v)
+            v as u64
         }
     };
     Ok((norm(rl.rlim_cur), norm(rl.rlim_max)))
