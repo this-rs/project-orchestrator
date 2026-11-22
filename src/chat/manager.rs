@@ -41706,10 +41706,10 @@ mod held_context_tests {
         );
     }
 
-    /// (d) reminder → Read → end, repeated: at most the cap. Then three store-side cases
-    /// rearm nothing: calls the store never applied (failed update, dry-run, refused
-    /// commit — one scenario, the store unchanged), a same-status write, a real change of
-    /// a task not linked to the session; (e) a step of a linked task really completed does.
+    /// (d) reminder → Read → end, repeated: at most the cap. Then two store-side cases
+    /// rearm nothing: calls that leave the store as it was (failed or same-status update,
+    /// dry-run, refused commit — one scenario), and a real change of a task not linked to
+    /// the session; (e) a step of a linked task really completed does.
     #[tokio::test]
     async fn the_agent_engine_rearms_only_on_a_change_in_the_store() {
         use serde_json::json;
@@ -41732,24 +41732,24 @@ mod held_context_tests {
                 json!({"action": "update", "task_id": task.to_string(), "status": status}),
             )
         };
-        // 1. Calls the store never applied: a `task update` that failed, a
-        //    `git commit --dry-run`, a commit its hook refused. The engine sees only the
-        //    calls, never their outcome: from the store's side these are ONE scenario —
-        //    nothing changed — played here in one turn.
+        // 1. Calls that leave the store as it was: a `task update` that failed or rewrote
+        //    the same status, a `git commit --dry-run`, a commit its hook refused. The
+        //    engine sees only the calls, and the snapshot only statuses, steps and commits
+        //    (not `updated_at`): from the store's side these are ONE scenario — nothing
+        //    changed — played here in one turn.
+        mock.tasks.write().await.get_mut(&mine).unwrap().status = TaskStatus::InProgress;
         total += reminded(
             &s,
             &sid,
             &with_tools(vec![
                 update(mine, "completed"),
+                update(mine, "in_progress"),
                 ("Bash", json!({"command": "git commit --dry-run -m x"})),
                 ("Bash", json!({"command": "git commit -m x"})),
             ]),
         )
         .await;
-        // 2. An update that WAS applied but kept the same status (written again).
-        mock.tasks.write().await.get_mut(&mine).unwrap().status = TaskStatus::InProgress;
-        total += reminded(&s, &sid, &with_tools(vec![update(mine, "in_progress")])).await;
-        // 3. An update of a task that is not this session's, really applied.
+        // 2. An update of a task that is not this session's, really applied.
         mock.tasks.write().await.get_mut(&foreign).unwrap().status = TaskStatus::Completed;
         total += reminded(&s, &sid, &with_tools(vec![update(foreign, "completed")])).await;
         for _ in 0..3 {

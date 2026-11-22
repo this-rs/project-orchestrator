@@ -220,7 +220,8 @@ pub struct MockGraphStore {
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `vector_search_notes` fail (an index error surfaces to the caller).
     pub fail_vector_search: std::sync::atomic::AtomicBool,
-    /// Makes `get_session_links` fail (a graph error: the objective reminder stays silent).
+    /// Makes `get_session_links` and `get_session_links_batch` fail (a graph error: the
+    /// objective reminder stays silent).
     pub fail_session_links: std::sync::atomic::AtomicBool,
     /// Tasks whose `get_task_steps` fails (a graph error, not an empty list).
     pub fail_task_steps: std::sync::Mutex<std::collections::HashSet<Uuid>>,
@@ -16920,6 +16921,12 @@ impl ChatStore for MockGraphStore {
         &self,
         session_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        if self
+            .fail_session_links
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of get_session_links_batch");
+        }
         let links = self.session_links.read().await;
         Ok(session_ids
             .iter()

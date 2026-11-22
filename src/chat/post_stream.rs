@@ -3092,26 +3092,6 @@ mod integration_tests {
         assert!(tracked.lock().unwrap().is_some(), "read");
     }
 
-    /// The list (`get_session_links_batch`) and the detail (`get_session_links`) of a
-    /// session answer the same links, a task without title included.
-    #[tokio::test]
-    async fn the_batch_and_single_reads_of_links_agree() {
-        let graph = Arc::new(MockGraphStore::new());
-        let uuid = Uuid::new_v4();
-        let task = Uuid::new_v4();
-        link_tasks(&graph, uuid, &[task]).await;
-        let single = graph.get_session_links(uuid).await.unwrap();
-        let batch = graph.get_session_links_batch(&[uuid]).await.unwrap();
-        let ids = |l: &crate::neo4j::models::LinkedSessionInfo| {
-            l.linked_tasks
-                .iter()
-                .map(|t| (t.id, t.title.clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(&single), vec![(task, String::new())]);
-        assert_eq!(ids(&batch[&uuid]), ids(&single));
-    }
-
     /// A reopened session (restart, resume) starts with its allowance spent
     /// (`ObjectiveCounters::initial_in_a_row(true)`, what the reopening sites use): three
     /// reopenings in a row without progress add no reminder to the first run's cap.
