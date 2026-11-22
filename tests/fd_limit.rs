@@ -1334,13 +1334,18 @@ async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reade
     let mut stuck = sock.connect(addr).await.unwrap();
     send_get_with(&mut stuck, "/big", "").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // The single quota place is held by the stuck client...
+    // The single quota place is held by the stuck client, and the 3 ordinary places are
+    // taken: a 200 here means an ORDINARY connection was cut (its place freed) or the
+    // quota place was given back early.
     assert_eq!(
         get(srv.port, "/health", Duration::from_secs(3))
             .await
             .unwrap()
             .0,
-        503
+        503,
+        "/health was served while the quota place and the 3 ordinary places were all taken: \
+         an ORDINARY connection was cut (quota write delay applied to it?) or the quota \
+         place was given back early"
     );
     // ...until the write stalls for the delay: the connection is closed, the place given back.
     wait_quota_free(srv.port).await;
