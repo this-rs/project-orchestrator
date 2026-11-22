@@ -1345,7 +1345,7 @@ curl -X PATCH http://localhost:8080/api/plans/{plan_id} \
 
 ### DELETE /api/plans/{plan_id} -- Protected
 
-Delete a plan and all related data (tasks, steps, decisions, constraints).
+Delete a plan, its tasks, steps and constraints. The decisions of its tasks are kept: detached from their tasks (and kept in the plan's project, when it has one), not destroyed.
 
 ```bash
 curl -X DELETE -H "Authorization: Bearer <JWT>" \

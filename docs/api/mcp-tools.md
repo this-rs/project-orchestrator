@@ -78,7 +78,7 @@ Manage development plans with tasks and constraints.
 | `create` | Create a new plan | `title`, `description`, `priority`, `project_id` |
 | `get` | Get plan with tasks and constraints | `plan_id` |
 | `update_status` | Update plan status | `plan_id`, `status` (draft/approved/in_progress/completed/cancelled) |
-| `delete` | Delete plan and all data | `plan_id` |
+| `delete` | Delete plan, tasks, steps, constraints (its tasks' decisions are detached, kept) | `plan_id` |
 | `link_to_project` | Associate plan with project | `plan_id`, `project_id` |
 | `unlink_from_project` | Dissociate from project | `plan_id`, `project_id` |
 | `get_dependency_graph` | Task dependency DAG | `plan_id` |

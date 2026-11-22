@@ -573,7 +573,7 @@ pub async fn update_plan_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete a plan and all its related data
+/// Delete a plan, its tasks, steps and constraints (its tasks' decisions are detached, not destroyed)
 pub async fn delete_plan(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,

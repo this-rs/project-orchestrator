@@ -986,7 +986,8 @@ pub trait PlanStore: Send + Sync {
     /// Unlink a plan from its project
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
 
-    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    /// Delete a plan, its tasks, steps and constraints. The tasks' decisions survive: detached
+    /// (and kept in the plan's project by `HAS_DECISION`), as in `delete_task`.
     async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
 
     // ========================================================================

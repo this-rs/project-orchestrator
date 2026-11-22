@@ -1014,6 +1014,7 @@ pub mod conformance {
             .await
             .unwrap();
         assert_eq!(task_of(&before), Some(Some(task.id)), "linked before");
+        assert!(in_project(store, p.id, &decision).await, "in project before");
 
         let report = store.delete_task(task.id).await.unwrap();
         assert_eq!(report.detached_decision_ids, vec![decision.id]);
@@ -1032,11 +1033,82 @@ pub mod conformance {
             .await
             .unwrap();
         assert_eq!(task_of(&after), Some(None), "it belongs to no task");
+        assert!(
+            in_project(store, p.id, &decision).await,
+            "it is still found by its project, not only by id"
+        );
         let affects = store.list_decision_affects(decision.id).await.unwrap();
         assert_eq!(affects.len(), 1, "{affects:?}");
         assert_eq!(affects[0].entity_id, p.id.to_string());
 
         store.delete_decision(decision.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// The decision as a project-scoped read finds it (the project's list, not
+    /// the global one nor a lookup by id).
+    async fn in_project(store: &dyn GraphStore, project: Uuid, d: &DecisionNode) -> bool {
+        let (items, _) = store
+            .list_decisions_by_status(d.status.clone(), Some(project), None, 10_000, 0)
+            .await
+            .unwrap();
+        items.iter().any(|i| i.decision.id == d.id)
+    }
+
+    fn a_decision_with(description: &str) -> DecisionNode {
+        DecisionNode {
+            id: Uuid::new_v4(),
+            description: description.to_string(),
+            rationale: "why".to_string(),
+            alternatives: vec![],
+            chosen_option: Some("this".to_string()),
+            decided_by: "conformance".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Deprecated,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        }
+    }
+
+    /// Deleting a PLAN detaches its tasks' decisions like deleting a task
+    /// does (issue #1189): they survive, task-less, in the project, with
+    /// their AFFECTS.
+    pub async fn check_plan_delete_detaches_its_decisions(store: &dyn GraphStore) {
+        let p = a_project("plan-delete-detach");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "plan delete detach plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        let task = a_task(Some("goes with its plan"));
+        store.create_task(plan.id, &task).await.unwrap();
+        let d = a_decision_with("conformance decision that outlives its plan");
+        store.create_decision(task.id, &d).await.unwrap();
+        store
+            .add_decision_affects(d.id, "project", &p.id.to_string(), Some("scope"))
+            .await
+            .unwrap();
+
+        store.delete_plan(plan.id).await.unwrap();
+
+        assert!(store.get_task(task.id).await.unwrap().is_none());
+        assert!(
+            store.get_decision(d.id).await.unwrap().is_some(),
+            "the decision survives its plan"
+        );
+        let (items, _) = store
+            .list_decisions_by_status(d.status, Some(p.id), None, 10_000, 0)
+            .await
+            .unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.decision.id == d.id)
+            .expect("found by its project");
+        assert_eq!(item.task_id, None, "it belongs to no task");
+        let affects = store.list_decision_affects(d.id).await.unwrap();
+        assert_eq!(affects.len(), 1, "{affects:?}");
+
+        store.delete_decision(d.id).await.unwrap();
         store.delete_project(p.id, &p.name).await.unwrap();
     }
 
@@ -2461,6 +2533,7 @@ macro_rules! all_checks {
                 check_cascade_delete_project,
                 check_task_delete_reports_its_cascade,
                 check_task_delete_detaches_its_decisions,
+                check_plan_delete_detaches_its_decisions,
                 check_empty_prompt_cache_reads_as_none,
                 check_project_scoped_suffix_lookup_filters_before_limit,
                 check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path,

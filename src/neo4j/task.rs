@@ -770,13 +770,25 @@ impl Neo4jClient {
 
         // The task's decisions survive it (issue #1189): only the
         // `(Task)-[:INFORMED_BY]->(Decision)` edge goes, the decision and its
-        // AFFECTS edges stay. Its task is read from that edge alone (there is
-        // no `task_id` property), so it then belongs to no task — what
-        // `decision add` without `task_id` creates. Ids are read in the same
+        // AFFECTS edges stay. A decision recorded with `create_decision` has
+        // NO direct project edge: its project is reached only through that
+        // INFORMED_BY edge (Project -> Plan -> Task -> Decision), which every
+        // project-scoped read relies on. So, BEFORE the edge goes and in the
+        // SAME statement (atomic), the task's project, when it has one, is
+        // linked to the decision by `HAS_DECISION` (what `create_decision_global`
+        // writes when a project is given); otherwise the decision would survive
+        // but vanish from its project's lists and searches. A task whose plan
+        // has no project gets no such edge (there is no project to keep it in).
+        // MERGE keeps it idempotent and shared with a second task's decision.
+        // The decision then has no task, if this was its only one; with a second
+        // INFORMED_BY task it stays linked to that one. Ids are read in the same
         // statement; the aggregation yields one row even when nothing matches.
         let q = query(
             r#"
             MATCH (t:Task {id: $id})-[r:INFORMED_BY]->(d:Decision)
+            OPTIONAL MATCH (proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t)
+            WITH r, d, collect(DISTINCT proj) AS projects
+            FOREACH (p IN projects | MERGE (p)-[:HAS_DECISION]->(d))
             WITH collect(r) AS links, collect(DISTINCT d.id) AS ids
             FOREACH (r IN links | DELETE r)
             RETURN ids
