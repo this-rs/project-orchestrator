@@ -432,6 +432,13 @@ diagrams:
       - "backend:src/neurons/synaptic_shadow.rs"
       - "backend:src/neurons/synaptic_shadow_tests.rs"
       - "backend:src/neo4j/synapse_shadow.rs"
+  - name: po-fd-guard
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-fd-guard.mmd
+    covers:
+      - "backend:src/fd_guard.rs"
+      - "backend:src/api/ws_liveness.rs"
   - name: po-yaml
     owner: theotime
     status: verified
