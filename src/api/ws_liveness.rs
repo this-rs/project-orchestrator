@@ -305,6 +305,12 @@ impl<S> BoundedSink<S> {
         }
     }
 
+    /// Test seulement : ce puits a-t-il été compté dans [`BLOCKED_WRITES`] ?
+    #[cfg(test)]
+    pub fn was_counted(&self) -> bool {
+        self.counted
+    }
+
     /// A write failed or stalled: the connection is to be dropped.
     pub fn is_broken(&self) -> bool {
         self.broken

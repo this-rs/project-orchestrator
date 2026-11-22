@@ -821,3 +821,29 @@ async fn a_client_blocked_on_a_huge_message_is_cut_at_the_absolute_ceiling() {
     assert!(stuck.send(huge).await.is_err());
     assert_eq!(t0.elapsed(), super::ws_liveness::WS_MAX_SEND_TIMEOUT);
 }
+
+/// A socket whose write blocks, frees and blocks again counts ONCE in
+/// `BLOCKED_WRITES`: otherwise the race tests could see "6 blocked" with 5 sockets.
+/// Red if every blocking episode counts.
+#[tokio::test(start_paused = true)]
+async fn a_socket_that_blocks_again_is_counted_once() {
+    use super::ws_liveness::BLOCKED_WRITES;
+    use futures::SinkExt;
+    use std::sync::atomic::Ordering::SeqCst;
+    let _g = BLOCKING.lock().await; // no other test may raise the counter meanwhile
+    let before = BLOCKED_WRITES.load(SeqCst);
+    // Each write takes 400 ms (it goes pending, then completes): three episodes.
+    let mut sink = super::ws_liveness::BoundedSink::new(SlowFlush {
+        delay: Duration::from_millis(400),
+        sleep: None,
+    });
+    for _ in 0..3 {
+        sink.send(Message::Text("x".into())).await.unwrap();
+    }
+    assert!(sink.was_counted());
+    assert_eq!(
+        BLOCKED_WRITES.load(SeqCst) - before,
+        1,
+        "one count per socket"
+    );
+}
