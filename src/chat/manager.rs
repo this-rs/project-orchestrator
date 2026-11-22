@@ -601,6 +601,9 @@ pub struct ActiveSession {
     /// Capped at `OBJECTIVE_REMINDER_MAX_IN_A_ROW`: past it the tracker stays silent until the
     /// agent works again (a reminder that is answered by text only, every turn, is a loop).
     pub objective_reminders_in_a_row: Arc<AtomicU32>,
+    /// The store's state of the session's linked tasks at the last reminder, the
+    /// reference real progress is judged against (`post_stream::made_progress`).
+    pub(crate) objective_baseline: super::post_stream::ProgressBaseline,
     /// Accumulates work performed during the session: files modified, files read,
     /// steps completed, last tool used. Source of truth for resumption after
     /// compaction or max_turns.
@@ -2878,7 +2881,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                     "objective_tracking",
                     super::post_stream::objective_reminder(
                         &self.graph,
-                        ctx.project_slug.as_deref(),
+                        uuid,
                         &self.session.objectives,
                         turn,
                         self.work_summary(),
@@ -8661,8 +8664,12 @@ impl ChatManager {
                     // is noise it never asked for (measured 17/10/2026: an extra unrequested
                     // turn, ~9.4k cache tokens, to answer a reminder meant for someone else).
                     objective_tracking: tracks_own_objectives(request.spawned_by.is_some()),
+                    // A fresh session: the full allowance of reminders.
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(
+                        super::post_stream::ObjectiveCounters::initial_in_a_row(false),
+                    )),
+                    objective_baseline: Default::default(),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
                     provider_outage: Arc::new(std::sync::Mutex::new(
@@ -13950,6 +13957,15 @@ impl ChatManager {
         let mirror_tap = self.mirror_tap(session_id);
         let parent =
             super::cancelled_parents::parent_checked_on_resume(session_node.spawned_by.as_deref());
+        // The reference real progress is judged against, read before the first turn of the
+        // reopened session (`ObjectiveCounters::reopening_baseline`) — not read at all for
+        // a session that tracks no objective, as on the agent engine.
+        let objective_baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
+            &self.graph,
+            Some(session_node.id),
+            tracks_own_objectives(session_node.spawned_by.is_some()),
+        )
+        .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // B36-RACE: a child the warm pool resumes for a new delegation, whose parent a
@@ -14019,8 +14035,13 @@ impl ChatManager {
                     // child stays one — it must not start receiving the parent's objective
                     // reminders just because it crossed a restart.
                     objective_tracking: tracks_own_objectives(session_node.spawned_by.is_some()),
+                    // A reopened session: the allowance stays spent until real progress
+                    // (`ObjectiveCounters::opening`), so reopening never rearms it.
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(
+                        super::post_stream::ObjectiveCounters::initial_in_a_row(true),
+                    )),
+                    objective_baseline: objective_baseline.clone(),
                     work_log: work_log.clone(),
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
@@ -18343,6 +18364,7 @@ impl ChatManager {
             false,
             mcp_names,
             super::cancelled_parents::parent_of(request.spawned_by.as_deref()),
+            false,
         )
         .await?;
         // Live: the token and the router are the session's now (a refusal above left
@@ -18494,10 +18516,13 @@ impl ChatManager {
     }
 
     /// The end-of-turn state of the agent session `session_id`, from its node: its
-    /// memory conversation, the protocol run it was spawned in. Objective tracking is
-    /// on, as for every Claude Code session, EXCEPT for a child of a conversation: a
-    /// sub-agent's objective is the prompt it was given, never the project's backlog.
-    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// follows the rule of the Claude Code engine (`tracks_own_objectives`): off for any
+    /// session with a `spawned_by`.
+    ///
+    /// `reopened`: the session is opened again (resume, restart, engine switch), so its
+    /// objective reminders start spent ([`super::post_stream::ObjectiveCounters::opening`]).
+    async fn agent_turn_state(&self, session_id: &str, reopened: bool) -> AgentTurnState {
         let node = match Uuid::parse_str(session_id) {
             Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
             Err(_) => None,
@@ -18516,15 +18541,15 @@ impl ChatManager {
             .as_ref()
             .and_then(|n| n.spawned_by.as_deref())
             .and_then(parse_spawned_by);
-        // A child of a conversation is a sub-agent: its objective is the prompt it was
-        // given. The objective reminder reads the PROJECT's pending tasks
-        // (`post_stream::objective_reminder`), so on a child it nags about work the child
-        // never took — and the child pays a whole extra billed turn to answer it.
-        // Measured 17/10/2026 on a throwaway child: 9 413 cache-creation tokens, 600
-        // output tokens, $0.0094, for a task list that was never its own.
-        let subagent = spawned
+        // A spawned session's objective is the prompt it was given (measured 17/10/2026
+        // on a throwaway child: a reminder cost it an extra billed turn, 9 413
+        // cache-creation tokens). The rule of the Claude Code engine, one function for both
+        // (`tracks_own_objectives`): any session with a `spawned_by` — conversation
+        // sub-agent, delegation, runner, pipeline, gate, trigger, protocol runner — does
+        // not track objectives. A session whose node cannot be read is not tracked either.
+        let tracks = node
             .as_ref()
-            .is_some_and(|ctx| ctx.spawn_type == "conversation");
+            .is_some_and(|n| tracks_own_objectives(n.spawned_by.is_some()));
         // What waited for this session's next turn before it closed or the server
         // restarted.
         let held = self.held_slot(session_id).await;
@@ -18544,16 +18569,24 @@ impl ChatManager {
             }
             None => None,
         };
+        let mut objectives = super::post_stream::ObjectiveCounters::opening(tracks, reopened);
+        if reopened {
+            // The reference, read before the first turn of the reopened session (not read
+            // for a session that tracks no objective).
+            objectives.baseline = super::post_stream::ObjectiveCounters::reopening_baseline(
+                &self.graph,
+                node.as_ref().map(|n| n.id),
+                tracks,
+            )
+            .await;
+        }
         AgentTurnState {
             memory,
             context_window,
             protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
             held,
             protocol_state: spawned.and_then(|s| s.protocol_state),
-            objectives: super::post_stream::ObjectiveCounters {
-                enabled: !subagent,
-                ..Default::default()
-            },
+            objectives,
             ..Default::default()
         }
     }
@@ -18568,7 +18601,9 @@ impl ChatManager {
     /// (`session_grants::declarations_for_project`). `lasting`: the person and project whose
     /// lasting approvals the session keeps and obeys (`None`: `always` is not offered).
     /// `resumed`: a resumed session starts with its shell taken as moved unless it is known
-    /// it never moved ([`Self::session_grants_for`]).
+    /// it never moved ([`Self::session_grants_for`]). `reopened`: an existing session opened
+    /// again (resume, restart, provider switch — unlike `resumed`, a switch counts), whose
+    /// objective reminders start spent ([`super::post_stream::ObjectiveCounters::opening`]).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -18585,6 +18620,7 @@ impl ChatManager {
         resumed: bool,
         mcp_names: Vec<String>,
         parent: Option<String>,
+        reopened: bool,
     ) -> std::result::Result<(), super::cancelled_parents::ParentCancelled> {
         // What the provider's kind tells beyond its capabilities (an unknown window on
         // the native harness, no sub-agents and no fallback).
@@ -18657,7 +18693,7 @@ impl ChatManager {
                 tool_policy,
                 Some(
                     self.turn_services_with(
-                        self.agent_turn_state(session_id).await,
+                        self.agent_turn_state(session_id, reopened).await,
                         // Claude Code runs its sub-agents itself: they get read-only mirrors
                         // (P18c). A native session's sub-agents are real children already.
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
@@ -19374,6 +19410,9 @@ impl ChatManager {
             // B36-RACE: a warm child the pool resumes for a delegation is refused like a fresh
             // one; a person resuming it passes (B36-RACE-RESUME).
             super::cancelled_parents::parent_checked_on_resume(node.spawned_by.as_deref()),
+            // Reopened (a resume, a restart, a provider switch alike): its objective
+            // reminders start spent, rearmed only by real progress.
+            true,
         )
         .await?;
         cleanup.disarm();

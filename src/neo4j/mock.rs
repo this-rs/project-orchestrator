@@ -220,6 +220,11 @@ pub struct MockGraphStore {
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `vector_search_notes` fail (an index error surfaces to the caller).
     pub fail_vector_search: std::sync::atomic::AtomicBool,
+    /// Makes `get_session_links` and `get_session_links_batch` fail (a graph error: the
+    /// objective reminder stays silent).
+    pub fail_session_links: std::sync::atomic::AtomicBool,
+    /// Tasks whose `get_task_steps` fails (a graph error, not an empty list).
+    pub fail_task_steps: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     /// Stall injection: `search_decisions_by_vector` sleeps this long before
     /// answering — a dense decision search slower than the turn's budget.
     pub slow_decision_vector_search: std::sync::Mutex<Option<std::time::Duration>>,
@@ -556,6 +561,8 @@ impl MockGraphStore {
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_vector_search: std::sync::atomic::AtomicBool::new(false),
+            fail_session_links: std::sync::atomic::AtomicBool::new(false),
+            fail_task_steps: std::sync::Mutex::new(std::collections::HashSet::new()),
             slow_decision_vector_search: std::sync::Mutex::new(None),
             slow_chat_session_update: std::sync::Mutex::new(None),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
@@ -10425,6 +10432,13 @@ impl PlanStore for MockGraphStore {
     }
 
     async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>> {
+        if self
+            .fail_task_steps
+            .lock()
+            .is_ok_and(|f| f.contains(&task_id))
+        {
+            anyhow::bail!("injected failure of get_task_steps({task_id})");
+        }
         let ts = self.task_steps.read().await;
         let steps = self.steps.read().await;
         let ids = ts.get(&task_id).cloned().unwrap_or_default();
@@ -16962,6 +16976,12 @@ impl ChatStore for MockGraphStore {
     }
 
     async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo> {
+        if self
+            .fail_session_links
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of get_session_links");
+        }
         Ok(self
             .session_links
             .read()
@@ -16979,11 +16999,23 @@ impl ChatStore for MockGraphStore {
         Ok(Vec::new())
     }
 
+    /// The same answer as [`Self::get_session_links`], per session (the list and the
+    /// detail of a session read the same links).
     async fn get_session_links_batch(
         &self,
-        _session_ids: &[Uuid],
+        session_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
-        Ok(std::collections::HashMap::new())
+        if self
+            .fail_session_links
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of get_session_links_batch");
+        }
+        let links = self.session_links.read().await;
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| links.get(id).map(|l| (*id, l.clone())))
+            .collect())
     }
 
     async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
