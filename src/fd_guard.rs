@@ -41,6 +41,20 @@ pub const ENV_MAX_CONNECTIONS: &str = "ORCHESTRATOR_MAX_CONNECTIONS";
 /// l'application desktop et les clients MCP locaux passent toujours.
 pub const ENV_LOOPBACK_RESERVE: &str = "ORCHESTRATOR_LOOPBACK_RESERVE";
 pub const DEFAULT_LOOPBACK_RESERVE: usize = 8;
+/// Variable d'environnement : durée maximale (secondes) d'une connexion admise
+/// sur le quota loopback (défaut [`DEFAULT_LOOPBACK_MAX_AGE`]).
+pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS";
+/// Une connexion admise sur le quota loopback est un DÉPASSEMENT TEMPORAIRE : le
+/// garde la ferme au bout de cette durée, de sorte que des WebSocket ou des
+/// keep-alive locaux ne puissent pas occuper le quota et exclure la sonde de
+/// santé. Choix retenu plutôt que « quota réservé aux requêtes courtes »,
+/// qui exigerait de lire la requête avant d'admettre.
+pub const DEFAULT_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// Le quota est borné sous la marge [`RESERVE_FDS`] : il consomme de cette marge.
+pub fn clamp_loopback_reserve(n: usize) -> usize {
+    n.min(RESERVE_FDS as usize / 2)
+}
 /// Variable d'environnement : `1`/`true` active le suivi par adresse distante.
 pub const ENV_CONN_STATS: &str = "ORCHESTRATOR_CONN_STATS";
 /// Seuil d'alerte (fraction de la limite souple).
@@ -403,6 +417,12 @@ impl FdStatus {
             FdStatus::Unavailable { errno } => is_saturation_errno(*errno),
         }
     }
+    /// Un mètre aveugle (quel qu'en soit le motif) est DÉGRADÉ : le plafond
+    /// statique reste en place, mais on ne voit plus la table. Journalisé en
+    /// `warn` à chaque période et au démarrage, et `/health` passe `degraded`.
+    pub fn degraded(&self) -> bool {
+        self.alert() || matches!(self, FdStatus::Unavailable { .. })
+    }
     /// Texte du journal. Jamais de pourcentage quand la mesure est impossible.
     pub fn describe(&self) -> String {
         match self {
@@ -442,6 +462,8 @@ pub fn fd_status() -> FdStatus {
 pub struct MonitorReport {
     pub status: FdStatus,
     pub alert: bool,
+    /// `alert` OU mètre indisponible.
+    pub degraded: bool,
     pub message: String,
 }
 
@@ -449,13 +471,24 @@ pub fn monitor_report() -> MonitorReport {
     let status = fd_status();
     MonitorReport {
         alert: status.alert(),
+        degraded: status.degraded(),
         message: status.describe(),
         status,
     }
 }
 
-/// Surveillance périodique : warn à chaque période si ≥ 80 % OU si la mesure
-/// est impossible ; un rappel info toutes les 10 périodes sinon ; et, si le
+/// Au démarrage : un mètre indisponible est signalé tout de suite (`warn`).
+pub fn log_meter_at_startup() {
+    let status = fd_status();
+    if status.degraded() {
+        tracing::warn!("File descriptors: {}", status.describe());
+    } else {
+        tracing::info!("File descriptors: {}", status.describe());
+    }
+}
+
+/// Surveillance périodique : warn à chaque période si ≥ 80 % OU si le mètre est
+/// indisponible (dégradé) ; un rappel info toutes les 10 périodes sinon ; et, si le
 /// suivi par pair est actif, les adresses distantes les plus chargées.
 pub fn spawn_fd_monitor(period: Duration, tracker: ConnTracker) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -466,12 +499,13 @@ pub fn spawn_fd_monitor(period: Duration, tracker: ConnTracker) -> tokio::task::
             n += 1;
             let snap = tracker.snapshot();
             let r = monitor_report();
-            if r.alert {
+            if r.degraded {
                 tracing::warn!(
                     connections = snap.active,
                     cap = snap.max,
                     rejected_total = snap.rejected,
-                    "File descriptors ALERT: {}",
+                    "File descriptors {}: {}",
+                    if r.alert { "ALERT" } else { "meter DEGRADED" },
                     r.message
                 );
             } else if n % 10 == 1 {
@@ -592,6 +626,7 @@ struct TrackerInner {
     /// Connexions loopback admises au-delà du plafond, et leur borne.
     loopback_reserve: AtomicUsize,
     loopback_in_use: AtomicUsize,
+    loopback_max_age_ms: AtomicU64,
     rejecting: AtomicUsize,
     last_log_ms: AtomicU64,
     started: Instant,
@@ -641,6 +676,7 @@ impl ConnTracker {
                 reject_write_failed: AtomicU64::new(0),
                 loopback_reserve: AtomicUsize::new(0),
                 loopback_in_use: AtomicUsize::new(0),
+                loopback_max_age_ms: AtomicU64::new(DEFAULT_LOOPBACK_MAX_AGE.as_millis() as u64),
                 rejecting: AtomicUsize::new(0),
                 last_log_ms: AtomicU64::new(0),
                 started: Instant::now(),
@@ -654,6 +690,17 @@ impl ConnTracker {
     /// Quota de connexions loopback admises au-delà du plafond (0 = aucun).
     pub fn set_loopback_reserve(&self, n: usize) {
         self.inner.loopback_reserve.store(n, Ordering::Relaxed);
+    }
+
+    /// Durée maximale d'une connexion admise sur le quota loopback.
+    pub fn set_loopback_max_age(&self, age: Duration) {
+        self.inner
+            .loopback_max_age_ms
+            .store(age.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn loopback_max_age(&self) -> Duration {
+        Duration::from_millis(self.inner.loopback_max_age_ms.load(Ordering::Relaxed))
     }
 
     pub fn from_env(soft_limit: u64) -> Self {
@@ -679,7 +726,26 @@ impl ConnTracker {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_LOOPBACK_RESERVE);
-        tracker.set_loopback_reserve(reserve);
+        let clamped = clamp_loopback_reserve(reserve);
+        if clamped != reserve {
+            tracing::warn!(
+                requested = reserve,
+                used = clamped,
+                "{ENV_LOOPBACK_RESERVE} lowered: it must stay under the {RESERVE_FDS}-descriptor margin"
+            );
+        }
+        tracker.set_loopback_reserve(clamped);
+        if let Some(secs) = std::env::var(ENV_LOOPBACK_MAX_AGE_SECS)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            tracker.set_loopback_max_age(Duration::from_secs(secs));
+        }
+        tracing::info!(
+            loopback_reserve = clamped,
+            loopback_max_age_secs = tracker.loopback_max_age().as_secs(),
+            "Loopback quota over the connection cap"
+        );
         tracker
     }
 
@@ -804,6 +870,15 @@ impl ConnTracker {
     }
 
     pub fn snapshot(&self) -> ConnSnapshot {
+        self.snapshot_inner(true)
+    }
+
+    /// Counters only (`max` left at 0): no second `/dev/fd` listing.
+    pub fn snapshot_counters(&self) -> ConnSnapshot {
+        self.snapshot_inner(false)
+    }
+
+    fn snapshot_inner(&self, with_cap: bool) -> ConnSnapshot {
         let i = &self.inner;
         let mut peers = Vec::new();
         let mut others = 0;
@@ -824,7 +899,11 @@ impl ConnTracker {
         }
         ConnSnapshot {
             active: i.active.load(Ordering::Acquire),
-            max: self.effective_cap().unwrap_or(0),
+            max: if with_cap {
+                self.effective_cap().unwrap_or(0)
+            } else {
+                0
+            },
             rejected: i.rejected.load(Ordering::Relaxed),
             accept_errors: i.accept_errors.load(Ordering::Relaxed),
             reject_write_failed: i.reject_write_failed.load(Ordering::Relaxed),
@@ -979,6 +1058,26 @@ pub struct GuardedStream {
     inner: TcpStream,
     admission: Admission,
     tracker: ConnTracker,
+    /// Connexion admise sur le quota loopback : fermée à l'échéance.
+    limit: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl GuardedStream {
+    /// `Err(TimedOut)` une fois l'échéance du quota loopback atteinte. La minuterie
+    /// est sondée avec le contexte de l'appelant : une connexion inactive est
+    /// réveillée à l'échéance, pas seulement à la prochaine E/S.
+    fn check_limit(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        use std::future::Future;
+        if let Some(timer) = self.limit.as_mut() {
+            if timer.as_mut().poll(cx).is_ready() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "loopback quota connection reached its maximum age",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for GuardedStream {
@@ -993,6 +1092,9 @@ impl AsyncRead for GuardedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Err(e) = self.check_limit(cx) {
+            return Poll::Ready(Err(e));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -1003,6 +1105,9 @@ impl AsyncWrite for GuardedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Err(e) = self.check_limit(cx) {
+            return Poll::Ready(Err(e));
+        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1032,14 +1137,18 @@ impl axum::serve::Listener for GuardedListener {
             match self.inner.accept().await {
                 Ok((stream, peer)) => match self.tracker.admit(peer.ip()) {
                     Some(admission) => {
+                        let limit = admission
+                            .reserved
+                            .then(|| Box::pin(tokio::time::sleep(self.tracker.loopback_max_age())));
                         return (
                             GuardedStream {
                                 inner: stream,
                                 admission,
                                 tracker: self.tracker.clone(),
+                                limit,
                             },
                             peer,
-                        )
+                        );
                     }
                     None => reject(&self.tracker, stream, peer),
                 },
@@ -1170,6 +1279,37 @@ mod tests {
         let t = ConnTracker::from_env(0);
         assert_eq!(t.inner.soft_limit, Some(UNKNOWN_LIMIT_FALLBACK));
         assert!(t.effective_cap().is_some());
+    }
+
+    #[test]
+    fn an_unavailable_meter_is_degraded_and_warned_but_not_a_saturation_alert() {
+        let enoent = FdStatus::Unavailable {
+            errno: Some(libc::ENOENT),
+        };
+        assert!(!enoent.alert());
+        assert!(enoent.degraded());
+        assert!(FdStatus::Unavailable {
+            errno: Some(libc::EMFILE)
+        }
+        .degraded());
+        let ok = FdStatus::Usage(FdUsage {
+            open: 10,
+            soft_limit: 256,
+        });
+        assert!(!ok.degraded());
+        let msg = enoent.describe();
+        assert!(
+            msg.contains("unavailable (errno 2)") && !msg.contains("impossible"),
+            "{msg}"
+        );
+        assert!(!msg.contains('%'));
+    }
+
+    #[test]
+    fn the_loopback_reserve_stays_under_the_descriptor_margin() {
+        assert_eq!(clamp_loopback_reserve(8), 8);
+        assert_eq!(clamp_loopback_reserve(1000), RESERVE_FDS as usize / 2);
+        assert_eq!(clamp_loopback_reserve(0), 0);
     }
 
     #[test]

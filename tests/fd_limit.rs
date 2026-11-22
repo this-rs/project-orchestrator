@@ -48,6 +48,7 @@ fn child_server() {
         fd_guard::override_meter_path_for_tests(&path);
     }
     let loopback = env_num("FD_LOOPBACK").unwrap_or(0) as usize;
+    let loopback_age = env_num("FD_LOOPBACK_AGE_MS");
     fd_guard::init_fd_meter();
     let report = fd_guard::raise_nofile_limit(target);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -62,6 +63,9 @@ fn child_server() {
             fd_guard::ConnTracker::new(max, peers)
         };
         tracker.set_loopback_reserve(loopback);
+        if let Some(ms) = loopback_age {
+            tracker.set_loopback_max_age(Duration::from_millis(ms));
+        }
         let t2 = tracker.clone();
         let t3 = tracker.clone();
         let app = axum::Router::new()
@@ -100,6 +104,16 @@ fn child_server() {
                             })
                             .collect::<String>()
                     }
+                }),
+            )
+            .route(
+                "/monitor",
+                get(|| async {
+                    let r = fd_guard::monitor_report();
+                    format!(
+                        "alert={} degraded={} msg={}",
+                        r.alert, r.degraded, r.message
+                    )
                 }),
             )
             .route("/noninbound", get(|| async { hold_non_inbound() }))
@@ -248,6 +262,8 @@ struct Cfg {
     /// Loopback connections admitted over the cap (0 in the cap tests, which
     /// connect from loopback themselves).
     loopback: u64,
+    /// Maximum age (ms) of a connection admitted on the loopback quota.
+    loopback_age_ms: Option<u64>,
     /// Another directory for the descriptor meter (an unavailable one).
     meter_path: Option<&'static str>,
     soft: u64,
@@ -262,6 +278,7 @@ impl Cfg {
     fn new(soft: u64, hard: u64) -> Cfg {
         Cfg {
             loopback: 0,
+            loopback_age_ms: None,
             meter_path: None,
             soft,
             hard,
@@ -313,6 +330,9 @@ fn spawn(cfg: Cfg) -> Server {
     let exe = std::env::current_exe().unwrap();
     let (soft, hard) = (cfg.soft, cfg.hard);
     let mut cmd = Command::new(exe);
+    if let Some(ms) = cfg.loopback_age_ms {
+        cmd.env("FD_LOOPBACK_AGE_MS", ms.to_string());
+    }
     if let Some(path) = cfg.meter_path {
         cmd.env("FD_METER_PATH", path);
     }
@@ -1038,6 +1058,87 @@ async fn an_unavailable_meter_falls_back_to_the_static_cap_and_does_not_refuse_e
         held.push(c);
     }
     drop(held);
+}
+
+/// Le quota loopback est un DÉPASSEMENT TEMPORAIRE : 8 connexions locales
+/// longues l'épuisent, mais le garde les ferme à l'échéance et la sonde repasse.
+/// ROUGE sans échéance : `/health` reste refusé tant que les 8 tiennent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eight_long_local_connections_do_not_lock_the_probe_out_for_good() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("quota-expiry", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        max: 3,
+        loopback: 8,
+        loopback_age_ms: Some(1500),
+        ..Cfg::new(128, 128)
+    });
+    let mut holders = Vec::new();
+    for _ in 0..3 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        holders.push(c);
+    }
+    // Eight long-lived LOOPBACK connections (keep-alive, idle) use the whole quota.
+    let mut quota = Vec::new();
+    for _ in 0..8 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        quota.push(c);
+    }
+    // Quota exhausted: the probe is refused for now...
+    assert_eq!(
+        get(srv.port, "/health", Duration::from_secs(3))
+            .await
+            .unwrap()
+            .0,
+        503
+    );
+    // ...and answers again once the temporary overshoot expired, though the 3
+    // normal holders and the 8 clients are still connected on their side.
+    eventually_ok(srv.port, "/health", Duration::from_secs(8)).await;
+    // The quota connections were closed by the server, the 3 normal ones were not.
+    for c in quota.iter_mut() {
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf)).await;
+        assert!(
+            matches!(n, Ok(Ok(0)) | Ok(Err(_))),
+            "a quota connection outlived its age"
+        );
+    }
+    for c in holders.iter_mut() {
+        send_get(c, "/health", false).await;
+        assert_eq!(
+            read_response(c).await.unwrap().0,
+            200,
+            "a normal connection was cut"
+        );
+    }
+}
+
+/// Mètre aveugle SANS table pleine : le moniteur est DÉGRADÉ (warn à chaque
+/// période, `/health` degraded), sans être une alerte de saturation, et le
+/// message ne dit pas « impossible ». ROUGE si `degraded` ne couvre que l'alerte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blind_meter_is_reported_degraded_not_as_a_saturation_alert() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("meter-degraded", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        meter_path: Some("/nonexistent/meter"),
+        ..Cfg::new(128, 128)
+    });
+    let (_, _, out) = eventually_ok(srv.port, "/monitor", Duration::from_secs(5)).await;
+    assert!(out.contains("degraded=true"), "{out}");
+    assert!(out.contains("alert=false"), "{out}");
+    assert!(out.contains("unavailable (errno 2)"), "{out}");
+    assert!(!out.contains("impossible"), "{out}");
+    assert!(!out.contains('%'), "{out}");
 }
 
 #[test]

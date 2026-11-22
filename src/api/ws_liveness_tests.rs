@@ -512,6 +512,11 @@ async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Res
     for _ in 0..60 {
         emit_one(which, &rig, run_id).await;
     }
+    // Precondition: answer only once the server is blocked in its write (the
+    // client reads nothing, the buffers are full). Answering at once let the
+    // /ws/run loop read the Pong BEFORE it started writing, so the race was never
+    // set up (the first version passed under the tick-first mutation for /ws/run).
+    tokio::time::sleep(Duration::from_millis(500)).await;
     raw.send(0xA, &first).await;
     // Read NOTHING for 1.5 Pong deadlines: the buffers are full, the server stays
     // blocked in its write for longer than the deadline.
@@ -773,4 +778,22 @@ async fn a_big_message_to_a_slow_but_advancing_client_is_not_cut() {
     let t0 = Instant::now();
     assert!(stuck.send(big).await.is_err());
     assert_eq!(t0.elapsed(), Duration::from_secs(5 + 122));
+}
+
+/// A client blocked on a huge message is cut at the ABSOLUTE ceiling, not after
+/// the proportional time (20 MiB would be 2560 s extra): red without the ceiling.
+#[tokio::test(start_paused = true)]
+async fn a_client_blocked_on_a_huge_message_is_cut_at_the_absolute_ceiling() {
+    use futures::SinkExt;
+    let huge = Message::Text("x".repeat(20 * 1024 * 1024).into());
+    let mut stuck = super::ws_liveness::BoundedSink::with_limit(
+        SlowFlush {
+            delay: Duration::from_secs(1_000_000),
+            sleep: None,
+        },
+        Duration::from_secs(5),
+    );
+    let t0 = Instant::now();
+    assert!(stuck.send(huge).await.is_err());
+    assert_eq!(t0.elapsed(), super::ws_liveness::WS_MAX_SEND_TIMEOUT);
 }

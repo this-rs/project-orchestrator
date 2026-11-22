@@ -242,7 +242,9 @@ pub struct ResourceUsage {
     pub fd_percent: Option<u32>,
     /// `true` from 80 %, and ALSO when the measurement is impossible.
     pub fd_alert: bool,
-    /// Why the measurement is impossible (errno), if it is.
+    /// Why the measurement is unavailable (errno), if it is: "impossible" when the
+    /// table is full (also raises `fd_alert`), "unavailable" otherwise (static cap
+    /// in use, status degraded, no saturation alert).
     pub fd_measure_error: Option<String>,
     pub connections: usize,
     /// Inbound cap in force right now; 0 = no cap.
@@ -257,7 +259,7 @@ pub struct ResourceUsage {
 fn resource_usage() -> Option<ResourceUsage> {
     use crate::fd_guard::{fd_status, global, FdStatus, UNLIMITED};
     let status = fd_status();
-    let snap = global().map(|t| t.snapshot());
+    let snap = global().map(|t| t.snapshot_counters());
     let (open_fds, fd_soft_limit, fd_percent, fd_measure_error) = match status {
         FdStatus::Usage(u) => {
             let limited = u.soft_limit != UNLIMITED;
@@ -268,15 +270,9 @@ fn resource_usage() -> Option<ResourceUsage> {
                 None,
             )
         }
-        FdStatus::Unavailable { errno } => (
-            None,
-            None,
-            None,
-            Some(format!(
-                "measurement impossible (errno {})",
-                errno.map_or("?".to_string(), |e| e.to_string())
-            )),
-        ),
+        // The same wording as the log: "impossible" only when the table is full,
+        // "unavailable" (static cap in use) for any other reason.
+        FdStatus::Unavailable { .. } => (None, None, None, Some(status.describe())),
     };
     Some(ResourceUsage {
         open_fds,
@@ -285,7 +281,7 @@ fn resource_usage() -> Option<ResourceUsage> {
         fd_alert: status.alert(),
         fd_measure_error,
         connections: snap.as_ref().map_or(0, |s| s.active),
-        max_connections: snap.as_ref().map_or(0, |s| s.max),
+        max_connections: global().and_then(|t| t.effective_cap()).unwrap_or(0),
         connections_rejected: snap.as_ref().map_or(0, |s| s.rejected),
         accept_errors: snap.as_ref().map_or(0, |s| s.accept_errors),
     })
@@ -294,6 +290,18 @@ fn resource_usage() -> Option<ResourceUsage> {
 #[cfg(not(unix))]
 fn resource_usage() -> Option<ResourceUsage> {
     None
+}
+
+/// `/health` turns `degraded` on the 80 % alert OR when the meter is blind
+/// (one `/dev/fd` listing, no counters).
+#[cfg(unix)]
+fn fd_degraded() -> bool {
+    crate::fd_guard::fd_status().degraded()
+}
+
+#[cfg(not(unix))]
+fn fd_degraded() -> bool {
+    false
 }
 
 /// `GET /api/diagnostics/resources` (authenticated): descriptor usage and inbound
@@ -332,9 +340,9 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
             .map(|emitter| emitter.transport_state()),
     );
 
-    // Only a state, never the numbers: the descriptor alert degrades the status.
-    let fd_alert = resource_usage().is_some_and(|r| r.fd_alert);
-    let status = if neo4j_ok && meili_ok && !fd_alert {
+    // Only a state, never the numbers: the descriptor alert, or a blind meter,
+    // degrades the status.
+    let status = if neo4j_ok && meili_ok && !fd_degraded() {
         "ok"
     } else if neo4j_ok {
         "degraded"

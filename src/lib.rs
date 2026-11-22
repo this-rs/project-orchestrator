@@ -1407,6 +1407,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let nofile = {
         // Hold /dev/fd open from the start: measuring must not need a free descriptor.
         fd_guard::init_fd_meter();
+        fd_guard::log_meter_at_startup();
         fd_guard::raise_nofile_limit_and_log()
     };
 

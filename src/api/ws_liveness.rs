@@ -117,6 +117,12 @@ pub const WS_SEND_TIMEOUT: Duration = WS_PONG_TIMEOUT;
 /// Débit minimal toléré d'une écriture qui avance (octets par seconde).
 pub const WS_MIN_WRITE_RATE: usize = 8 * 1024;
 
+/// Plafond ABSOLU d'une écriture, quelle que soit la taille du message : sans lui,
+/// 10 MiB donneraient plus de 20 minutes et 100 MiB plus de 3 heures pendant
+/// lesquelles un client bloqué retiendrait son descripteur. Un client qui n'a pas
+/// absorbé un message en 5 minutes est coupé.
+pub const WS_MAX_SEND_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn message_len(m: &Message) -> usize {
     match m {
         Message::Text(t) => t.len(),
@@ -239,7 +245,8 @@ where
 pub type WsSender = BoundedSink<SplitSink<WebSocket, Message>>;
 
 /// Une écriture qui n'aboutit pas dans [`WS_SEND_TIMEOUT`] PLUS le temps qu'un
-/// débit minimal de [`WS_MIN_WRITE_RATE`] octets/s mettrait à écrire le message
+/// débit minimal de [`WS_MIN_WRITE_RATE`] octets/s mettrait à écrire le message,
+/// sans jamais dépasser [`WS_MAX_SEND_TIMEOUT`] (5 minutes),
 /// échoue. Le délai est donc proportionnel à la taille : un message de plusieurs
 /// Mo vers un client lent MAIS qui avance (au moins ce débit) n'est pas coupé ;
 /// un client qui ne lit plus l'est. La minuterie repart à zéro à chaque fin
@@ -311,8 +318,10 @@ where
                 Poll::Ready(r)
             }
             Poll::Pending => {
-                let limit =
+                let proportional =
                     self.limit + Duration::from_secs((self.last_len / WS_MIN_WRITE_RATE) as u64);
+                // Never more than the absolute ceiling (unless the base itself is higher).
+                let limit = proportional.min(WS_MAX_SEND_TIMEOUT.max(self.limit));
                 let timer = self
                     .stall
                     .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
