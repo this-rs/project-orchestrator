@@ -2827,9 +2827,9 @@ mod integration_tests {
         let graph = Arc::new(MockGraphStore::new());
         let done_soon = seed_task(&graph, TaskStatus::InProgress, Some("Done soon")).await;
         let next = seed_task(&graph, TaskStatus::Pending, Some("Next")).await;
-        let uuid = Some(Uuid::new_v4());
-        link_tasks(&graph, uuid.unwrap(), &[done_soon, next]).await;
-        let h = reopened_handler(graph.clone(), "reopened-progress", uuid).await;
+        let uuid = Uuid::new_v4();
+        link_tasks(&graph, uuid, &[done_soon, next]).await;
+        let h = reopened_handler(graph.clone(), "reopened-progress", Some(uuid)).await;
         // The first turn completes a linked task.
         graph
             .tasks
