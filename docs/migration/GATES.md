@@ -141,10 +141,11 @@ divergence listée est corrigée (« now conforms »), ce qui force à retirer l
   dont `obrain_transverse`, et aucun test `mock_` ni `neo4j_`.
 - En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
 
-### G5 — tests unitaires obrain
-Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`.
-Deux tests sensibles à l'ordonnancement restent exclus et sont nommés dans le tableau
-ci-dessus ; leur stabilisation est nécessaire avant leur réactivation en CI.
+### G5 — refus nommés : les tests unitaires de `src/obrain/`
+Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`, et
+échoue si aucun test n'a tourné. Deux tests sensibles à l'ordonnancement restent exclus
+(`--skip`, qui compare par sous-chaîne) ; ils sont suivis en G11 et leur stabilisation est
+nécessaire avant leur réactivation en CI.
 
 ## Portes manuelles ou non faites
 
@@ -194,6 +195,10 @@ configuration, source jamais modifiée, testé. Non fusionné.
 (« no kill landed inside a creation over 12 rounds ») et un `unwrap()` sur une ligne de
 journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 (manche
 « suspendue ») ; le second n'est corrigé nulle part. Une porte instable ne prouve rien.
+
+Exclus du job Obrain backend tant qu'ils dépendent de l'horloge ou de l'ordonnancement :
+`obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et
+`obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`.
 
 ## Règles de contrôle
 

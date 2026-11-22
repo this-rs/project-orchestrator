@@ -806,9 +806,12 @@ jobs:
       # their timing windows with deterministic synchronization.
       - name: Run the obrain library unit tests
         run: |
+          set -o pipefail
           cargo test --features obrain-backend --lib obrain:: -- \
             --skip obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou \
-            --skip obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable
+            --skip obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable \
+            2>&1 | tee /tmp/obrain-lib.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/obrain-lib.log
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
