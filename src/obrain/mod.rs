@@ -884,10 +884,15 @@ impl Ecriture<'_> {
     /// it itself if the closure did not.
     fn rendre_durable(&mut self) -> Result<()> {
         #[cfg(test)]
-        if let Some((arrivee, reprise)) = self.interne.pause_durabilite.lock().unwrap().take() {
-            let _ = arrivee.send(());
-            // A dropped sender also releases the writer if the test fails.
-            let _ = reprise.recv();
+        {
+            // Take the hook in its own statement: the lock must not be held while
+            // the writer waits for the test to release it.
+            let pause = self.interne.pause_durabilite.lock().unwrap().take();
+            if let Some((arrivee, reprise)) = pause {
+                let _ = arrivee.send(());
+                // A dropped sender also releases the writer if the test fails.
+                let _ = reprise.recv();
+            }
         }
         self.rendu_durable = true;
         let n = self.interne.ecritures.fetch_add(1, Ordering::Relaxed) + 1;
