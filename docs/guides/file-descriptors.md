@@ -54,7 +54,10 @@
   - a client that stops READING a response (asset, export...): until a write makes
     no progress for `ORCHESTRATOR_LOOPBACK_WRITE_STALL_SECS` (default 30, minimum
     1). A no-progress delay, not a duration cap: a slow client that keeps reading is
-    never cut. Only quota connections are subject to it.
+    never cut. Only quota connections are subject to it. Progress is seen per
+    writable event, and loopback TCP can reopen a window in coarse steps: a client
+    reading at tens of KiB/s can show gaps of seconds, which is why the default is
+    30 s and not 1 s (the tests use 1 s with a reader at ~2 MiB/s).
   - a LONG non-SSE response that the server itself produces slowly (a slow chunked
     stream) to a client that keeps reading: nothing bounds it on the quota (no write
     stalls, the client advances; the route timeout covers the wait for the

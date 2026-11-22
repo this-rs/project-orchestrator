@@ -124,6 +124,7 @@ fn child_server() {
                 }),
             )
             .route("/big", get(|| async { "x".repeat(24 * 1024 * 1024) }))
+            .route("/mid", get(|| async { "y".repeat(8 * 1024 * 1024) }))
             .route(
                 "/slow",
                 get(|| async {
@@ -1264,8 +1265,8 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
 
 /// Un lecteur arrêté sur le quota ne tient pas sa place indéfiniment : une écriture
 /// sans AUCUN progrès pendant le délai (1 s ici) ferme la connexion du quota et rend la
-/// place ; un client lent MAIS qui avance (8 Kio toutes les 200 ms pendant 3 s, puis la
-/// suite à pleine vitesse) n'est jamais coupé ; une connexion ORDINAIRE dont le lecteur est arrêté
+/// place ; un client lent MAIS qui avance (8 Mio à 256 Kio / 100 ms, plusieurs secondes,
+/// plus que ce délai) n'est jamais coupé ; une connexion ORDINAIRE dont le lecteur est arrêté
 /// n'est PAS coupée (le délai ne concerne que le quota).
 /// ROUGE sans le délai d'écriture : le quota (1 place) reste pris et `/health` 503 ;
 /// rouge aussi sans le `if self.quota.is_none()` : la connexion ordinaire est coupée.
@@ -1298,41 +1299,30 @@ async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reade
         holders.push(c);
     }
 
-    // A slow reader that ADVANCES on the QUOTA. The response is 24 MiB, far more than the
-    // socket buffers (the server's write stays pending the whole time), and the client
-    // reads 8 KiB every 200 ms for 3 s: each read lets the server's write progress, but the
-    // gaps and the 3 s total are well beyond the 1 s delay. Then it reads the rest at full
-    // speed: every byte must arrive (a cut connection ends early).
-    let sock = tokio::net::TcpSocket::new_v4().unwrap();
-    sock.set_recv_buffer_size(4096).unwrap();
-    let mut slow = sock.connect(addr).await.unwrap();
-    send_get_with(&mut slow, "/big", "").await;
+    // A slow reader that ADVANCES on the QUOTA: 8 MiB read 256 KiB per 100 ms (a few
+    // seconds, much longer than the 1 s delay). The response is far larger than the socket
+    // buffers, so the server's write is pending nearly all the time; each read lets it
+    // progress (measured: the server's progress gaps stay far below the delay at this
+    // rate; at ~40 KiB/s they do not, because loopback TCP reopens the window in coarse
+    // steps, which is why the production delay is 30 s and the test reader is not slower).
+    let mut slow = TcpStream::connect(addr).await.unwrap();
+    send_get_with(&mut slow, "/mid", "").await;
     let slow_started = std::time::Instant::now();
     let mut total = 0usize;
-    let mut small = vec![0u8; 8 * 1024];
-    while slow_started.elapsed() < Duration::from_secs(3) {
-        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut small))
+    let mut chunk = vec![0u8; 256 * 1024];
+    while total < 8 * 1024 * 1024 {
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut chunk))
             .await
             .expect("a slow but advancing reader stalled")
-            .expect("the slow reader was cut");
+            .unwrap_or(0);
         assert!(n > 0, "the slow reader was cut after {total} bytes");
         total += n;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let mut fast = vec![0u8; 256 * 1024];
-    while total < 24 * 1024 * 1024 {
-        let n = tokio::time::timeout(Duration::from_secs(10), slow.read(&mut fast))
-            .await
-            .expect("the slow reader stalled")
-            .unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        total += n;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        total >= 24 * 1024 * 1024,
-        "the slow reader was cut after {total} bytes"
+        slow_started.elapsed() > Duration::from_secs(2),
+        "the reader was not slower than the stall delay ({:?}): the test proves nothing",
+        slow_started.elapsed()
     );
     drop(slow);
     // The slow reader's place is given back at the server's Drop: wait for it.
