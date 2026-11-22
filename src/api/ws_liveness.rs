@@ -66,6 +66,30 @@ impl Beat {
 
     #[cfg(test)]
     pub fn from_headers(h: &axum::http::HeaderMap) -> Beat {
+        Beat::overridden(Beat::PRODUCTION, h)
+    }
+
+    /// `/ws/chat`: the short test rhythm of [`WS_PING_EVERY`] / [`WS_PONG_TIMEOUT`]
+    /// under `cfg(test)` (its existing keepalive tests rely on it), overridable
+    /// by the same headers.
+    #[cfg(not(test))]
+    pub fn for_chat(_: &axum::http::HeaderMap) -> Beat {
+        Beat::PRODUCTION
+    }
+
+    #[cfg(test)]
+    pub fn for_chat(h: &axum::http::HeaderMap) -> Beat {
+        Beat::overridden(
+            Beat {
+                ping_every: WS_PING_EVERY,
+                pong_timeout: WS_PONG_TIMEOUT,
+            },
+            h,
+        )
+    }
+
+    #[cfg(test)]
+    fn overridden(base: Beat, h: &axum::http::HeaderMap) -> Beat {
         let ms = |k: &str| {
             h.get(k)
                 .and_then(|v| v.to_str().ok())
@@ -73,8 +97,8 @@ impl Beat {
                 .map(Duration::from_millis)
         };
         Beat {
-            ping_every: ms("x-test-ws-ping-ms").unwrap_or(Beat::PRODUCTION.ping_every),
-            pong_timeout: ms("x-test-ws-pong-ms").unwrap_or(Beat::PRODUCTION.pong_timeout),
+            ping_every: ms("x-test-ws-ping-ms").unwrap_or(base.ping_every),
+            pong_timeout: ms("x-test-ws-pong-ms").unwrap_or(base.pong_timeout),
         }
     }
 }

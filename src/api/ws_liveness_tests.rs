@@ -100,11 +100,15 @@ impl Raw {
         Raw::upgrade(tcp, addr, path).await
     }
 
-    async fn upgrade(mut tcp: TcpStream, addr: SocketAddr, path: &str) -> Raw {
+    async fn upgrade(tcp: TcpStream, addr: SocketAddr, path: &str) -> Raw {
+        Raw::upgrade_with(tcp, addr, path, 600).await
+    }
+
+    async fn upgrade_with(mut tcp: TcpStream, addr: SocketAddr, path: &str, pong_ms: u64) -> Raw {
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             x-test-ws-ping-ms: 250\r\nx-test-ws-pong-ms: 600\r\n\r\n"
+             x-test-ws-ping-ms: 250\r\nx-test-ws-pong-ms: {pong_ms}\r\n\r\n"
         );
         tcp.write_all(req.as_bytes()).await.unwrap();
         let mut head = Vec::new();
@@ -486,12 +490,15 @@ fn path_for(which: Socket, rig: &Full, run_id: uuid::Uuid) -> String {
 /// the tick about half the time and closes a live connection; the client then
 /// keeps answering for several periods and must still be connected.
 async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Result<(), String> {
+    // A looser Pong deadline than the other tests: the point here is the order in
+    // which a ready Pong and an overdue tick are served, not machine speed.
+    let race_pong = Duration::from_millis(2500);
     let rig = full_rig().await;
     let run_id = uuid::Uuid::new_v4();
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();
     let tcp = sock.connect(rig.addr).await.unwrap();
-    let mut raw = Raw::upgrade(tcp, rig.addr, &path_for(which, &rig, run_id)).await;
+    let mut raw = Raw::upgrade_with(tcp, rig.addr, &path_for(which, &rig, run_id), 2500).await;
     raw.send(0x1, b"ready").await;
     // Up to the first Ping.
     let first = loop {
@@ -508,9 +515,9 @@ async fn pong_in_flight_during_a_blocked_write_is_not_lost(which: Socket) -> Res
     raw.send(0xA, &first).await;
     // Read NOTHING for 1.5 Pong deadlines: the buffers are full, the server stays
     // blocked in its write for longer than the deadline.
-    tokio::time::sleep(WS_PONG_TIMEOUT * 3 / 2).await;
+    tokio::time::sleep(race_pong * 3 / 2).await;
     // Then behave: read everything, answer every Ping, for several periods.
-    let until = Instant::now() + WS_PONG_TIMEOUT * 5;
+    let until = Instant::now() + race_pong * 3;
     let mut pings = 0;
     while Instant::now() < until {
         match raw.next(WS_PING_EVERY * 4).await {

@@ -31,7 +31,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::ws_liveness::{Liveness, WS_PING_EVERY, WS_PONG_TIMEOUT};
+use super::ws_liveness::{Beat, Liveness};
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
@@ -153,6 +153,7 @@ pub async fn ws_chat(
     );
 
     let last_event = query.last_event;
+    let beat = Beat::for_chat(&headers);
 
     // Pre-upgrade auth: cookie first, then ticket fallback
     let neo4j = state.orchestrator.neo4j_arc();
@@ -174,7 +175,7 @@ pub async fn ws_chat(
     Ok(match auth_result {
         CookieAuthResult::Authenticated(claims) => ws
             .on_upgrade(move |socket| {
-                handle_ws_chat_preauthed(socket, state, session_id, last_event, claims)
+                handle_ws_chat_preauthed(socket, state, session_id, last_event, claims, beat)
             })
             .into_response(),
         CookieAuthResult::Invalid(reason) => {
@@ -193,6 +194,7 @@ async fn handle_ws_chat_preauthed(
     session_id: String,
     last_event: i64,
     claims: Claims,
+    beat: Beat,
 ) {
     let t0 = tokio::time::Instant::now();
     // Wait for client "ready" signal before sending auth_ok
@@ -208,7 +210,7 @@ async fn handle_ws_chat_preauthed(
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "⏱ ready handshake completed"
     );
-    handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
+    handle_ws_chat_loop(socket, state, session_id, last_event, claims, beat).await;
 }
 
 /// Main chat event loop for an authenticated WebSocket connection.
@@ -218,6 +220,7 @@ async fn handle_ws_chat_loop(
     session_id: String,
     last_event: i64,
     claims: Claims,
+    beat: Beat,
 ) {
     let (ws_sender_raw, mut ws_receiver) = socket.split();
     let mut ws_sender = super::ws_liveness::BoundedSink::new(ws_sender_raw);
@@ -582,9 +585,9 @@ async fn handle_ws_chat_loop(
             .await;
     }
 
-    let mut ping_interval = interval(WS_PING_EVERY);
+    let mut ping_interval = interval(beat.ping_every);
     ping_interval.tick().await; // skip first immediate tick
-    let mut liveness = Liveness::new(WS_PONG_TIMEOUT);
+    let mut liveness = Liveness::new(beat.pong_timeout);
 
     // Track responded permission request IDs to prevent double-click bugs.
     // If a user clicks Allow/Deny twice, the second response is silently ignored.
