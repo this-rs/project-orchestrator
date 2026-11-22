@@ -124,7 +124,6 @@ fn child_server() {
                 }),
             )
             .route("/big", get(|| async { "x".repeat(24 * 1024 * 1024) }))
-            .route("/mid", get(|| async { "y".repeat(3 * 1024 * 1024) }))
             .route(
                 "/slow",
                 get(|| async {
@@ -536,6 +535,12 @@ async fn eventually_ok(port: u16, path: &str, total: Duration) -> (u16, String, 
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Wait (bounded) until a quota place is free: it is given back at the Drop of the
+/// server's stream, after the FIN the client already saw. A leaked place never frees.
+async fn wait_quota_free(port: u16) {
+    eventually_ok(port, "/health", Duration::from_secs(8)).await;
 }
 
 fn nums(s: &str) -> Vec<u64> {
@@ -1211,6 +1216,9 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
         "{head}"
     );
 
+    // The quota has ONE slot and it is given back when the server's GuardedStream is
+    // dropped, which is AFTER hyper sent its FIN: wait for it before assuming it free.
+    wait_quota_free(srv.port).await;
     // h2c prior knowledge on the quota: the preface and an empty SETTINGS frame.
     let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
@@ -1231,21 +1239,17 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
         String::from_utf8_lossy(&got[..got.len().min(40)])
     );
     // And its quota slot is given back: a new request on the quota is served.
-    let r = get(srv.port, "/health", Duration::from_secs(3))
-        .await
-        .expect("no answer after h2c");
-    // The quota has ONE slot here: a leaked slot would make this a 503.
-    assert_eq!(
-        r.0, 200,
-        "the quota slot of the refused h2c connection was not given back"
-    );
+    // The quota has ONE slot here: a LEAKED slot never frees (the wait times out).
+    wait_quota_free(srv.port).await;
 
     // The MCP GET (Accept: text/event-stream only) is NOT a stream request: the
     // handler's 405 reaches the client ("no server stream") instead of a 503.
+    wait_quota_free(srv.port).await;
     let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     send_get_with(&mut c, "/mcp", "Accept: text/event-stream\r\n").await;
     assert_eq!(read_response(&mut c).await.unwrap().0, 405);
     // A POST whose RESPONSE is an event stream is refused (guard of the Content-Type check).
+    wait_quota_free(srv.port).await;
     let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     let req = "POST /mcp-stream HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\
                Accept: application/json, text/event-stream\r\n\r\n{}";
@@ -1260,15 +1264,18 @@ async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
 
 /// Un lecteur arrêté sur le quota ne tient pas sa place indéfiniment : une écriture
 /// sans AUCUN progrès pendant le délai (1 s ici) ferme la connexion du quota et rend la
-/// place ; un client lent MAIS qui avance (3 Mo lus par morceaux pendant plus que ce
-/// délai) n'est jamais coupé ; les connexions ordinaires ne sont pas concernées.
-/// ROUGE sans le délai d'écriture : le quota (1 place) reste pris et `/health` 503.
+/// place ; un client lent MAIS qui avance (8 Kio toutes les 200 ms pendant 3 s, puis la
+/// suite à pleine vitesse) n'est jamais coupé ; une connexion ORDINAIRE dont le lecteur est arrêté
+/// n'est PAS coupée (le délai ne concerne que le quota).
+/// ROUGE sans le délai d'écriture : le quota (1 place) reste pris et `/health` 503 ;
+/// rouge aussi sans le `if self.quota.is_none()` : la connexion ordinaire est coupée.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reader_is_kept() {
     let _g = ONE_AT_A_TIME.lock().await;
     if !runnable("quota-write-stall", 128) {
         return;
     }
+    let started = std::time::Instant::now();
     let srv = spawn(Cfg {
         max: 3,
         loopback: 1,
@@ -1276,45 +1283,68 @@ async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reade
         ..Cfg::new(128, 128)
     });
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], srv.port));
+
+    // An ORDINARY connection whose reader stops: 24 MiB, tiny receive buffer, nothing is
+    // read for now. It takes one of the 3 ordinary places.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut ordinary_stuck = sock.connect(addr).await.unwrap();
+    send_get_with(&mut ordinary_stuck, "/big", "Connection: keep-alive\r\n").await;
     let mut holders = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
         send_get(&mut c, "/health", false).await;
         assert_eq!(read_response(&mut c).await.unwrap().0, 200);
         holders.push(c);
     }
 
-    // A slow reader that ADVANCES (128 KiB per 100 ms, 3 MiB in ~2.4 s, more than the
-    // 1 s delay) is served in full.
+    // A slow reader that ADVANCES on the QUOTA. The response is 24 MiB, far more than the
+    // socket buffers (the server's write stays pending the whole time), and the client
+    // reads 8 KiB every 200 ms for 3 s: each read lets the server's write progress, but the
+    // gaps and the 3 s total are well beyond the 1 s delay. Then it reads the rest at full
+    // speed: every byte must arrive (a cut connection ends early).
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();
     let mut slow = sock.connect(addr).await.unwrap();
-    send_get_with(&mut slow, "/mid", "").await;
+    send_get_with(&mut slow, "/big", "").await;
+    let slow_started = std::time::Instant::now();
     let mut total = 0usize;
-    let mut chunk = vec![0u8; 128 * 1024];
-    loop {
-        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut chunk))
+    let mut small = vec![0u8; 8 * 1024];
+    while slow_started.elapsed() < Duration::from_secs(3) {
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut small))
             .await
             .expect("a slow but advancing reader stalled")
+            .expect("the slow reader was cut");
+        assert!(n > 0, "the slow reader was cut after {total} bytes");
+        total += n;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut fast = vec![0u8; 256 * 1024];
+    while total < 24 * 1024 * 1024 {
+        let n = tokio::time::timeout(Duration::from_secs(10), slow.read(&mut fast))
+            .await
+            .expect("the slow reader stalled")
             .unwrap_or(0);
         if n == 0 {
             break;
         }
         total += n;
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        total >= 3 * 1024 * 1024,
+        total >= 24 * 1024 * 1024,
         "the slow reader was cut after {total} bytes"
     );
+    drop(slow);
+    // The slow reader's place is given back at the server's Drop: wait for it.
+    wait_quota_free(srv.port).await;
 
-    // A reader that STOPS: 24 MiB, tiny receive buffer, nothing is ever read.
+    // A reader that STOPS on the quota: 24 MiB, tiny receive buffer, nothing is ever read.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();
     let mut stuck = sock.connect(addr).await.unwrap();
     send_get_with(&mut stuck, "/big", "").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // The single quota slot is held by the stuck client...
+    // The single quota place is held by the stuck client...
     assert_eq!(
         get(srv.port, "/health", Duration::from_secs(3))
             .await
@@ -1322,9 +1352,27 @@ async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reade
             .0,
         503
     );
-    // ...until the write stalls for the delay: the connection is closed, the slot given back.
-    eventually_ok(srv.port, "/health", Duration::from_secs(6)).await;
-    // Ordinary connections were never touched.
+    // ...until the write stalls for the delay: the connection is closed, the place given back.
+    wait_quota_free(srv.port).await;
+
+    // The ORDINARY stuck connection outlived the delay many times over: it was never cut, so
+    // every one of its 24 MiB can still be read.
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 256 * 1024];
+    while got < 24 * 1024 * 1024 {
+        let n = tokio::time::timeout(Duration::from_secs(10), ordinary_stuck.read(&mut buf))
+            .await
+            .expect("the ordinary connection stalled")
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    assert!(
+        got >= 24 * 1024 * 1024,
+        "an ORDINARY connection was cut by the quota write delay after {got} bytes"
+    );
     for c in holders.iter_mut() {
         send_get(c, "/health", false).await;
         assert_eq!(
@@ -1333,6 +1381,7 @@ async fn a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reade
             "a normal connection was cut"
         );
     }
+    println!("FD_LIMIT write-stall test took {:?}", started.elapsed());
     drop(stuck);
 }
 

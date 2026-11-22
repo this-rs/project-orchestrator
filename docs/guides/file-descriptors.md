@@ -41,8 +41,8 @@
   (`Accept: text/event-stream`) whose 405 tells the client there is no server stream. HTTP/2 in clear text
   (h2c) is refused on the quota: it has no `Connection: close`, and hyper-util's
   `http2` feature is enabled in this build (checked with
-  `cargo tree -e features -i hyper-util`). What holds a quota place, honestly (a quota place is a short-request place, and
-  these are the only ways to keep one):
+  `cargo tree -e features -i hyper-util`). What holds a quota place, honestly (the quota is meant for short requests; these
+  are the ways a place stays taken, the last one is NOT bounded):
   - an incomplete request head (nothing received, or partial headers): until
     `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1), the safety net
     against slow-loris, which closes on the read side only and only when no byte is
@@ -55,6 +55,11 @@
     no progress for `ORCHESTRATOR_LOOPBACK_WRITE_STALL_SECS` (default 30, minimum
     1). A no-progress delay, not a duration cap: a slow client that keeps reading is
     never cut. Only quota connections are subject to it.
+  - a LONG non-SSE response that the server itself produces slowly (a slow chunked
+    stream) to a client that keeps reading: nothing bounds it on the quota (no write
+    stalls, the client advances; the route timeout covers the wait for the
+    response, not its streaming). A route that does this should not be reached
+    through the quota.
   A LAN health probe is not covered. A quota rather than a second health listener:
   no extra port, every local client benefits.
 - `ORCHESTRATOR_CONN_STATS=1` logs, every 60 s, the top peers by remote address

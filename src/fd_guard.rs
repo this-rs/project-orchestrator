@@ -55,8 +55,9 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 ///   service qu'alors ; le corps peut arriver lentement) ni une réponse en cours
 ///   (une réponse longue non-SSE n'est donc PAS bornée sur le quota) ;
 /// - une écriture qui n'avance plus depuis [`DEFAULT_LOOPBACK_WRITE_STALL`] (lecteur
-///   arrêté) ferme la connexion du quota et rend la place (rien d'autre n'y borne
-///   l'écriture) ;
+///   arrêté) ferme la connexion du quota et rend la place ; en revanche une
+///   réponse LONGUE produite par le serveur (flux chunked lent, non SSE) à un client
+///   qui lit n'est bornée par RIEN sur le quota ;
 /// - HTTP/2 en clair (h2c, sans `Connection: close`) est refusé sur le quota ;
 /// - filet de sécurité (slowloris) : une connexion du quota dont les en-têtes ne
 ///   sont pas complets (rien reçu, ou en-têtes partiels) au bout de ce délai est
@@ -64,6 +65,8 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 pub const DEFAULT_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(10);
 /// Plancher du délai ci-dessus.
 pub const MIN_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(1);
+/// Plancher du délai d'absence de progrès d'écriture (voir ci-dessous).
+pub const MIN_LOOPBACK_WRITE_STALL: Duration = Duration::from_secs(1);
 /// Variable d'environnement : durée (secondes, minimum 1) sans AUCUN progrès
 /// d'écriture au bout de laquelle une connexion du quota est fermée et sa place
 /// rendue (défaut [`DEFAULT_LOOPBACK_WRITE_STALL`]).
@@ -676,6 +679,19 @@ pub struct ConnTracker {
     inner: Arc<TrackerInner>,
 }
 
+/// Secondes lues dans l'environnement : absente = `None` ; PRÉSENTE mais invalide =
+/// `None` AVEC un `warn` (la valeur par défaut reste en vigueur, jamais en silence).
+fn env_secs(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(value = %raw, "{name} is not a number of seconds: ignored, default kept");
+            None
+        }
+    }
+}
+
 /// Durée en millisecondes, sans troncature silencieuse.
 fn millis_u64(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
@@ -765,12 +781,12 @@ impl ConnTracker {
     /// Durée sans progrès d'écriture avant fermeture d'une connexion du quota
     /// (minimum 1 s, relevée avec un `warn` sinon).
     pub fn set_loopback_write_stall(&self, d: Duration) {
-        let d = if d < MIN_LOOPBACK_MAX_AGE {
+        let d = if d < MIN_LOOPBACK_WRITE_STALL {
             tracing::warn!(
                 requested_ms = millis_u64(d),
                 "{ENV_LOOPBACK_WRITE_STALL_SECS} raised to the 1 s minimum"
             );
-            MIN_LOOPBACK_MAX_AGE
+            MIN_LOOPBACK_WRITE_STALL
         } else {
             d
         };
@@ -828,16 +844,10 @@ impl ConnTracker {
             );
         }
         tracker.set_loopback_reserve(clamped);
-        if let Some(secs) = std::env::var(ENV_LOOPBACK_MAX_AGE_SECS)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
+        if let Some(secs) = env_secs(ENV_LOOPBACK_MAX_AGE_SECS) {
             tracker.set_loopback_max_age(Duration::from_secs(secs));
         }
-        if let Some(secs) = std::env::var(ENV_LOOPBACK_WRITE_STALL_SECS)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
+        if let Some(secs) = env_secs(ENV_LOOPBACK_WRITE_STALL_SECS) {
             tracker.set_loopback_write_stall(Duration::from_secs(secs));
         }
         tracing::info!(
@@ -1205,6 +1215,7 @@ impl GuardedStream {
         &mut self,
         cx: &mut Context<'_>,
         r: Poll<io::Result<T>>,
+        progressed: impl Fn(&T) -> bool,
     ) -> Poll<io::Result<T>> {
         use std::future::Future;
         if self.quota.is_none() {
@@ -1226,8 +1237,12 @@ impl GuardedStream {
                     Poll::Pending
                 }
             }
+            // Only a write that moved bytes (or a flush that completed) is progress:
+            // `Ok(0)` re-arms nothing.
             ready => {
-                self.write_stall = None;
+                if matches!(&ready, Poll::Ready(Ok(t)) if progressed(t)) {
+                    self.write_stall = None;
+                }
                 ready
             }
         }
@@ -1283,11 +1298,11 @@ impl AsyncWrite for GuardedStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
-        self.guard_write(cx, r)
+        self.guard_write(cx, r, |n| *n > 0)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let r = Pin::new(&mut self.inner).poll_flush(cx);
-        self.guard_write(cx, r)
+        self.guard_write(cx, r, |_| true)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
@@ -1298,7 +1313,7 @@ impl AsyncWrite for GuardedStream {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        self.guard_write(cx, r)
+        self.guard_write(cx, r, |n| *n > 0)
     }
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
