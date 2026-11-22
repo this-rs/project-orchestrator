@@ -30,16 +30,24 @@
 - Loopback quota. Loopback peers (the health probe, the desktop app, local MCP
   clients) keep a quota of `ORCHESTRATOR_LOOPBACK_RESERVE` (default 8, clamped to
   half the 64 margin, logged at startup) connections OVER the cap. The quota is
-  for SHORT REQUESTS ONLY, and nothing ever cuts a request in progress:
-  every response on a quota connection carries `Connection: close` (the
-  connection closes after its response, no keep-alive); a WebSocket upgrade or an
-  SSE on a quota connection gets a clean `503` (the desktop therefore never
-  reaches `onopen` through the quota and its reconnect backoff keeps growing);
-  as a safety net against slow-loris, a quota connection that has sent NO request
-  after `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1) is closed,
-  on the read side only. Silent local connections can therefore hold the quota
-  for that long. A LAN health probe is not covered. A quota rather than a second
-  health listener: no extra port, every local client benefits.
+  for SHORT REQUESTS ONLY. Every response on a quota connection carries
+  `Connection: close` (the connection closes after its response, no keep-alive);
+  a WebSocket upgrade, or a request whose `Accept` is ONLY `text/event-stream`, or
+  a response whose `Content-Type` is `text/event-stream`, gets a clean `503` (the
+  desktop therefore never reaches `onopen` through the quota and its reconnect
+  backoff keeps growing). An MCP Streamable HTTP POST
+  (`Accept: application/json, text/event-stream`) is served. HTTP/2 in clear text
+  (h2c) is refused on the quota: it has no `Connection: close`, and hyper-util's
+  `http2` feature is enabled in this build (checked with
+  `cargo tree -e features -i hyper-util`). Nothing cuts a request whose headers are
+  complete, nor a response in progress: a LONG non-SSE response on a quota
+  connection is not bounded. As a safety net against slow-loris, a quota
+  connection whose request headers are not complete (nothing received, or partial
+  headers) after `ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS` (default 10, minimum 1) is
+  closed, on the read side only and only when no byte is available. Silent local
+  connections can therefore hold the quota for that long. A LAN health probe is
+  not covered. A quota rather than a second health listener: no extra port,
+  every local client benefits.
 - `ORCHESTRATOR_CONN_STATS=1` logs, every 60 s, the top peers by remote address
   (connections, time since the first one of the current series, connections
   admitted). It is bounded (256 peers, then an aggregate counter) and forgets a
@@ -47,7 +55,8 @@
   say what the connections are.
 - WebSockets (`/ws/chat`, `/ws/events`, `/ws/activity`, `/ws/run`) now require a
   valid `Pong` (echoing the Ping's 8-byte sequence) within 60 s, and every write
-  fails after 60 s without progress, so a peer that stops answering or reading
+  fails after 60 s plus the time an 8 KiB/s client would need for the message
+  (at most 5 minutes), so a peer that stops answering or reading
   frees its descriptor.
 
 ## Deployment fix (NOT applied: restarting the service is a human decision)

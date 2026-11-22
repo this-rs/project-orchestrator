@@ -482,7 +482,8 @@ fn path_for(which: Socket, rig: &Full, run_id: uuid::Uuid) -> String {
 }
 
 /// Tests that block a server write (the stall tests, the error-path test, the race
-/// tests) run one at a time: the race tests detect "the server is blocked" through
+/// tests) run one at a time (only tests that FILL a socket buffer can raise the
+/// counter; the other tests that open real WebSockets send a few bytes): the race tests detect "the server is blocked" through
 /// the process-wide [`BLOCKED_WRITES`] counter, which only means something if no
 /// other test blocks a write meanwhile.
 static BLOCKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

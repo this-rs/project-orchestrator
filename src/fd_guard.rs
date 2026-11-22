@@ -42,8 +42,8 @@ pub const ENV_MAX_CONNECTIONS: &str = "ORCHESTRATOR_MAX_CONNECTIONS";
 pub const ENV_LOOPBACK_RESERVE: &str = "ORCHESTRATOR_LOOPBACK_RESERVE";
 pub const DEFAULT_LOOPBACK_RESERVE: usize = 8;
 /// Variable d'environnement : délai (secondes, minimum 1) au bout duquel une
-/// connexion admise sur le quota loopback qui n'a envoyé AUCUNE requête est
-/// fermée (défaut [`DEFAULT_LOOPBACK_MAX_AGE`]).
+/// connexion admise sur le quota loopback dont les en-têtes de requête ne sont pas
+/// complets est fermée en lecture (défaut [`DEFAULT_LOOPBACK_MAX_AGE`]).
 pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS";
 /// Le quota loopback ne sert qu'à des REQUÊTES COURTES :
 /// - toute réponse sur une connexion du quota porte `Connection: close` (pas de
@@ -51,9 +51,12 @@ pub const ENV_LOOPBACK_MAX_AGE_SECS: &str = "ORCHESTRATOR_LOOPBACK_MAX_AGE_SECS"
 /// - un upgrade WebSocket ou une SSE sur le quota est refusé en 503 propre, donc
 ///   le desktop, dont le backoff repart à 1 s à chaque ouverture réussie, n'y
 ///   obtient jamais de `onopen` et son backoff grandit ;
-/// - rien ne coupe jamais une requête commencée ni une réponse en cours ;
-/// - filet de sécurité (slowloris) : une connexion du quota qui n'a envoyé aucune
-///   requête au bout de ce délai est fermée EN LECTURE seulement.
+/// - rien ne coupe une requête dont les en-têtes sont complets ni une réponse en
+///   cours (une réponse longue non-SSE n'est donc PAS bornée sur le quota) ;
+/// - HTTP/2 en clair (h2c, sans `Connection: close`) est refusé sur le quota ;
+/// - filet de sécurité (slowloris) : une connexion du quota dont les en-têtes ne
+///   sont pas complets (rien reçu, ou en-têtes partiels) au bout de ce délai est
+///   fermée EN LECTURE seulement, et seulement quand aucun octet n'est disponible.
 pub const DEFAULT_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(10);
 /// Plancher du délai ci-dessus.
 pub const MIN_LOOPBACK_MAX_AGE: Duration = Duration::from_secs(1);
@@ -744,6 +747,10 @@ impl ConnTracker {
 
     /// L'état d'une connexion du quota (pour le middleware), si `peer` en est une.
     pub fn quota_state(&self, peer: &SocketAddr) -> Option<Arc<QuotaState>> {
+        // Hot path of every request: no lock when no quota connection exists.
+        if self.inner.loopback_in_use.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         self.inner.quota_conns.lock().unwrap().get(peer).cloned()
     }
 
@@ -1112,7 +1119,12 @@ pub struct GuardedStream {
     tracker: ConnTracker,
     /// Connexion du quota loopback : sa minuterie de filet de sécurité et son état.
     quota: Option<(Arc<QuotaState>, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+    /// Début du flux d'une connexion du quota, tant qu'on cherche la préface h2c.
+    sniff: Option<Vec<u8>>,
 }
+
+/// Préface d'une connexion HTTP/2 « prior knowledge » (h2c).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 impl GuardedStream {
     /// Filet de sécurité du quota (slowloris), EN LECTURE seulement : une
@@ -1146,10 +1158,33 @@ impl AsyncRead for GuardedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Err(e) = self.check_idle(cx) {
-            return Poll::Ready(Err(e));
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                // h2c is refused on the quota: HTTP/2 has no `Connection: close`, so a
+                // multiplexed connection could stay open and serve any number of
+                // requests, long ones included. Only a quota connection sniffs.
+                if let Some(seen) = self.sniff.as_mut() {
+                    seen.extend_from_slice(&buf.filled()[before..]);
+                    let n = seen.len().min(H2_PREFACE.len());
+                    if seen[..n] != H2_PREFACE[..n] {
+                        self.sniff = None; // not h2: stop looking
+                    } else if seen.len() >= H2_PREFACE.len() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HTTP/2 is not served on the loopback quota",
+                        )));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            // No byte available: this is the only moment the idle net may cut.
+            Poll::Pending => match self.check_idle(cx) {
+                Ok(()) => Poll::Pending,
+                Err(e) => Poll::Ready(Err(e)),
+            },
+            other => other,
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -1188,6 +1223,7 @@ impl axum::serve::Listener for GuardedListener {
             match self.inner.accept().await {
                 Ok((stream, peer)) => match self.tracker.admit(peer.ip()) {
                     Some(mut admission) => {
+                        let sniff = admission.reserved.then(Vec::new);
                         let quota = if admission.reserved {
                             admission.peer = Some(peer);
                             let state = Arc::new(QuotaState::default());
@@ -1210,6 +1246,7 @@ impl axum::serve::Listener for GuardedListener {
                                 admission,
                                 tracker: self.tracker.clone(),
                                 quota,
+                                sniff,
                             },
                             peer,
                         );
@@ -1232,6 +1269,24 @@ impl axum::serve::Listener for GuardedListener {
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.inner.local_addr()
     }
+}
+
+/// `true` si `text/event-stream` est le SEUL type accepté. Les POST du transport
+/// MCP « Streamable HTTP » envoient `Accept: application/json, text/event-stream`
+/// (la spécification l'impose) : ils acceptent aussi du JSON et doivent être servis.
+pub fn accepts_only_sse(accept: &str) -> bool {
+    let mut any = false;
+    for part in accept.split(',') {
+        let media = part.split(';').next().unwrap_or("").trim();
+        if media.is_empty() {
+            continue;
+        }
+        if !media.eq_ignore_ascii_case("text/event-stream") {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 fn header_matches(
@@ -1282,7 +1337,7 @@ pub async fn quota_guard(
     let upgrade = header_matches(req.headers(), "upgrade", |v| {
         v.eq_ignore_ascii_case("websocket")
     });
-    let sse = header_matches(req.headers(), "accept", |v| v.contains("text/event-stream"));
+    let sse = header_matches(req.headers(), "accept", accepts_only_sse);
     if upgrade || sse {
         return quota_refusal();
     }
@@ -1439,6 +1494,17 @@ mod tests {
         assert_eq!(clamp_loopback_reserve(8), 8);
         assert_eq!(clamp_loopback_reserve(1000), RESERVE_FDS as usize / 2);
         assert_eq!(clamp_loopback_reserve(0), 0);
+    }
+
+    #[test]
+    fn only_a_pure_event_stream_accept_is_an_sse_request() {
+        assert!(accepts_only_sse("text/event-stream"));
+        assert!(accepts_only_sse(" Text/Event-Stream ; q=1 "));
+        // The MCP Streamable HTTP transport sends this on every POST: it must be served.
+        assert!(!accepts_only_sse("application/json, text/event-stream"));
+        assert!(!accepts_only_sse("text/event-stream, */*"));
+        assert!(!accepts_only_sse("*/*"));
+        assert!(!accepts_only_sse(""));
     }
 
     #[test]

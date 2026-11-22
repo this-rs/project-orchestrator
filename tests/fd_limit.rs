@@ -106,6 +106,7 @@ fn child_server() {
                     }
                 }),
             )
+            .route("/mcp", axum::routing::post(|| async { "ok" }))
             .route(
                 "/slow",
                 get(|| async {
@@ -1130,6 +1131,66 @@ async fn the_loopback_quota_serves_short_requests_only_and_never_cuts_a_request_
             "a normal connection was cut"
         );
     }
+}
+
+/// Un POST du transport MCP « Streamable HTTP » (`Accept: application/json,
+/// text/event-stream`, imposé par la spécification) est SERVI sur le quota : seul un
+/// `Accept` limité à `text/event-stream` est une demande de SSE. Et HTTP/2 en clair
+/// (h2c) est refusé sur le quota : il n'a pas de `Connection: close`, une connexion
+/// multiplexée pourrait y rester ouverte indéfiniment. ROUGE si tout `Accept` qui
+/// contient `text/event-stream` est refusé, ou si la préface h2c est acceptée
+/// (le serveur répond alors par sa trame SETTINGS, ou par une erreur 400).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quota_serves_mcp_posts_and_refuses_h2c() {
+    let _g = ONE_AT_A_TIME.lock().await;
+    if !runnable("quota-mcp-h2c", 128) {
+        return;
+    }
+    let srv = spawn(Cfg {
+        max: 3,
+        loopback: 8,
+        loopback_age_ms: Some(5000),
+        ..Cfg::new(128, 128)
+    });
+    let mut holders = Vec::new();
+    for _ in 0..3 {
+        let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+        send_get(&mut c, "/health", false).await;
+        assert_eq!(read_response(&mut c).await.unwrap().0, 200);
+        holders.push(c);
+    }
+    // MCP POST on the quota.
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let req = "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+               Accept: application/json, text/event-stream\r\nContent-Length: 2\r\n\r\n{}";
+    c.write_all(req.as_bytes()).await.unwrap();
+    let (status, head, body) = read_response(&mut c)
+        .await
+        .expect("no answer to an MCP POST");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok"),
+        "an MCP POST was refused on the quota: {head}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+
+    // h2c prior knowledge on the quota: the preface and an empty SETTINGS frame.
+    let mut c = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+    c.write_all(&hello).await.unwrap();
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut got)).await;
+    assert!(
+        got.is_empty(),
+        "h2c was served on the quota (answered {} bytes: {:?})",
+        got.len(),
+        String::from_utf8_lossy(&got[..got.len().min(40)])
+    );
+    drop(holders);
 }
 
 /// Mètre indisponible SANS table pleine (`/dev/fd` absent : conteneur, bac à
