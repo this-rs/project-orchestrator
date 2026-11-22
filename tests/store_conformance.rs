@@ -892,10 +892,10 @@ pub mod conformance {
         assert!(store.delete_note(note.id).await.unwrap());
     }
 
-    /// Deleting a task deletes its steps and its decisions, and SAYS so: the
-    /// report names the decisions that went, and only those (issue #1189 — the
-    /// cascade used to be silent). A decision of another task, and a decision
-    /// attached to no task, are left alone and not reported.
+    /// Deleting a task deletes its steps and detaches its decisions, and SAYS
+    /// so: the report names the decisions it let go, and only those (issue
+    /// #1189 — they used to be deleted, silently). A decision of another task,
+    /// and a decision attached to no task, are left alone and not reported.
     pub async fn check_task_delete_reports_its_cascade(store: &dyn GraphStore) {
         let a_decision = |label: &str| DecisionNode {
             id: Uuid::new_v4(),
@@ -948,16 +948,14 @@ pub mod conformance {
         let report = store.delete_task(doomed.id).await.unwrap();
 
         assert_eq!(report.steps_deleted, 3);
-        let reported: HashSet<Uuid> = report.deleted_decision_ids.iter().copied().collect();
-        assert_eq!(report.deleted_decision_ids.len(), 2, "{report:?}");
+        assert!(report.deleted_decision_ids.is_empty(), "{report:?}");
+        let reported: HashSet<Uuid> = report.detached_decision_ids.iter().copied().collect();
+        assert_eq!(report.detached_decision_ids.len(), 2, "{report:?}");
         assert_eq!(reported, HashSet::from([d1.id, d2.id]));
 
         // What the report says is what happened — no more, no less.
         assert!(store.get_task(doomed.id).await.unwrap().is_none());
-        for gone in [d1.id, d2.id] {
-            assert!(store.get_decision(gone).await.unwrap().is_none());
-        }
-        for stays in [kept.id, loose.id] {
+        for stays in [d1.id, d2.id, kept.id, loose.id] {
             assert!(store.get_decision(stays).await.unwrap().is_some());
         }
         assert!(store.get_step(kept_step.id).await.unwrap().is_some());
@@ -969,7 +967,76 @@ pub mod conformance {
             TaskDeletion::default()
         );
 
-        store.delete_decision(loose.id).await.unwrap();
+        for d in [d1.id, d2.id, loose.id] {
+            store.delete_decision(d).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// A decision outlives its task (issue #1189): deleting the task removes
+    /// the link and nothing else. Read back, the decision is whole, belongs to
+    /// no task, and still AFFECTS what it affected.
+    pub async fn check_task_delete_detaches_its_decisions(store: &dyn GraphStore) {
+        let p = a_project("task-delete-detach");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "task delete detach plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        let task = a_task(Some("deleted, its decision is not"));
+        store.create_task(plan.id, &task).await.unwrap();
+        let decision = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "conformance decision that outlives its task".to_string(),
+            rationale: "why".to_string(),
+            alternatives: vec!["other".to_string()],
+            chosen_option: Some("this".to_string()),
+            decided_by: "conformance".to_string(),
+            decided_at: Utc::now(),
+            // A status the other checks do not write, to find it in a listing.
+            status: DecisionStatus::Deprecated,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        store.create_decision(task.id, &decision).await.unwrap();
+        store
+            .add_decision_affects(decision.id, "project", &p.id.to_string(), Some("scope"))
+            .await
+            .unwrap();
+        let task_of = |items: &[project_orchestrator::neo4j::models::DecisionListItem]| {
+            items
+                .iter()
+                .find(|i| i.decision.id == decision.id)
+                .map(|i| i.task_id)
+        };
+        let (before, _) = store
+            .list_decisions_by_status(DecisionStatus::Deprecated, None, None, 10_000, 0)
+            .await
+            .unwrap();
+        assert_eq!(task_of(&before), Some(Some(task.id)), "linked before");
+
+        let report = store.delete_task(task.id).await.unwrap();
+        assert_eq!(report.detached_decision_ids, vec![decision.id]);
+        assert!(report.deleted_decision_ids.is_empty(), "{report:?}");
+
+        let read = store
+            .get_decision(decision.id)
+            .await
+            .unwrap()
+            .expect("the decision survives its task");
+        assert_eq!(read.description, decision.description);
+        assert_eq!(read.rationale, decision.rationale);
+        assert_eq!(read.chosen_option, decision.chosen_option);
+        let (after, _) = store
+            .list_decisions_by_status(DecisionStatus::Deprecated, None, None, 10_000, 0)
+            .await
+            .unwrap();
+        assert_eq!(task_of(&after), Some(None), "it belongs to no task");
+        let affects = store.list_decision_affects(decision.id).await.unwrap();
+        assert_eq!(affects.len(), 1, "{affects:?}");
+        assert_eq!(affects[0].entity_id, p.id.to_string());
+
+        store.delete_decision(decision.id).await.unwrap();
         store.delete_project(p.id, &p.name).await.unwrap();
     }
 
@@ -2393,6 +2460,7 @@ macro_rules! all_checks {
                 check_absent_entity_matrix,
                 check_cascade_delete_project,
                 check_task_delete_reports_its_cascade,
+                check_task_delete_detaches_its_decisions,
                 check_empty_prompt_cache_reads_as_none,
                 check_project_scoped_suffix_lookup_filters_before_limit,
                 check_membership_is_the_contains_edge_and_the_suffix_order_is_by_path,

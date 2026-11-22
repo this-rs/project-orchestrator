@@ -10291,12 +10291,14 @@ impl PlanStore for MockGraphStore {
                 }
             }
         }
-        // Cascade: decisions
+        // Decisions: detached, not deleted (issue #1189). Dropping the
+        // task -> decisions entry is the INFORMED_BY edge going; the decision
+        // and its AFFECTS (`decision_affects`) stay.
         if let Some(dec_ids) = self.task_decisions.write().await.remove(&task_id) {
-            let mut decisions = self.decisions.write().await;
+            let decisions = self.decisions.read().await;
             for did in dec_ids {
-                if decisions.remove(&did).is_some() {
-                    report.deleted_decision_ids.push(did);
+                if decisions.contains_key(&did) && !report.detached_decision_ids.contains(&did) {
+                    report.detached_decision_ids.push(did);
                 }
             }
         }

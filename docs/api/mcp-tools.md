@@ -97,7 +97,7 @@ Manage tasks within plans.
 | `create` | Create a task | `plan_id`, `title`, `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
 | `get` | Get task details | `task_id` |
 | `update` | Update task fields. A published parameter this update does not write is refused (`unsupported_fields`), not dropped. A key the tool does not publish is ignored. An update that writes nothing is refused (`empty_update`). A malformed list (`acceptance_criteria`, `affected_files`) is not written and is named in `rejected_fields` of the answer. `acceptance_criteria: []` and `affected_files: []` clear the lists. `updated` is `false` when only a refused list was given | `task_id`, `status`, `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
-| `delete` | Delete task, with its steps and its decisions (the answer lists `deleted_decision_ids`) | `task_id` |
+| `delete` | Delete task with its steps. Its decisions survive: detached, they keep their AFFECTS and belong to no task (the answer lists them in `detached_decision_ids`; `deleted_decision_ids` stays empty) | `task_id` |
 | `get_next` | Next unblocked task (highest priority) | `plan_id` |
 | `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |
 | `remove_dependency` | Remove a dependency | `task_id`, `dependency_id` |
