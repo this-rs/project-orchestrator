@@ -249,6 +249,7 @@ fn passes_graph_filters(
 /// This prevents a race condition with the Tauri WebSocket plugin where
 /// `auth_ok` can be lost if sent before the client's message listener is
 /// registered (the plugin's `connect()` resolves before `addListener()`).
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_preauthed(
     mut socket: WebSocket,
     state: OrchestratorState,
@@ -393,6 +394,7 @@ async fn flush_graph_batch(
 ///
 /// This ensures high-frequency mutations (sync pipeline, bulk reinforcement) don't
 /// overwhelm the WebSocket connection while maintaining < 100ms latency.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_loop(
     socket: WebSocket,
     state: OrchestratorState,

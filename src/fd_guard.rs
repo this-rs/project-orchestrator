@@ -111,7 +111,7 @@ pub fn nofile_limits() -> io::Result<(u64, u64)> {
         if v == libc::RLIM_INFINITY {
             UNLIMITED
         } else {
-            v as u64
+            u64::from(v)
         }
     };
     Ok((norm(rl.rlim_cur), norm(rl.rlim_max)))
