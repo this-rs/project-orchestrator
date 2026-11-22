@@ -631,8 +631,9 @@ async fn stalled_reader_is_dropped(which: Socket) {
 
     // Bounded: the stalled write fails after WS_SEND_TIMEOUT, the handler leaves
     // its loop, the socket is dropped. Nothing else (no Pong, no read) helps it.
-    // A 128 KiB message is allowed WS_SEND_TIMEOUT plus 16 s (8 KiB/s minimum rate).
-    let deadline = Instant::now() + WS_PONG_TIMEOUT * 6 + Duration::from_secs(30);
+    // The messages are up to ~256 KiB (activity: id + payload): WS_SEND_TIMEOUT plus
+    // ~32 s at the 8 KiB/s minimum rate. A wide margin: the point is `bounded`, not speed.
+    let deadline = Instant::now() + WS_PONG_TIMEOUT * 6 + Duration::from_secs(75);
     while server_side_socket_exists(client_local) {
         assert!(
             Instant::now() < deadline,
