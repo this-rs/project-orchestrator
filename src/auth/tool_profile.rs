@@ -1457,6 +1457,7 @@ mod tests {
             "/api/agents",
             "/api/alerts",
             "/api/attention",
+            "/api/diagnostics/resources",
             "/api/agent/providers",
             "/api/documents",
             "/api/feedback",

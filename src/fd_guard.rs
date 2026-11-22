@@ -1234,6 +1234,17 @@ impl axum::serve::Listener for GuardedListener {
     }
 }
 
+fn header_matches(
+    headers: &axum::http::HeaderMap,
+    name: &'static str,
+    f: impl Fn(&str) -> bool,
+) -> bool {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(f)
+}
+
 /// Le 503 propre d'un upgrade WebSocket ou d'une SSE sur le quota loopback.
 fn quota_refusal() -> axum::response::Response {
     use axum::http::{header, HeaderValue, StatusCode};
@@ -1268,14 +1279,10 @@ pub async fn quota_guard(
         return next.run(req).await;
     };
     state.request_seen.store(true, Ordering::Release);
-    let header_is = |name: header::HeaderName, f: &dyn Fn(&str) -> bool| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(f)
-    };
-    let upgrade = header_is(header::UPGRADE, &|v| v.eq_ignore_ascii_case("websocket"));
-    let sse = header_is(header::ACCEPT, &|v| v.contains("text/event-stream"));
+    let upgrade = header_matches(req.headers(), "upgrade", |v| {
+        v.eq_ignore_ascii_case("websocket")
+    });
+    let sse = header_matches(req.headers(), "accept", |v| v.contains("text/event-stream"));
     if upgrade || sse {
         return quota_refusal();
     }
