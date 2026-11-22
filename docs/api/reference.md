@@ -1345,7 +1345,7 @@ curl -X PATCH http://localhost:8080/api/plans/{plan_id} \
 
 ### DELETE /api/plans/{plan_id} -- Protected
 
-Delete a plan and all related data (tasks, steps, decisions, constraints).
+Delete a plan, its tasks, steps and constraints. The decisions of its tasks are kept: detached from their tasks (and kept in the plan's project, when it has one), not destroyed.
 
 ```bash
 curl -X DELETE -H "Authorization: Bearer <JWT>" \
@@ -1515,12 +1515,14 @@ curl -X PATCH http://localhost:8080/api/tasks/{task_id} \
 
 ### DELETE /api/tasks/{task_id} -- Protected
 
-Delete a task and all its steps and decisions.
+Delete a task and its steps. Its decisions are NOT deleted: the `INFORMED_BY` link to the task is removed, and the decision and its `AFFECTS` stay (kept in the task's project, when it has one).
 
 ```bash
 curl -X DELETE -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/tasks/{task_id}
 ```
+
+Response fields: `steps_deleted`, `detached_decision_ids` (the decisions that survive, now without this task), and `decisions_deleted` / `deleted_decision_ids` (kept for compatibility, always `0` / `[]`).
 
 ### POST /api/tasks/{task_id}/dependencies -- Protected
 

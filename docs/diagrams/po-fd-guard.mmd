@@ -1,0 +1,48 @@
+%% name: po-fd-guard
+%% covers: backend:src/fd_guard.rs backend:src/api/ws_liveness.rs
+%% verified: b41e3f0b
+%% ---
+%% PROUVE : ce que le service fait de ses descripteurs de fichiers et de ses sockets WebSocket
+%%   (PR #1269, branche fix/fd-limit) : limite relevée au démarrage, mesure par un /dev/fd gardé
+%%   ouvert, plafond de connexions entrantes dynamique avec 503 complet, quota loopback réservé
+%%   aux requêtes courtes, Pong exigé et écritures bornées sur /ws/chat, /ws/events, /ws/activity,
+%%   /ws/run. Relu contre le code de la branche fix/fd-limit (b41e3f0b).
+%% ---
+%% SOURCES LUES :
+%%   src/fd_guard.rs, src/api/ws_liveness.rs, src/lib.rs (start_server), src/api/handlers.rs
+%%   (health, resource_diagnostics), src/api/ws_{chat,handlers,activity,run}_handler.rs,
+%%   tests/fd_limit.rs, src/api/ws_liveness_tests.rs
+%% ---
+%% NON ETABLI :
+%%   la nature des 133 connexions de 192.168.1.42 (ORCHESTRATOR_CONN_STATS sert à l'établir) ;
+%%   que le Pong manquant soit la cause du flap observé (hypothèse) ;
+%%   l'absence d'EMFILE : le plafond réduit le risque, une rafale hors-entrant plus grande que la
+%%   réserve de 64 peut encore en provoquer (test: an_outbound_burst_beyond_the_margin_may_hit_emfile_but_the_service_recovers).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["⚪ autre domaine"]
+    end
+
+    START["⚪ start_server (lib.rs)"]
+    RAISE["✅ raise_nofile_limit : souple relevée à min(dure, cible), paliers macOS, jamais muet ;<br/>test: the_soft_limit_is_raised_when_the_hard_limit_allows_it, a_low_hard_limit_is_respected_and_reported"]
+    METER["✅ /dev/fd gardé ouvert : mesurer ne consomme aucun descripteur ;<br/>EMFILE = saturation (alerte), autre errno = mètre aveugle (dégradé, plafond statique) ;<br/>test: the_meter_reports_impossible_when_the_table_is_full_and_never_invents_a_percentage, a_blind_meter_is_reported_degraded_not_as_a_saturation_alert"]
+    CAP["✅ plafond = limite − hors-entrant mesuré à chaque admission − 64 ;<br/>au-delà : 503 complet, Content-Length calculé ;<br/>test: non_inbound_descriptors_and_a_burst_of_refusals_never_exhaust_the_table, the_503_is_framed_exactly_and_the_connection_closes_cleanly"]
+    QUOTA["✅ quota loopback : requêtes courtes seulement, Connection: close, 503 sur WebSocket et sur réponse SSE (Content-Type), POST et GET MCP servis, h2c refusé ;<br/>rien ne coupe une requête dont hyper a analysé l'en-tête (une réponse longue produite lentement par le serveur à un client qui lit n'est bornée par rien) ; filet en lecture pour en-têtes incomplets ; lecteur arrêté coupé après 30 s sans progrès d'écriture (quota seulement) ;<br/>test: the_loopback_quota_serves_short_requests_only_and_never_cuts_a_request_in_progress, the_quota_serves_mcp_posts_and_refuses_h2c, a_quota_client_that_stops_reading_gives_its_place_back_and_a_slow_reader_is_kept, at_the_cap_health_still_answers_through_the_loopback_quota"]
+    PEERS["✅ suivi par pair borné (256 + autres), oublié à zéro ;<br/>test: peer_tracking_is_bounded_coherent_and_forgets_idle_peers"]
+    HEALTH["✅ /health : aucun chiffre, degraded si alerte ou mètre aveugle ;<br/>chiffres derrière l'authentification (GET /api/diagnostics/resources) ;<br/>test: health_is_degraded_when_the_descriptor_meter_is_blind, resource_diagnostics_require_authentication"]
+    LIVE["✅ ws_liveness : Ping numéroté, Pong valide exigé sous 60 s, Pong périmé ou inventé ignoré ;<br/>test: events_silent_peer_is_closed, events_noise_does_not_extend (et activity, run, chat)"]
+    SINK["✅ BoundedSink : écriture bornée (60 s + taille à 8 Ko/s, au plus 5 min), puis socket lâchée ;<br/>test: events_stalled_reader_is_dropped (et activity, run, chat), a_client_blocked_on_a_huge_message_is_cut_at_the_absolute_ceiling"]
+    RACE["✅ select! biaisé : le client est lu avant le tick, un Pong prêt ne perd pas la course ;<br/>test: events_pong_in_flight_is_not_lost_to_the_tick (et activity, run, chat)"]
+
+    START --> RAISE --> METER --> CAP
+    CAP --> QUOTA
+    CAP --> PEERS
+    METER --> HEALTH
+    START --> LIVE --> SINK
+    LIVE --> RACE

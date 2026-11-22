@@ -2988,29 +2988,9 @@ impl Neo4jClient {
         let mut info = LinkedSessionInfo::default();
 
         if let Some(row) = result.next().await? {
-            // Parse tasks
+            // Parse tasks (`parse_linked_tasks`: a task without title is kept).
             if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
-                if let Some(arr) = tasks_val.as_array() {
-                    for t in arr {
-                        if let (Some(id_str), Some(title)) = (
-                            t.get("id").and_then(|v| v.as_str()),
-                            t.get("title").and_then(|v| v.as_str()),
-                        ) {
-                            if let Ok(id) = id_str.parse::<Uuid>() {
-                                let source = t
-                                    .get("source")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("manual")
-                                    .to_string();
-                                info.linked_tasks.push(LinkedTaskInfo {
-                                    id,
-                                    title: title.to_string(),
-                                    source,
-                                });
-                            }
-                        }
-                    }
-                }
+                info.linked_tasks = parse_linked_tasks(&tasks_val);
             }
             // Parse plans
             if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
@@ -3224,29 +3204,9 @@ impl Neo4jClient {
 
             let mut info = LinkedSessionInfo::default();
 
-            // Parse tasks
+            // Parse tasks: the same contract as `get_session_links` (`parse_linked_tasks`).
             if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
-                if let Some(arr) = tasks_val.as_array() {
-                    for t in arr {
-                        if let (Some(id_str), Some(title)) = (
-                            t.get("id").and_then(|v| v.as_str()),
-                            t.get("title").and_then(|v| v.as_str()),
-                        ) {
-                            if let Ok(id) = id_str.parse::<Uuid>() {
-                                let source = t
-                                    .get("source")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("manual")
-                                    .to_string();
-                                info.linked_tasks.push(LinkedTaskInfo {
-                                    id,
-                                    title: title.to_string(),
-                                    source,
-                                });
-                            }
-                        }
-                    }
-                }
+                info.linked_tasks = parse_linked_tasks(&tasks_val);
             }
             // Parse plans
             if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
@@ -4133,5 +4093,59 @@ mod agent_identity_neo4j {
             )
             .await;
         }
+    }
+}
+
+/// The linked tasks of a `get_session_links` / `get_session_links_batch` row: one entry
+/// per link (a task linked by two paths comes twice, with each source). A task's title is
+/// optional (`TaskNode::title`): a task without one is kept with an empty title, never
+/// dropped — both reads answer the same, and the objective reminder shows it by its
+/// description. An entry without a parsable id is skipped.
+pub(crate) fn parse_linked_tasks(tasks_val: &serde_json::Value) -> Vec<LinkedTaskInfo> {
+    let Some(arr) = tasks_val.as_array() else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|t| {
+            let id = t.get("id")?.as_str()?.parse::<Uuid>().ok()?;
+            Some(LinkedTaskInfo {
+                id,
+                title: t
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                source: t
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("manual")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod linked_tasks_parse_tests {
+    use super::*;
+
+    /// Both reads keep a task without title (empty title) and one entry per link.
+    #[test]
+    fn a_task_without_title_is_kept_and_each_link_is_an_entry() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let rows = serde_json::json!([
+            {"id": a.to_string(), "title": "Titled", "source": "runner"},
+            {"id": a.to_string(), "title": "Titled", "source": "auto"},
+            {"id": b.to_string(), "title": null, "source": "auto"},
+            {"id": "not-a-uuid", "title": "x"},
+        ]);
+        let tasks = parse_linked_tasks(&rows);
+        assert_eq!(tasks.len(), 3, "{tasks:?}");
+        assert_eq!(tasks[2].id, b);
+        assert_eq!(tasks[2].title, "");
+        assert_eq!(
+            (tasks[0].source.as_str(), tasks[1].source.as_str()),
+            ("runner", "auto")
+        );
     }
 }

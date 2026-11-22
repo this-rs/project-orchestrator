@@ -11509,6 +11509,7 @@ fn create_dummy_session(
         reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
         objective_tracking: false,
         objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+        objective_baseline: Default::default(),
         objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
         work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
         provider_outage: Arc::new(std::sync::Mutex::new(
@@ -13788,6 +13789,7 @@ fn mock_active_session(
         reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
         objective_tracking: false,
         objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+        objective_baseline: Default::default(),
         objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
         work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
         provider_outage: Arc::new(std::sync::Mutex::new(
