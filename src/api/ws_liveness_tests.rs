@@ -284,12 +284,10 @@ async fn noise_does_not_extend(which: Socket) {
     let pings = loop {
         tokio::select! {
             f = raw.next(Duration::from_millis(40)) => match f {
-                Frame::Ping(p) => {
-                    if first.is_none() {
-                        // Le premier Ping est acquitté une fois, correctement.
-                        raw.send(0xA, &p).await;
-                        first = Some(p);
-                    }
+                // Le premier Ping est acquitté une fois, correctement.
+                Frame::Ping(p) if first.is_none() => {
+                    raw.send(0xA, &p).await;
+                    first = Some(p);
                 }
                 Frame::Close | Frame::Eof => break start.elapsed(),
                 _ => {}
