@@ -68,6 +68,9 @@ mod ws_activity_tests;
 pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;
+pub mod ws_liveness;
+#[cfg(test)]
+mod ws_liveness_tests;
 pub mod ws_run_handler;
 
 #[cfg(feature = "embedded-frontend")]

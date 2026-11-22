@@ -83,7 +83,7 @@ const HELD: &str = "Post-Compaction Context";
 async fn a_failed_clear_is_retried_on_the_next_turn() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let s = services(&manager, manager.agent_turn_state(&sid).await);
+    let s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
     mock.fail_llm_setting_writes(HeldContext::KEY, true);
@@ -94,7 +94,7 @@ async fn a_failed_clear_is_retried_on_the_next_turn() {
         "the store refused the clear"
     );
     assert!(s.session.held.unsynced(), "and the slot knows it");
-    let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+    let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
     assert!(
         !prepared(&reopened, &sid, "two").await.contains(HELD),
         "a reopen keeps memory over a store known to be behind"
@@ -124,7 +124,7 @@ async fn a_failed_clear_is_retried_on_the_next_turn() {
 async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.step_budget = Duration::from_secs(1);
     s.after_turn(&sid, &compacted()).await;
     mock.stall_llm_setting_deletes(HeldContext::KEY);
@@ -189,7 +189,7 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
 #[tokio::test]
 async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
     let (manager, sid) = world().await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.step_budget = Duration::from_millis(500);
     s.stall_step = Some("objective_tracking");
     let s = Arc::new(s);
@@ -201,7 +201,7 @@ async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
         s.session.held.held().context.is_some()
     })
     .await;
-    let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+    let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
     turn.await.unwrap();
     assert!(
         prepared(&reopened, &sid, "next").await.contains(HELD),
@@ -223,7 +223,7 @@ async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
 #[tokio::test]
 async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
     let (manager, sid) = world().await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     s.step_budget = Duration::from_millis(500);
     s.stall_step = Some("context");
@@ -236,7 +236,7 @@ async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
         s.session.held.held().is_empty()
     })
     .await;
-    let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+    let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
     assert!(
         !prepared(&reopened, &sid, "next").await.contains(HELD),
         "not reloaded from the store the clear has not reached yet"
@@ -251,11 +251,11 @@ async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
 async fn a_store_read_error_at_reopen_keeps_memory() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let s = services(&manager, manager.agent_turn_state(&sid).await);
+    let s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     assert!(!s.session.held.unsynced());
     mock.fail_llm_setting_reads(HeldContext::KEY, true);
-    let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+    let reopened = services(&manager, manager.agent_turn_state(&sid, false).await);
     assert!(
         prepared(&reopened, &sid, "next").await.contains(HELD),
         "a read error is not an empty context"
@@ -271,7 +271,7 @@ async fn a_store_read_error_at_reopen_keeps_memory() {
 async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let s = services(&manager, manager.agent_turn_state(&sid).await);
+    let s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     assert!(!s.session.held.unsynced());
     mock.stall_llm_setting_reads(HeldContext::KEY);
@@ -309,7 +309,7 @@ async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
 async fn a_failed_write_is_retried_without_a_turn() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let s = services(&manager, manager.agent_turn_state(&sid).await);
+    let s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     mock.fail_llm_setting_writes(HeldContext::KEY, true);
     s.after_turn(&sid, &answered()).await;
@@ -335,7 +335,7 @@ async fn a_failed_write_is_retried_without_a_turn() {
 async fn a_store_write_that_never_answers_releases_the_lock() {
     let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
     let (manager, sid) = world_on(mock.clone()).await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.step_budget = Duration::from_millis(100);
     s.after_turn(&sid, &compacted()).await;
     mock.stall_llm_setting_deletes(HeldContext::KEY);
@@ -355,7 +355,7 @@ async fn a_store_write_that_never_answers_releases_the_lock() {
 #[tokio::test]
 async fn a_compaction_without_a_fresh_context_holds_what_the_turn_carried() {
     let (manager, sid) = world().await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.step_budget = Duration::from_millis(200);
     s.stall_step = Some("post_compaction");
     let carried = HeldContext {
@@ -381,10 +381,10 @@ async fn a_compaction_without_a_fresh_context_holds_what_the_turn_carried() {
 #[tokio::test]
 async fn the_held_context_survives_a_restart() {
     let (manager, sid) = world().await;
-    let before = services(&manager, manager.agent_turn_state(&sid).await);
+    let before = services(&manager, manager.agent_turn_state(&sid, false).await);
     before.after_turn(&sid, &compacted()).await;
     drop(before);
-    let after = services(&manager, manager.agent_turn_state(&sid).await);
+    let after = services(&manager, manager.agent_turn_state(&sid, false).await);
     let sent = prepared(&after, &sid, "next").await;
     assert!(sent.contains("Post-Compaction Context"), "{sent}");
 }
@@ -396,7 +396,7 @@ async fn the_held_context_survives_a_restart() {
 #[tokio::test]
 async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
     let (manager, sid) = world().await;
-    let s = services(&manager, manager.agent_turn_state(&sid).await);
+    let s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.after_turn(&sid, &compacted()).await;
     let first = prepared(&s, &sid, "one").await;
     assert!(first.contains("Post-Compaction Context"));
@@ -426,7 +426,7 @@ async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
 async fn the_post_tool_advice_is_dropped_only_once_a_turn_is_answered() {
     use super::super::agent_runtime::TurnServices as _;
     let (manager, sid) = world().await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.hook_fallback = Some(Arc::new(super::super::provider::hooks::HookFallback::new(
         Arc::new(super::super::provider::hooks::TestAdvisor),
         Arc::new(super::super::hook_ledger::HookLedger::new()),
@@ -491,7 +491,7 @@ fn the_held_context_is_cut_to_a_share_of_the_window() {
 #[tokio::test]
 async fn a_stuck_step_does_not_take_the_next_ones_with_it() {
     let (manager, sid) = world().await;
-    let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+    let mut s = services(&manager, manager.agent_turn_state(&sid, false).await);
     s.step_budget = Duration::from_millis(100);
     s.stall_step = Some("context");
     let started = std::time::Instant::now();

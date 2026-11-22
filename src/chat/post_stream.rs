@@ -546,7 +546,8 @@ impl PostStreamHandler {
     // ── Objective tracking ────────────────────────────────────────────────
 
     /// If the agent concluded without using *productive* tools and auto-continue
-    /// didn't fire, check for pending objectives and inject a SystemHint reminder.
+    /// didn't fire, check for the pending tasks linked to THIS session and inject a
+    /// SystemHint reminder ([`objective_reminder`], shared with the agent engine).
     ///
     /// "Productive" excludes conclusive tools (git commit/push/status) — the agent
     /// may be wrapping up prematurely after a commit without finishing remaining tasks.
@@ -564,6 +565,7 @@ impl PostStreamHandler {
                     enabled: session.objective_tracking,
                     turns_since: session.objective_reminder_turns_since.clone(),
                     in_a_row: session.objective_reminders_in_a_row.clone(),
+                    baseline: session.objective_baseline.clone(),
                 },
                 None => return,
             }
@@ -578,7 +580,7 @@ impl PostStreamHandler {
         };
         if let Some(reminder) = objective_reminder(
             &self.graph,
-            self.ctx.project_slug.as_deref(),
+            self.session_uuid,
             &counters,
             turn,
             work_log_summary,
@@ -1074,14 +1076,173 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// The objective-reminder state of a session (both engines keep one).
+///
+/// In memory only: it is rebuilt when the session is opened again (restart, resume,
+/// in-place switch of engine). [`ObjectiveCounters::opening`] decides what a rebuilt state
+/// starts with, so that rebuilding it never hands out a fresh allowance of reminders.
 #[derive(Clone, Default)]
 pub(crate) struct ObjectiveCounters {
     /// Objective tracking is on for the session.
     pub enabled: bool,
     /// Turns since the last reminder (the cooldown).
     pub turns_since: Arc<std::sync::atomic::AtomicU32>,
-    /// Reminders injected back to back without productive work in between.
+    /// Reminders injected back to back without real progress in between
+    /// ([`made_progress`]); reading, searching or running a shell command is not progress.
     pub in_a_row: Arc<std::sync::atomic::AtomicU32>,
+    /// What the session's linked tasks looked like in the store at the last reminder (or
+    /// at the first turn after a reopening): the reference [`made_progress`] compares with.
+    pub baseline: ProgressBaseline,
+}
+
+/// The shared slot of [`ObjectiveCounters::baseline`] (the Claude Code engine keeps it on
+/// its `ActiveSession`).
+pub(crate) type ProgressBaseline = Arc<std::sync::Mutex<Option<ProgressSnapshot>>>;
+
+/// The state, IN THE STORE, of the tasks linked to a session: per task its status, its
+/// completed steps and its linked commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProgressSnapshot {
+    pub tasks: std::collections::BTreeMap<Uuid, TaskProgress>,
+}
+
+/// One linked task in a [`ProgressSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskProgress {
+    pub status: crate::neo4j::models::TaskStatus,
+    pub completed_steps: std::collections::BTreeSet<Uuid>,
+    pub commits: std::collections::BTreeSet<String>,
+}
+
+/// Whether the session made REAL progress between two reads of the store: a linked task
+/// changed status, one of its steps became completed, a commit was linked to it, or a
+/// task became linked (a task moved to `in_progress` by the session is linked then).
+///
+/// Judged on the store, never on the tool calls: a `task update` that failed or changed
+/// nothing, an update of a task that is not this session's, a `git commit --dry-run`, a
+/// commit refused by a hook, a `Read`, a `pgrep` leave the store as it was and rearm
+/// nothing. Both engines decide with this function (through [`objective_reminder`]).
+pub(crate) fn made_progress(before: &ProgressSnapshot, after: &ProgressSnapshot) -> bool {
+    after
+        .tasks
+        .iter()
+        .any(|(id, now)| match before.tasks.get(id) {
+            None => true,
+            Some(was) => {
+                was.status != now.status
+                    || now
+                        .completed_steps
+                        .difference(&was.completed_steps)
+                        .next()
+                        .is_some()
+                    || now.commits.difference(&was.commits).next().is_some()
+            }
+        })
+}
+
+/// The [`ProgressSnapshot`] of a session, `None` when it cannot be read (no id, a store
+/// error): then nothing is rearmed.
+///
+/// EVERY linked task is in it, with no cap and in id order, so the snapshot does not depend
+/// on the order the store returns the links in, and no historical link can push a task
+/// still to do out of it. A task still to do (`Pending`/`InProgress`, the ones a reminder
+/// lists) is read with its steps and commits; any other only by its status (its change is
+/// what matters). Cost: one task read per link, plus two per task to do, at the end of
+/// each turn while the reminders are spent; past the 2 s budget of the caller the
+/// snapshot is dropped and nothing is rearmed.
+pub(crate) async fn progress_snapshot(
+    graph: &Arc<dyn GraphStore>,
+    session_uuid: Option<Uuid>,
+) -> Option<ProgressSnapshot> {
+    use crate::neo4j::models::{StepStatus, TaskStatus};
+    let links = graph.get_session_links(session_uuid?).await.ok()?;
+    let mut snapshot = ProgressSnapshot::default();
+    let mut ids = linked_task_ids(&links);
+    ids.sort();
+    for id in ids {
+        // A linked task deleted since is skipped; any read error drops the whole
+        // snapshot (nothing is rearmed on a partial read).
+        let task = match graph.get_task(id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
+        let to_do = matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress);
+        let (steps, commits) = if to_do {
+            (
+                graph.get_task_steps(id).await.ok()?,
+                graph.get_task_commits(id).await.ok()?,
+            )
+        } else {
+            (vec![], vec![])
+        };
+        snapshot.tasks.insert(
+            id,
+            TaskProgress {
+                status: task.status,
+                completed_steps: steps
+                    .iter()
+                    .filter(|s| s.status == StepStatus::Completed)
+                    .map(|s| s.id)
+                    .collect(),
+                commits: commits.into_iter().map(|c| c.hash).collect(),
+            },
+        );
+    }
+    Some(snapshot)
+}
+
+impl ObjectiveCounters {
+    /// The counters of a session as it is opened, on either engine.
+    ///
+    /// A FRESH session starts with the full allowance ([`OBJECTIVE_REMINDER_MAX_IN_A_ROW`]).
+    /// A RESUMED one (restart, resume, engine switch) starts with the allowance spent: it gets
+    /// no reminder until it makes real progress again. The counter is not stored, so this is
+    /// what bounds the reminders across reopenings: with no progress, a session receives at
+    /// most `OBJECTIVE_REMINDER_MAX_IN_A_ROW` reminders over its whole life, however many
+    /// times it is reopened (a reopening never rearms it; only progress does).
+    pub(crate) fn opening(enabled: bool, resumed: bool) -> Self {
+        Self {
+            enabled,
+            turns_since: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            in_a_row: Arc::new(std::sync::atomic::AtomicU32::new(Self::initial_in_a_row(
+                resumed,
+            ))),
+            baseline: ProgressBaseline::default(),
+        }
+    }
+
+    /// The reference of a REOPENED session, read in the store at the reopening itself
+    /// (before its first turn), so that progress made during that first turn is seen.
+    /// Empty when the store cannot be read: then the end of the first turn is the
+    /// reference. Empty, WITHOUT reading the store, for a session that tracks no objective
+    /// (`tracks`, from `tracks_own_objectives`): both engines call it with the same guard.
+    pub(crate) async fn reopening_baseline(
+        graph: &Arc<dyn GraphStore>,
+        session_uuid: Option<Uuid>,
+        tracks: bool,
+    ) -> ProgressBaseline {
+        if !tracks {
+            return ProgressBaseline::default();
+        }
+        let now = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            progress_snapshot(graph, session_uuid),
+        )
+        .await
+        .ok()
+        .flatten();
+        Arc::new(std::sync::Mutex::new(now))
+    }
+
+    /// What `in_a_row` starts at when a session is opened ([`Self::opening`]); the
+    /// Claude Code engine, which keeps the counters on its `ActiveSession`, reads it too.
+    pub(crate) fn initial_in_a_row(resumed: bool) -> u32 {
+        if resumed {
+            OBJECTIVE_REMINDER_MAX_IN_A_ROW
+        } else {
+            0
+        }
+    }
 }
 
 /// What a turn did, for the objective tracker.
@@ -1094,28 +1255,160 @@ pub(crate) struct ObjectiveTurn {
     pub interrupted: bool,
 }
 
+/// The tasks linked DIRECTLY to a session, once each, in the store's order: the task
+/// associations (`ASSOCIATED_WITH`) and the tasks the session executes
+/// (`AgentExecution -[:EXECUTES]->`), both read by `GraphStore::get_session_links`. A
+/// linked PLAN is not used: being attached to a plan does not make every task of the
+/// plan the work of this chat.
+///
+/// Deduplicated HERE, by the consumer: the store's contract is one entry per link —
+/// `collect(DISTINCT {id, title, source})` per path, so a task the session executes
+/// (`source: runner`) and is associated with (`auto`/`manual`) comes back twice.
+pub(crate) fn linked_task_ids(links: &crate::neo4j::models::LinkedSessionInfo) -> Vec<Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    links
+        .linked_tasks
+        .iter()
+        .filter(|t| seen.insert(t.id))
+        .map(|t| t.id)
+        .collect()
+}
+
+/// The reminder entry of a linked task, `None` unless it is still to do (typed
+/// `Pending` or `InProgress`): a link is historical, so a task completed, failed,
+/// blocked or interrupted since it was linked is left out. A task without a title is
+/// shown by its description.
+pub(crate) fn pending_task_info(
+    task: &crate::neo4j::models::TaskNode,
+    steps: &[crate::neo4j::models::StepNode],
+) -> Option<PendingTaskInfo> {
+    use crate::neo4j::models::{StepStatus, TaskStatus};
+    let status = match task.status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::InProgress => "in_progress",
+        _ => return None,
+    };
+    let title = task
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_chars(task.description.trim(), 120));
+    Some(PendingTaskInfo {
+        title,
+        status: status.to_string(),
+        pending_steps: steps
+            .iter()
+            .filter(|s| !matches!(s.status, StepStatus::Completed | StepStatus::Skipped))
+            .map(|s| s.description.clone())
+            .collect(),
+        affected_files: task.affected_files.clone(),
+    })
+}
+
+/// Most tasks listed in one reminder.
+pub(crate) const OBJECTIVE_REMINDER_MAX_TASKS: usize = 4;
+
+/// The pending tasks of THIS session for its reminder ([`linked_task_ids`],
+/// [`pending_task_info`]), at most [`OBJECTIVE_REMINDER_MAX_TASKS`]. Empty — hence no
+/// reminder — for a session without an id, without a linked task, or whose links cannot
+/// be read: never the project's tasks instead.
+async fn session_pending_tasks(
+    graph: &Arc<dyn GraphStore>,
+    session_uuid: Option<Uuid>,
+) -> Vec<PendingTaskInfo> {
+    let Some(session_uuid) = session_uuid else {
+        return vec![];
+    };
+    let links = match graph.get_session_links(session_uuid).await {
+        Ok(links) => links,
+        Err(e) => {
+            debug!(%session_uuid, error = %e, "Objective tracker: links unreadable, no reminder");
+            return vec![];
+        }
+    };
+    let mut tasks = Vec::new();
+    for id in linked_task_ids(&links) {
+        if tasks.len() >= OBJECTIVE_REMINDER_MAX_TASKS {
+            break;
+        }
+        let task = match graph.get_task(id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(%session_uuid, task_id = %id, error = %e, "Objective tracker: task unreadable, left out of the reminder");
+                continue;
+            }
+        };
+        // Filtered on the typed status BEFORE the cap, and before reading its steps.
+        if pending_task_info(&task, &[]).is_none() {
+            continue;
+        }
+        // Steps that cannot be read are not "no step left": the task is left out of the
+        // reminder (named in the log) rather than shown with a list that would be wrong.
+        let steps = match graph.get_task_steps(id).await {
+            Ok(steps) => steps,
+            Err(e) => {
+                warn!(%session_uuid, task_id = %id, error = %e, "Objective tracker: steps unreadable, task left out of the reminder");
+                continue;
+            }
+        };
+        if let Some(info) = pending_task_info(&task, &steps) {
+            tasks.push(info);
+        }
+    }
+    tasks
+}
+
 /// If the agent concluded without using *productive* tools and auto-continue
-/// didn't fire, the reminder of the project's pending objectives to queue, and the
+/// didn't fire, the reminder of the pending tasks OF THIS SESSION to queue, and the
 /// counters updated — both engines ([`PostStreamHandler::handle_objective_tracking`],
 /// the agent engine's end of turn).
 ///
 /// "Productive" excludes conclusive tools (git commit/push/status) — the agent
 /// may be wrapping up prematurely after a commit without finishing remaining tasks.
+/// Only real progress, read in the store ([`made_progress`]), rearms the reminders: a
+/// turn that only read, searched or called a tool that changed nothing resets nothing.
 pub(crate) async fn objective_reminder(
     graph: &Arc<dyn GraphStore>,
-    project_slug: Option<&str>,
+    session_uuid: Option<Uuid>,
     counters: &ObjectiveCounters,
     turn: ObjectiveTurn,
     work_log_summary: String,
 ) -> Option<String> {
-    if turn.had_productive_tool_use && !turn.had_conclusive_tool_use {
-        // Agent used ONLY productive tools (no commit/push) = actively working, reset cooldown
-        counters.turns_since.store(0, Ordering::Relaxed);
-        // The agent is working again: the next stall may be reminded afresh.
-        counters.in_a_row.store(0, Ordering::Relaxed);
+    // Once reminded (or reopened with the reminders spent), the store is read at the end
+    // of each turn: real progress since the reference rearms the cooldown and the cap.
+    if counters.enabled && counters.in_a_row.load(Ordering::Relaxed) > 0 {
+        let now = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            progress_snapshot(graph, session_uuid),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(now) = now {
+            let mut baseline = counters.baseline.lock().unwrap_or_else(|e| e.into_inner());
+            match baseline.as_ref() {
+                Some(before) if made_progress(before, &now) => {
+                    // The cooldown is over (not 0, which the increment below would turn
+                    // into 1, inside the cooldown, silencing the next stall).
+                    counters
+                        .turns_since
+                        .store(OBJECTIVE_REMINDER_COOLDOWN, Ordering::Relaxed);
+                    counters.in_a_row.store(0, Ordering::Relaxed);
+                    // What the store shows now is the new reference (never None: a later
+                    // failed read keeps it, instead of letting the next read absorb a
+                    // progress).
+                    *baseline = Some(now);
+                }
+                Some(_) => {}
+                // Reopened with the reminders spent: what the store shows now is the
+                // reference.
+                None => *baseline = Some(now),
+            }
+        }
     }
-    // When both productive AND conclusive → agent did work AND committed.
-    // Don't reset cooldown — let the reminder check fire.
     let cooldown_turns = counters.turns_since.fetch_add(1, Ordering::Relaxed);
     let reminders_in_a_row = counters.in_a_row.load(Ordering::Relaxed);
 
@@ -1132,36 +1425,12 @@ pub(crate) async fn objective_reminder(
         && reminders_in_a_row < OBJECTIVE_REMINDER_MAX_IN_A_ROW
         && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
     {
-        let tasks = if let Some(slug) = project_slug {
-            let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
-            if let Ok(Ok(ctx)) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                builder.build_for_session(Some(slug)),
-            )
-            .await
-            {
-                ctx.pending_tasks
-                    .iter()
-                    .filter(|t| t.status == "inprogress" || t.status == "pending")
-                    .take(4)
-                    .map(|t| PendingTaskInfo {
-                        title: t.title.clone(),
-                        status: t.status.clone(),
-                        pending_steps: t
-                            .steps
-                            .iter()
-                            .filter(|s| s.status != "completed" && s.status != "skipped")
-                            .map(|s| s.description.clone())
-                            .collect(),
-                        affected_files: t.affected_files.clone(),
-                    })
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
+        let tasks = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session_pending_tasks(graph, session_uuid),
+        )
+        .await
+        .unwrap_or_default();
         (tasks, work_log_summary)
     } else {
         (vec![], String::new())
@@ -1181,20 +1450,36 @@ pub(crate) async fn objective_reminder(
         work_log_summary,
     };
     let reminder = check_objective_reminder(&input)?;
-    // Reset cooldown counter
+    // The cooldown starts: the next turn reads 1, below the threshold, and is skipped.
     counters.turns_since.store(1, Ordering::Relaxed);
     counters.in_a_row.fetch_add(1, Ordering::Relaxed);
+    // The reference progress is judged against: the store as it is at this reminder. A
+    // read that fails (timeout, store error, steps unreadable) keeps the previous
+    // reference rather than clearing it: cleared, the next successful read would become
+    // the reference and absorb a progress made in between. Only a session that never had
+    // a readable reference has none (its first successful read becomes it).
+    let now = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        progress_snapshot(graph, session_uuid),
+    )
+    .await
+    .ok()
+    .flatten();
+    if let Some(now) = now {
+        *counters.baseline.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
     Some(reminder)
 }
 
 // ── Pure logic for objective tracking (testable without Graph) ─────────
 
-/// Cooldown threshold for objective reminders (same as PostStreamHandler).
-pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 1;
+/// Turns that must pass after a reminder before the next one. 2: the turn right after a
+/// reminder (`turns_since` reads 1) never gets one, the turn after it (2) may.
+pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 2;
 
-/// Most reminders injected back to back without the agent doing productive work in between.
-/// The cooldown above is 1, so without this cap a text-only answer is followed by the same
-/// reminder on every turn, for as long as one task of the project stays pending.
+/// Most reminders injected back to back without real progress in between
+/// ([`made_progress`]). Reads and searches do not reset it, and neither does reopening
+/// the session ([`ObjectiveCounters::opening`]).
 pub(crate) const OBJECTIVE_REMINDER_MAX_IN_A_ROW: u32 = 2;
 
 /// First line of every objective reminder. It says what the message is (automatic, not typed by
@@ -1301,7 +1586,7 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
 
     parts.push("\n**Do NOT conclude. Continue working on the pending steps above.**".to_string());
     parts.push(format!(
-        "\n_Automatic message, not from the user. If these tasks are not yours or you are waiting on the user, say so in ONE line and do not repeat it: this reminder stops after {OBJECTIVE_REMINDER_MAX_IN_A_ROW} in a row, until you work again._"
+        "\n_Automatic message, not from the user. If these tasks are not yours or you are waiting on the user, say so in ONE line and do not repeat it: this reminder stops after {OBJECTIVE_REMINDER_MAX_IN_A_ROW} in a row, until a task or step is updated or a commit is made._"
     ));
 
     Some(parts.join("\n"))
@@ -1414,7 +1699,7 @@ mod tests {
             reminders_in_a_row: 0,
             pending_tasks: vec![PendingTaskInfo {
                 title: "Implement feature T1".to_string(),
-                status: "inprogress".to_string(),
+                status: "in_progress".to_string(),
                 pending_steps: vec!["Write the handler".to_string(), "Add tests".to_string()],
                 affected_files: vec!["src/handler.rs".to_string()],
             }],
@@ -1477,8 +1762,12 @@ mod tests {
         input.cooldown_turns = 0;
         assert!(check_objective_reminder(&input).is_some());
 
-        // turns=1 meets cooldown threshold (COOLDOWN=1) → should fire
+        // turns=1 is the turn right after a reminder: inside the cooldown → silent
         input.cooldown_turns = 1;
+        assert!(check_objective_reminder(&input).is_none());
+
+        // turns=2: the cooldown is over → fires
+        input.cooldown_turns = 2;
         assert!(check_objective_reminder(&input).is_some());
 
         // turns=0 is first turn → should fire
@@ -1535,7 +1824,7 @@ mod tests {
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Add REST endpoint".to_string(),
-                    status: "inprogress".to_string(),
+                    status: "in_progress".to_string(),
                     pending_steps: vec![
                         "Implement handler".to_string(),
                         "Register route".to_string(),
@@ -1662,7 +1951,7 @@ mod tests {
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Task A".to_string(),
-                    status: "inprogress".to_string(),
+                    status: "in_progress".to_string(),
                     pending_steps: vec!["Step A1".to_string()],
                     affected_files: vec!["a.rs".to_string()],
                 },
@@ -1680,6 +1969,115 @@ mod tests {
         assert!(msg.contains("Task B"), "Missing Task B: {}", msg);
         assert!(msg.contains("`a.rs`"), "Missing file a.rs: {}", msg);
         assert!(msg.contains("`b.rs`"), "Missing file b.rs: {}", msg);
+    }
+}
+
+#[cfg(test)]
+mod objective_scope_tests {
+    use super::*;
+    use crate::neo4j::models::{LinkedSessionInfo, LinkedTaskInfo, StepStatus, TaskStatus};
+    use uuid::Uuid;
+
+    #[test]
+    fn only_a_task_still_to_do_is_reminded_by_its_typed_status() {
+        let mut task = crate::test_helpers::test_task_titled("T");
+        task.status = TaskStatus::InProgress;
+        assert_eq!(pending_task_info(&task, &[]).unwrap().status, "in_progress");
+        task.status = TaskStatus::Pending;
+        assert_eq!(pending_task_info(&task, &[]).unwrap().status, "pending");
+        for st in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Interrupted,
+        ] {
+            task.status = st;
+            assert!(pending_task_info(&task, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn a_task_without_title_is_named_by_its_description_and_its_done_steps_are_left_out() {
+        let mut task = crate::test_helpers::test_task();
+        task.title = None;
+        task.description = "Do the thing".into();
+        let mut done = crate::test_helpers::test_step(1, "done step");
+        done.status = StepStatus::Completed;
+        let todo = crate::test_helpers::test_step(2, "todo step");
+        let info = pending_task_info(&task, &[done, todo]).unwrap();
+        assert_eq!(info.title, "Do the thing");
+        assert_eq!(info.pending_steps, vec!["todo step".to_string()]);
+    }
+
+    #[test]
+    fn linked_tasks_are_deduplicated_and_plans_are_not_used() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t = |id| LinkedTaskInfo {
+            id,
+            title: String::new(),
+            source: "auto".into(),
+        };
+        let links = LinkedSessionInfo {
+            linked_tasks: vec![t(a), t(b), t(a)],
+            linked_plans: vec![crate::neo4j::models::LinkedPlanInfo {
+                id: Uuid::new_v4(),
+                title: "plan".into(),
+                source: "auto".into(),
+            }],
+            linked_rfcs: vec![],
+        };
+        assert_eq!(linked_task_ids(&links), vec![a, b]);
+    }
+
+    fn progress(status: TaskStatus, steps: &[Uuid], commits: &[&str]) -> TaskProgress {
+        TaskProgress {
+            status,
+            completed_steps: steps.iter().copied().collect(),
+            commits: commits.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn progress_is_a_change_in_the_store_of_a_linked_task() {
+        let (t, step) = (Uuid::new_v4(), Uuid::new_v4());
+        let snap = |p: TaskProgress| ProgressSnapshot {
+            tasks: [(t, p)].into_iter().collect(),
+        };
+        let before = snap(progress(TaskStatus::InProgress, &[], &["aaa"]));
+        // Nothing changed (a failed or no-op update, a dry-run, a refused commit, a Read).
+        assert!(!made_progress(&before, &before.clone()));
+        // A status change, a step completed, a commit linked, a task newly linked.
+        assert!(made_progress(
+            &before,
+            &snap(progress(TaskStatus::Completed, &[], &["aaa"]))
+        ));
+        assert!(made_progress(
+            &before,
+            &snap(progress(TaskStatus::InProgress, &[step], &["aaa"]))
+        ));
+        assert!(made_progress(
+            &before,
+            &snap(progress(TaskStatus::InProgress, &[], &["aaa", "bbb"]))
+        ));
+        let mut more = before.clone();
+        more.tasks
+            .insert(Uuid::new_v4(), progress(TaskStatus::InProgress, &[], &[]));
+        assert!(made_progress(&before, &more));
+        // A task no longer linked is not progress.
+        assert!(!made_progress(&before, &ProgressSnapshot::default()));
+    }
+
+    #[test]
+    fn a_reopened_session_starts_with_its_reminders_spent() {
+        use std::sync::atomic::Ordering;
+        let fresh = ObjectiveCounters::opening(true, false);
+        assert_eq!(fresh.in_a_row.load(Ordering::Relaxed), 0);
+        let reopened = ObjectiveCounters::opening(true, true);
+        assert_eq!(
+            reopened.in_a_row.load(Ordering::Relaxed),
+            OBJECTIVE_REMINDER_MAX_IN_A_ROW
+        );
+        assert!(!ObjectiveCounters::opening(false, false).enabled);
     }
 }
 
@@ -1822,6 +2220,7 @@ mod integration_tests {
                 objective_tracking,
                 objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
+                objective_baseline: Default::default(),
                 reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
                 work_log: Arc::new(Mutex::new(crate::chat::types::SessionWorkLog::default())),
                 oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
@@ -1875,6 +2274,40 @@ mod integration_tests {
         }
     }
 
+    /// Link `tasks` to `session` the way `get_session_links` reads them (the mock's
+    /// `create_associated_with` is a no-op: the links are seeded explicitly).
+    async fn link_tasks(graph: &MockGraphStore, session: Uuid, tasks: &[Uuid]) {
+        use crate::neo4j::models::{LinkedSessionInfo, LinkedTaskInfo};
+        let mut links = graph.session_links.write().await;
+        let entry = links
+            .entry(session)
+            .or_insert_with(LinkedSessionInfo::default);
+        for id in tasks {
+            entry.linked_tasks.push(LinkedTaskInfo {
+                id: *id,
+                title: String::new(),
+                source: "auto".into(),
+            });
+        }
+    }
+
+    /// The tasks of the project seeded by [`seed_graph_with_pending_tasks`].
+    async fn project_task_ids(graph: &MockGraphStore) -> Vec<Uuid> {
+        graph.tasks.read().await.keys().copied().collect()
+    }
+
+    /// A handler whose session is linked to every task seeded so far.
+    async fn linked_handler(
+        graph: Arc<MockGraphStore>,
+        slug: String,
+        sid: &str,
+    ) -> PostStreamHandler {
+        let handler = build_handler(graph.clone(), Some(slug), sid, true).await;
+        let tasks = project_task_ids(&graph).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &tasks).await;
+        handler
+    }
+
     /// Populate mock graph with a project, an in_progress plan, and pending tasks.
     async fn seed_graph_with_pending_tasks(graph: &MockGraphStore) -> String {
         use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
@@ -1914,13 +2347,8 @@ mod integration_tests {
         let graph = Arc::new(MockGraphStore::new());
         let slug = seed_graph_with_pending_tasks(&graph).await;
 
-        let handler = build_handler(
-            graph,
-            Some(slug),
-            "test-session-1",
-            true, // objective_tracking enabled
-        )
-        .await;
+        // objective_tracking enabled, the session linked to the tasks
+        let handler = linked_handler(graph, slug, "test-session-1").await;
 
         // Call with had_tool_use=false → should inject reminder
         handler
@@ -1948,7 +2376,7 @@ mod integration_tests {
         let graph = Arc::new(MockGraphStore::new());
         let slug = seed_graph_with_pending_tasks(&graph).await;
 
-        let handler = build_handler(graph, Some(slug), "test-session-2", true).await;
+        let handler = linked_handler(graph, slug, "test-session-2").await;
 
         // Call with had_tool_use=true → no reminder
         handler
@@ -1968,13 +2396,15 @@ mod integration_tests {
         let slug = seed_graph_with_pending_tasks(&graph).await;
 
         let handler = build_handler(
-            graph,
+            graph.clone(),
             Some(slug),
             "test-session-3",
             false, // tracking disabled
         )
         .await;
 
+        let tasks = project_task_ids(&graph).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &tasks).await;
         handler
             .handle_objective_tracking(false, false, false, false)
             .await;
@@ -2013,7 +2443,7 @@ mod integration_tests {
         let graph = Arc::new(MockGraphStore::new());
         let slug = seed_graph_with_pending_tasks(&graph).await;
 
-        let handler = build_handler(graph, Some(slug), "test-session-5", true).await;
+        let handler = linked_handler(graph, slug, "test-session-5").await;
 
         // First call (turn 0) → should fire
         handler
@@ -2028,17 +2458,21 @@ mod integration_tests {
         // Clear pending for next check
         handler.pending_messages.lock().await.clear();
 
-        // Second call: after first reminder, cooldown_turns was reset to 1.
-        // The handler increments it via fetch_add(1) → reads 1, which meets
-        // COOLDOWN=1 → fires again. With cooldown=1, reminders fire every turn.
+        // (f) The turn right after a reminder never gets one (cooldown).
         handler
             .handle_objective_tracking(false, false, false, false)
             .await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
-            1,
-            "Second call should fire (cooldown=1 means every turn after reset)"
+            0,
+            "the turn right after a reminder is inside the cooldown"
         );
+
+        // The turn after it may.
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
+        assert_eq!(handler.pending_messages.lock().await.len(), 1);
     }
 
     /// The loop that flooded a chat: a text-only answer to a reminder is followed by the same
@@ -2048,10 +2482,10 @@ mod integration_tests {
     async fn test_integration_reminders_stop_at_the_cap_until_the_agent_works() {
         let graph = Arc::new(MockGraphStore::new());
         let slug = seed_graph_with_pending_tasks(&graph).await;
-        let handler = build_handler(graph, Some(slug), "test-session-cap", true).await;
+        let handler = linked_handler(graph.clone(), slug, "test-session-cap").await;
 
         let mut injected = 0;
-        for _ in 0..(OBJECTIVE_REMINDER_MAX_IN_A_ROW + 3) {
+        for _ in 0..(OBJECTIVE_REMINDER_MAX_IN_A_ROW * 2 + 3) {
             handler
                 .handle_objective_tracking(false, false, false, false)
                 .await;
@@ -2063,7 +2497,8 @@ mod integration_tests {
             "text-only turns must not be reminded past the cap"
         );
 
-        // The agent works (productive tools, no commit): the counter resets.
+        // The agent progresses: a linked task changes status IN THE STORE.
+        complete_one_linked_task(&graph, &handler).await;
         handler
             .handle_objective_tracking(true, false, false, false)
             .await;
@@ -2076,7 +2511,623 @@ mod integration_tests {
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,
-            "after real work, a new stall gets a reminder again"
+            "after real progress, a new stall gets a reminder again"
+        );
+    }
+
+    // ── Objective reminder scoped to the session (legacy engine's handler) ──────────
+
+    /// A task of its own plan in the mock, with `status`; `title: None` = a task without title.
+    async fn seed_task(
+        graph: &MockGraphStore,
+        status: crate::neo4j::models::TaskStatus,
+        title: Option<&str>,
+    ) -> Uuid {
+        let mut task = test_task_titled(title.unwrap_or("untitled"));
+        task.title = title.map(str::to_string);
+        task.description = format!("Description of {}", title.unwrap_or("the untitled task"));
+        task.status = status;
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        task.id
+    }
+
+    /// One task linked to the handler's session passes to `completed` in the store.
+    async fn complete_one_linked_task(graph: &MockGraphStore, handler: &PostStreamHandler) {
+        let links = graph
+            .get_session_links(handler.session_uuid.unwrap())
+            .await
+            .unwrap();
+        let id = links.linked_tasks[0].id;
+        graph.tasks.write().await.get_mut(&id).unwrap().status =
+            crate::neo4j::models::TaskStatus::Completed;
+    }
+
+    async fn reminders(handler: &PostStreamHandler) -> Vec<String> {
+        handler
+            .pending_messages
+            .lock()
+            .await
+            .drain(..)
+            .map(|m| m.content)
+            .collect()
+    }
+
+    /// A text-only turn (the agent concluded).
+    async fn text_turn(handler: &PostStreamHandler) -> Vec<String> {
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
+        reminders(handler).await
+    }
+
+    /// (a) A session linked to nothing gets NO reminder, even though its project has
+    /// pending and in-progress tasks: never the project's tasks instead.
+    #[tokio::test]
+    async fn a_session_without_linked_tasks_is_never_reminded() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        seed_task(&graph, TaskStatus::InProgress, Some("Someone else's work")).await;
+        let handler = build_handler(graph, Some(slug), "unlinked", true).await;
+        for _ in 0..4 {
+            assert!(text_turn(&handler).await.is_empty());
+        }
+    }
+
+    /// (b) Two chats of the same project: each is reminded of ITS task only, never the
+    /// other's, nor the project's other tasks (more than the 4 a reminder lists).
+    #[tokio::test]
+    async fn two_chats_of_one_project_each_see_only_their_own_tasks() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        for i in 0..6 {
+            seed_task(&graph, TaskStatus::Pending, Some(&format!("Foreign {i}"))).await;
+        }
+        let task_a = seed_task(&graph, TaskStatus::InProgress, Some("Task of chat A")).await;
+        let task_b = seed_task(&graph, TaskStatus::Pending, Some("Task of chat B")).await;
+        let a = build_handler(graph.clone(), Some(slug.clone()), "chat-a", true).await;
+        let b = build_handler(graph.clone(), Some(slug), "chat-b", true).await;
+        link_tasks(&graph, a.session_uuid.unwrap(), &[task_a]).await;
+        link_tasks(&graph, b.session_uuid.unwrap(), &[task_b]).await;
+
+        let ra = text_turn(&a).await;
+        let rb = text_turn(&b).await;
+        assert_eq!(ra.len(), 1, "{ra:?}");
+        assert_eq!(rb.len(), 1, "{rb:?}");
+        assert!(ra[0].contains("Task of chat A") && !ra[0].contains("Task of chat B"));
+        assert!(rb[0].contains("Task of chat B") && !rb[0].contains("Task of chat A"));
+        for r in [&ra[0], &rb[0]] {
+            assert!(
+                !r.contains("Foreign") && !r.contains("Fix the bug") && !r.contains("Write tests"),
+                "no task foreign to the chat: {r}"
+            );
+        }
+    }
+
+    /// (c) An `in_progress` linked task is reminded (the old filter compared with
+    /// "inprogress" and dropped it), shown with its snake_case status.
+    #[tokio::test]
+    async fn an_in_progress_linked_task_is_reminded() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::InProgress, Some("Ongoing work")).await;
+        let handler = build_handler(graph.clone(), None, "in-progress", true).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &[task]).await;
+        let r = text_turn(&handler).await;
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].contains("### Ongoing work [in_progress]"), "{}", r[0]);
+    }
+
+    /// Links are historical: a linked task completed, failed, blocked or interrupted
+    /// since is not reminded.
+    #[tokio::test]
+    async fn linked_tasks_that_are_no_longer_to_do_are_left_out() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let mut ids = vec![];
+        for st in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Interrupted,
+        ] {
+            ids.push(seed_task(&graph, st, Some("Old work")).await);
+        }
+        let handler = build_handler(graph.clone(), None, "historical", true).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &ids).await;
+        assert!(text_turn(&handler).await.is_empty());
+    }
+
+    /// A task linked twice (an association AND an execution) appears once.
+    #[tokio::test]
+    async fn a_task_linked_twice_appears_once() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::Pending, Some("Twice linked")).await;
+        let handler = build_handler(graph.clone(), None, "twice", true).await;
+        // One entry per (task, source), as Neo4j's `get_session_links` answers: the
+        // runner's execution AND an association of the same task.
+        {
+            use crate::neo4j::models::LinkedTaskInfo;
+            let mut links = graph.session_links.write().await;
+            let entry = links.entry(handler.session_uuid.unwrap()).or_default();
+            for source in ["runner", "auto"] {
+                entry.linked_tasks.push(LinkedTaskInfo {
+                    id: task,
+                    title: "Twice linked".into(),
+                    source: source.into(),
+                });
+            }
+        }
+        let r = text_turn(&handler).await;
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].matches("Twice linked").count(), 1, "{}", r[0]);
+    }
+
+    /// A linked task without a title is shown by its description, not dropped.
+    #[tokio::test]
+    async fn a_linked_task_without_title_is_shown_by_its_description() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::InProgress, None).await;
+        let handler = build_handler(graph.clone(), None, "untitled", true).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &[task]).await;
+        let r = text_turn(&handler).await;
+        assert_eq!(r.len(), 1);
+        assert!(
+            r[0].contains("Description of the untitled task"),
+            "{}",
+            r[0]
+        );
+    }
+
+    /// The links cannot be read (a store error), or the session has no id: no
+    /// reminder, never a fallback on the project's tasks.
+    #[tokio::test]
+    async fn unreadable_links_or_no_session_id_mean_no_reminder() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        let task = seed_task(&graph, TaskStatus::InProgress, Some("Mine")).await;
+        let handler = build_handler(graph.clone(), Some(slug.clone()), "err", true).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &[task]).await;
+        graph
+            .fail_session_links
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(text_turn(&handler).await.is_empty());
+
+        graph
+            .fail_session_links
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut no_id = build_handler(graph.clone(), Some(slug), "no-id", true).await;
+        no_id.session_uuid = None;
+        assert!(text_turn(&no_id).await.is_empty());
+    }
+
+    /// (d) reminder → Read → end, repeated: a turn that only reads is not progress, so
+    /// the session gets at most OBJECTIVE_REMINDER_MAX_IN_A_ROW reminders. (The old
+    /// tracker reset its counter on any non-conclusive tool: one reminder per cycle.)
+    /// (e) Real progress rearms it.
+    #[tokio::test]
+    async fn reminder_read_end_repeated_is_bounded_and_only_progress_rearms() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        let handler = linked_handler(graph.clone(), slug, "read-loop").await;
+        let mut total = 0;
+        for _ in 0..6 {
+            total += text_turn(&handler).await.len();
+            // The turn answering the reminder: Read / `pgrep` — productive, no progress.
+            handler
+                .handle_objective_tracking(true, false, false, false)
+                .await;
+            total += reminders(&handler).await.len();
+        }
+        assert_eq!(total as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+
+        // A linked task really changes status in the store: progress.
+        complete_one_linked_task(&graph, &handler).await;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        assert!(
+            reminders(&handler).await.is_empty(),
+            "a working turn is not reminded"
+        );
+        assert_eq!(text_turn(&handler).await.len(), 1, "rearmed by progress");
+    }
+
+    /// Spend the reminders of `handler`'s session: text-only turns until the cap.
+    async fn spend_reminders(handler: &PostStreamHandler) {
+        let mut n = 0;
+        for _ in 0..(OBJECTIVE_REMINDER_MAX_IN_A_ROW * 2 + 1) {
+            n += text_turn(handler).await.len();
+        }
+        assert_eq!(n as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+    }
+
+    /// Calls that change nothing in the store — a `task update` that failed or kept the
+    /// same status, a `git commit --dry-run`, a commit refused by a hook (on this engine
+    /// the handler never sees the calls: only the store can tell) — and a status change
+    /// of a task NOT linked to the session rearm nothing.
+    #[tokio::test]
+    async fn no_change_of_a_linked_task_in_the_store_rearms_nothing() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        let foreign = seed_task(&graph, TaskStatus::Pending, Some("Not this chat's")).await;
+        let handler = build_handler(graph.clone(), Some(slug), "no-rearm", true).await;
+        let mine = seed_task(&graph, TaskStatus::InProgress, Some("Mine")).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &[mine]).await;
+        spend_reminders(&handler).await;
+
+        // Same status written again (no-op update), a working turn: nothing changes.
+        graph.tasks.write().await.get_mut(&mine).unwrap().status = TaskStatus::InProgress;
+        handler
+            .handle_objective_tracking(true, true, false, false)
+            .await;
+        // A task of someone else changes status.
+        graph.tasks.write().await.get_mut(&foreign).unwrap().status = TaskStatus::Completed;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        for _ in 0..4 {
+            assert!(text_turn(&handler).await.is_empty(), "nothing rearmed it");
+        }
+
+        // The positive case: the linked task really changes status.
+        graph.tasks.write().await.get_mut(&mine).unwrap().status = TaskStatus::Blocked;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        // (Blocked is not to do: link another pending task so a reminder has content.)
+        let next = seed_task(&graph, TaskStatus::Pending, Some("Next of mine")).await;
+        link_tasks(&graph, handler.session_uuid.unwrap(), &[next]).await;
+        assert_eq!(
+            text_turn(&handler).await.len(),
+            1,
+            "rearmed by the real change"
+        );
+    }
+
+    /// A task whose steps cannot be read is left out of the reminder (never shown as a
+    /// task with no step left); a task with NO steps is shown.
+    #[tokio::test]
+    async fn unreadable_steps_leave_the_task_out_an_empty_list_does_not() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::InProgress, Some("Stepless")).await;
+        let empty = build_handler(graph.clone(), None, "steps-empty", true).await;
+        link_tasks(&graph, empty.session_uuid.unwrap(), &[task]).await;
+        let shown = text_turn(&empty).await;
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(shown[0].contains("Stepless"));
+
+        graph.fail_task_steps.lock().unwrap().insert(task);
+        let broken = build_handler(graph.clone(), None, "steps-broken", true).await;
+        link_tasks(&graph, broken.session_uuid.unwrap(), &[task]).await;
+        let r = text_turn(&broken).await;
+        assert!(r.is_empty(), "no reminder built on unreadable steps: {r:?}");
+    }
+
+    /// A handler of session `sid` reopened: counters spent, reference read NOW (before
+    /// its first turn), as the Claude Code engine's reopening site builds them.
+    async fn reopened_handler(
+        graph: Arc<MockGraphStore>,
+        sid: &str,
+        uuid: Option<Uuid>,
+    ) -> PostStreamHandler {
+        let mut h = build_handler(graph.clone(), None, sid, true).await;
+        h.session_uuid = uuid;
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let baseline = ObjectiveCounters::reopening_baseline(&dyn_graph, uuid, true).await;
+        let mut sessions = h.active_sessions.write().await;
+        let session = sessions.get_mut(sid).unwrap();
+        session.objective_reminders_in_a_row.store(
+            ObjectiveCounters::initial_in_a_row(true),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        session.objective_baseline = baseline;
+        drop(sessions);
+        h
+    }
+
+    /// Reopened, then REAL progress during the very first turn (a linked task changes
+    /// status): it is seen — the reference was read at the reopening, not at the end of
+    /// that turn — and the reminders are rearmed.
+    #[tokio::test]
+    async fn progress_in_the_first_turn_after_a_reopening_rearms() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let done_soon = seed_task(&graph, TaskStatus::InProgress, Some("Done soon")).await;
+        let next = seed_task(&graph, TaskStatus::Pending, Some("Next")).await;
+        let uuid = Uuid::new_v4();
+        link_tasks(&graph, uuid, &[done_soon, next]).await;
+        let h = reopened_handler(graph.clone(), "reopened-progress", Some(uuid)).await;
+        // The first turn completes a linked task.
+        graph
+            .tasks
+            .write()
+            .await
+            .get_mut(&done_soon)
+            .unwrap()
+            .status = TaskStatus::Completed;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert!(reminders(&h).await.is_empty());
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "the first turn's progress rearmed it"
+        );
+    }
+
+    /// Links, all of them (here 40), are the reference — not a window: the same links in
+    /// another order, a link removed (a disappearance is never progress), and an active
+    /// task behind 39 completed historical links that really changes status.
+    #[tokio::test]
+    async fn the_reference_covers_every_link_in_any_order() {
+        use crate::neo4j::models::{LinkedTaskInfo, TaskStatus};
+        let graph = Arc::new(MockGraphStore::new());
+        let mut ids = vec![];
+        for i in 0..39 {
+            ids.push(seed_task(&graph, TaskStatus::Completed, Some(&format!("Old {i}"))).await);
+        }
+        let active = seed_task(&graph, TaskStatus::InProgress, Some("Active")).await;
+        ids.push(active);
+        let handler = build_handler(graph.clone(), None, "many-links", true).await;
+        let uuid = handler.session_uuid.unwrap();
+        let set_links = |order: Vec<Uuid>| {
+            let graph = graph.clone();
+            async move {
+                graph.session_links.write().await.insert(
+                    uuid,
+                    crate::neo4j::models::LinkedSessionInfo {
+                        linked_tasks: order
+                            .into_iter()
+                            .map(|id| LinkedTaskInfo {
+                                id,
+                                title: String::new(),
+                                source: "auto".into(),
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                );
+            }
+        };
+        set_links(ids.clone()).await;
+        spend_reminders(&handler).await;
+
+        // Same links, reversed: no change, no rearm.
+        let mut reversed = ids.clone();
+        reversed.reverse();
+        set_links(reversed).await;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        // A link removed (the smallest id: the first of any sorted window).
+        let mut fewer = ids.clone();
+        fewer.sort();
+        let removed = fewer.remove(0);
+        assert_ne!(removed, active);
+        set_links(fewer.clone()).await;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        for _ in 0..3 {
+            assert!(
+                text_turn(&handler).await.is_empty(),
+                "no rearm without progress"
+            );
+        }
+
+        // The active task, behind the historical links, changes status: progress.
+        graph.tasks.write().await.get_mut(&active).unwrap().status = TaskStatus::Blocked;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        graph.tasks.write().await.get_mut(&active).unwrap().status = TaskStatus::InProgress;
+        // (back to in progress so the next stall has something to remind)
+        let r = text_turn(&handler).await;
+        assert_eq!(r.len(), 1, "the active task's progress was seen: {r:?}");
+        assert!(
+            r[0].contains("Active") && !r[0].contains("Old "),
+            "{}",
+            r[0]
+        );
+    }
+
+    /// `(turns_since, in_a_row)` of the handler's session.
+    async fn counters_of(handler: &PostStreamHandler) -> (u32, u32) {
+        let sessions = handler.active_sessions.read().await;
+        let s = sessions.get(&handler.session_id).unwrap();
+        (
+            s.objective_reminder_turns_since
+                .load(std::sync::atomic::Ordering::Relaxed),
+            s.objective_reminders_in_a_row
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The whole sequence, counters at each turn: reminder → progress (a working turn)
+    /// → text turn (reminded: the cooldown is over and the cap rearmed) → text turn
+    /// (inside the cooldown of that reminder: silent).
+    #[tokio::test]
+    async fn reminder_progress_text_text_counters() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let done_soon = seed_task(&graph, TaskStatus::InProgress, Some("Done soon")).await;
+        let next = seed_task(&graph, TaskStatus::Pending, Some("Next")).await;
+        let h = build_handler(graph.clone(), None, "sequence", true).await;
+        link_tasks(&graph, h.session_uuid.unwrap(), &[done_soon, next]).await;
+
+        assert_eq!(text_turn(&h).await.len(), 1, "turn 1: reminded");
+        assert_eq!(counters_of(&h).await, (1, 1));
+
+        graph
+            .tasks
+            .write()
+            .await
+            .get_mut(&done_soon)
+            .unwrap()
+            .status = TaskStatus::Completed;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert!(
+            reminders(&h).await.is_empty(),
+            "turn 2: working, not reminded"
+        );
+        // Rearmed: in_a_row 0, turns_since set past the cooldown (2) then counted (3).
+        assert_eq!(counters_of(&h).await, (OBJECTIVE_REMINDER_COOLDOWN + 1, 0));
+
+        let r = text_turn(&h).await;
+        assert_eq!(r.len(), 1, "turn 3: reminded again");
+        assert!(
+            r[0].contains("Next") && !r[0].contains("Done soon"),
+            "{}",
+            r[0]
+        );
+        assert_eq!(counters_of(&h).await, (1, 1));
+
+        assert!(
+            text_turn(&h).await.is_empty(),
+            "turn 4: inside the cooldown"
+        );
+        assert_eq!(counters_of(&h).await, (2, 1));
+    }
+
+    /// Progress AND a conclusive tool (a commit) in the same turn, after a reminder: the
+    /// progress rearms first (in_a_row 0, cooldown over), then the turn — wrapping up while
+    /// a linked task is still to do — is reminded at once (in_a_row 1, turns_since 1).
+    #[tokio::test]
+    async fn progress_and_a_commit_in_one_turn_rearm_then_remind_the_wrap_up() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let done_soon = seed_task(&graph, TaskStatus::InProgress, Some("Done soon")).await;
+        let next = seed_task(&graph, TaskStatus::Pending, Some("Next")).await;
+        let h = build_handler(graph.clone(), None, "progress-commit", true).await;
+        link_tasks(&graph, h.session_uuid.unwrap(), &[done_soon, next]).await;
+        assert_eq!(text_turn(&h).await.len(), 1);
+        assert_eq!(counters_of(&h).await, (1, 1));
+
+        graph
+            .tasks
+            .write()
+            .await
+            .get_mut(&done_soon)
+            .unwrap()
+            .status = TaskStatus::Completed;
+        // productive (Edit) + conclusive (git commit)
+        h.handle_objective_tracking(true, true, false, false).await;
+        let r = reminders(&h).await;
+        assert_eq!(r.len(), 1, "the wrap-up is reminded of what remains");
+        assert!(r[0].contains("Next"), "{}", r[0]);
+        assert_eq!(counters_of(&h).await, (1, 1));
+        assert!(text_turn(&h).await.is_empty(), "then the cooldown");
+    }
+
+    /// A reference read that FAILS keeps the previous reference: reminder, progress
+    /// (rearmed), two reminders whose reference read fails (a task's steps unreadable),
+    /// then a real progress — it is still seen against the kept reference, and rearms.
+    /// (Cleared on failure, the next successful read became the reference and absorbed
+    /// the progress: the session stayed silent.)
+    #[tokio::test]
+    async fn a_failed_reference_read_keeps_the_previous_reference() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let unreadable = seed_task(&graph, TaskStatus::InProgress, Some("Unreadable")).await;
+        let b = seed_task(&graph, TaskStatus::InProgress, Some("Task B")).await;
+        let c = seed_task(&graph, TaskStatus::InProgress, Some("Task C")).await;
+        let h = build_handler(graph.clone(), None, "failed-reference", true).await;
+        link_tasks(&graph, h.session_uuid.unwrap(), &[unreadable, b, c]).await;
+        let set = |id: Uuid, st: TaskStatus| {
+            let graph = graph.clone();
+            async move { graph.tasks.write().await.get_mut(&id).unwrap().status = st }
+        };
+
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 1 (reference read ok)"
+        );
+        set(c, TaskStatus::Completed).await;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert_eq!(counters_of(&h).await.1, 0, "progress rearmed");
+
+        // From now on, every reference read fails (the steps of a task to do).
+        graph.fail_task_steps.lock().unwrap().insert(unreadable);
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 2 (reference read fails)"
+        );
+        assert!(text_turn(&h).await.is_empty(), "cooldown");
+        assert_eq!(
+            text_turn(&h).await.len(),
+            1,
+            "reminder 3 (reference read fails)"
+        );
+        assert_eq!(counters_of(&h).await.1, OBJECTIVE_REMINDER_MAX_IN_A_ROW);
+
+        // The store is readable again, and B really progresses.
+        graph.fail_task_steps.lock().unwrap().clear();
+        set(b, TaskStatus::Completed).await;
+        h.handle_objective_tracking(true, false, false, false).await;
+        assert_eq!(counters_of(&h).await.1, 0, "the progress was seen");
+        assert_eq!(text_turn(&h).await.len(), 1, "and the reminders rearmed");
+    }
+
+    /// The reference of a reopened session is not read at all for a session that tracks
+    /// no objective (the guard both engines pass), and read for one that does.
+    #[tokio::test]
+    async fn the_reopening_reference_is_read_only_for_a_tracked_session() {
+        use crate::neo4j::models::TaskStatus;
+        let graph = Arc::new(MockGraphStore::new());
+        let task = seed_task(&graph, TaskStatus::InProgress, Some("Mine")).await;
+        let uuid = Uuid::new_v4();
+        link_tasks(&graph, uuid, &[task]).await;
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let untracked = ObjectiveCounters::reopening_baseline(&dyn_graph, Some(uuid), false).await;
+        assert!(untracked.lock().unwrap().is_none(), "nothing read");
+        let tracked = ObjectiveCounters::reopening_baseline(&dyn_graph, Some(uuid), true).await;
+        assert!(tracked.lock().unwrap().is_some(), "read");
+    }
+
+    /// A reopened session (restart, resume) starts with its allowance spent
+    /// (`ObjectiveCounters::initial_in_a_row(true)`, what the reopening sites use): three
+    /// reopenings in a row without progress add no reminder to the first run's cap.
+    #[tokio::test]
+    async fn successive_reopenings_never_rearm_the_reminders() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        let first = linked_handler(graph.clone(), slug.clone(), "reopened").await;
+        let uuid = first.session_uuid;
+        let mut total = 0;
+        for _ in 0..5 {
+            total += text_turn(&first).await.len();
+        }
+        for _ in 0..3 {
+            // The session reopened: new counters, as the reopening site builds them.
+            let mut again =
+                build_handler(graph.clone(), Some(slug.clone()), "reopened", true).await;
+            again.session_uuid = uuid;
+            again
+                .active_sessions
+                .read()
+                .await
+                .get("reopened")
+                .unwrap()
+                .objective_reminders_in_a_row
+                .store(
+                    ObjectiveCounters::initial_in_a_row(true),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            for _ in 0..5 {
+                total += text_turn(&again).await.len();
+            }
+        }
+        assert_eq!(
+            total as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW,
+            "the cap holds across reopenings"
         );
     }
 

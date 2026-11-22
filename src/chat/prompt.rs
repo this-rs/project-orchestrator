@@ -733,7 +733,7 @@ Manage tasks.
 | create | `plan_id` (req), `title` (req), `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Create task |
 | get | `task_id` (req) | Get task by UUID |
 | update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `title`, `description`, `assigned_to`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Update task. A published parameter this update does not write is refused (`unsupported_fields`). A key the tool does not publish is ignored. An update that writes nothing is refused (`empty_update`). A malformed list (`acceptance_criteria`, `affected_files`) is not written and is named in `rejected_fields` of the answer |
-| delete | `task_id` (req) | Delete a task, WITH its steps and its decisions; the answer lists `deleted_decision_ids` |
+| delete | `task_id` (req) | Delete a task WITH its steps. Its decisions survive: detached, they keep their AFFECTS and belong to no task; the answer lists them in `detached_decision_ids` (`deleted_decision_ids` stays empty) |
 | get_next | `plan_id` (req) | Get next actionable task |
 | add_dependencies | `task_id` (req), `dependency_ids` (req, array) | Add task dependencies |
 | remove_dependency | `task_id` (req), `dependency_id` (req) | Remove one dependency |
