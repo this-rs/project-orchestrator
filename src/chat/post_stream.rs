@@ -2905,10 +2905,12 @@ mod integration_tests {
         handler
             .handle_objective_tracking(true, false, false, false)
             .await;
-        // A link removed (the smallest id: the first of any sorted window).
+        // A link removed (the smallest id that is not the active task: the first of any
+        // sorted window, without depending on where the random UUID of `active` sorts).
         let mut fewer = ids.clone();
         fewer.sort();
-        let removed = fewer.remove(0);
+        let position = fewer.iter().position(|id| *id != active).unwrap();
+        let removed = fewer.remove(position);
         assert_ne!(removed, active);
         set_links(fewer.clone()).await;
         handler
