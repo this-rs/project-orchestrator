@@ -296,6 +296,10 @@ office_oxide = { version = "0.1.16", default-features = false, optional = true }
 # Unix process signaling (SIGINT to process group for interrupt)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Fail-closed publication (storage::publish): renameat WITHOUT replacement
+# (`renameat_with` + `RenameFlags::NOREPLACE`: RENAME_EXCL on macOS, RENAME_NOREPLACE on Linux)
+# and descriptor-relative walks. Already in Cargo.lock through tempfile, same version.
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [features]
 # The document extractors are in the default set on purpose: a shipped binary

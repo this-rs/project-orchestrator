@@ -10,6 +10,13 @@ use crate::neo4j::traits::*;
 pub mod migrate;
 #[cfg(feature = "obrain-backend")]
 pub mod migrator;
+/// Fail-closed publication components (protocol v6 + v6.1 + v6.2). NOT wired into startup.
+/// `renameat_with` (RENAME_EXCL / RENAME_NOREPLACE) exists only on Linux and Apple targets.
+#[cfg(all(
+    feature = "obrain-backend",
+    any(target_os = "linux", target_vendor = "apple")
+))]
+pub mod publish;
 
 use std::sync::Arc;
 
