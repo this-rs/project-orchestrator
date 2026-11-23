@@ -11609,19 +11609,10 @@ impl ChatManager {
             // Claude Code engine gives the prompt. It used to answer "not found" for a
             // delegated child that was alive.
             if let Some(handle) = self.agent_runtime.get(to_session_id).await {
-                // The message ITSELF is stored and broadcast as a team message — the peer's
-                // raw text and its sender, never the prefixed prompt — exactly as the Claude
-                // Code engine does a few lines below. What the model receives is the prefix,
-                // which the turn that carries the message shows.
-                handle
-                    .emit(ChatEvent::TeamMessage {
-                        from_session_id,
-                        from_name: from_name.to_string(),
-                        content: text.to_string(),
-                    })
-                    .await;
+                // Queued or sent as a TEAM message (the peer's raw text and sender; the prefix
+                // is what the model reads): see `AgentSessionHandle::inject_team_message`.
                 return handle
-                    .inject_hint(&format!("[team {}] {}", from_name, text))
+                    .inject_team_message(text, from_session_id, from_name)
                     .await;
             }
             // Not live on the Claude Code engine. A session released because its segment
@@ -27749,6 +27740,83 @@ mod tests {
             saw_team,
             "the team message must reach the session as a TeamMessage, not as a user message"
         );
+    }
+
+    /// #1271 — a team message to a session BUSY on the agent engine is queued as a team
+    /// message, not as a hint: an interruption of the running turn drops hints, and the
+    /// message would then be reported received and never read.
+    #[tokio::test]
+    async fn a_team_message_to_a_busy_agent_session_is_queued_as_a_team_message() {
+        use nexus_claude::agent::AgentEvent;
+
+        let (manager, _graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        let sid = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .expect("the session opens")
+            .session_id;
+        fake.state.push(AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: Some("ok".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        });
+        let handle = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .expect("the agent session is live");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the opening turn never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A second turn that nothing ends: the session stays busy.
+        manager
+            .send_message(&sid, "a long task")
+            .await
+            .expect("the turn starts");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        manager
+            .inject_team_message(Uuid::new_v4(), "peer", &sid, "queued text")
+            .await
+            .expect("inject succeeds");
+
+        let queue = handle.pending.lock().await;
+        assert!(
+            queue.iter().any(|m| matches!(
+                &m.kind,
+                crate::chat::types::PendingMessageKind::TeamMessage { from_name, .. } if from_name == "peer"
+            ) && m.content == "queued text"),
+            "queued as a team message with its raw text: {:?}",
+            queue
+                .iter()
+                .map(|m| (&m.kind, &m.content))
+                .collect::<Vec<_>>()
+        );
+        drop(queue);
+        fake.state.end_turn();
     }
 
     /// Two first sessions opened at once on an agent that refuses MCP servers per
