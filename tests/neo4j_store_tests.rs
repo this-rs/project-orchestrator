@@ -2519,3 +2519,97 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     .await
     .unwrap();
 }
+
+/// The project-scoped suffix lookup answers on a graph of the size the CI has.
+///
+/// The failure this sits next to is real and measured: on 2026-11-23, with the
+/// query written `f.path ENDS WITH $suffix`, `main` went red (run 45267830143,
+/// `store_conformance::check_project_scoped_suffix_lookup_filters_before_limit`
+/// — the suites share one database) with "Tried to query index with illegal
+/// query. A STRING_SUFFIX predicate is not allowed for a RANGE index", and the
+/// same form turns a relative `analyze_impact` target into a 500
+/// (`src/api/code_handlers.rs` -> this method).
+///
+/// This test does NOT reproduce that failure on demand, and must not pretend to:
+/// the plan choice depends on internal planner state a test cannot set. The same
+/// data on the same image failed on one instance and answered correctly on a
+/// fresh one, so a behavioural test asserting an error would be green with the
+/// defect present. The planner decision is guarded where it can be — on the
+/// SHAPE of the Cypher, in `src/neo4j/code.rs`
+/// (`the_project_suffix_cypher_never_offers_the_suffix_to_an_index`).
+///
+/// What this test holds is the other half: the expression that replaced
+/// `ENDS WITH` still answers the right file while the graph carries thousands of
+/// `CONTAINS` relations, with the project's own file holding the last position
+/// in path order — the case a `LIMIT` applied before the filter would lose.
+///
+/// The noise is labelled `:__SuffixPlannerNoise` so the cleanup removes exactly
+/// what this test wrote, and nothing of its neighbours.
+#[tokio::test]
+async fn the_project_suffix_lookup_answers_on_a_large_file_population() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+    let raw = raw_graph().await;
+
+    // The scale the CI database reaches by the time this suite runs: thousands
+    // of `CONTAINS` relations from the neighbouring suites.
+    const NOISE: i64 = 6_000;
+
+    // The paths carry a fresh tag: `File.path` is unique across the whole graph,
+    // so a fixed prefix would collide with a previous run that was interrupted
+    // before its cleanup, or with a neighbour writing the same name.
+    let noise_id = Uuid::new_v4().to_string();
+    let prefix = format!("noise/{}/", Uuid::new_v4());
+    raw.run(
+        query(
+            r#"
+            CREATE (p:Project:__SuffixPlannerNoise {id: $id, name: $id, slug: $id})
+            WITH p
+            UNWIND range(1, $n) AS i
+            CREATE (f:File:__SuffixPlannerNoise {path: $prefix + toString(i) + '/src/mod.rs'})
+            CREATE (p)-[:CONTAINS]->(f)
+            "#,
+        )
+        .param("id", noise_id.clone())
+        .param("prefix", prefix)
+        .param("n", NOISE),
+    )
+    .await
+    .expect("the noise population is written");
+
+    // The wanted project holds ONE file: that is the shape whose plan broke.
+    let tag = Uuid::new_v4();
+    let project_id = Uuid::new_v4().to_string();
+    let suffix = format!("/{tag}/src/lib.rs");
+    let wanted = format!("conformance/z-wanted{suffix}");
+    raw.run(
+        query(
+            r#"
+            CREATE (p:Project:__SuffixPlannerNoise {id: $pid, name: $pid, slug: $pid})
+            CREATE (f:File:__SuffixPlannerNoise {path: $path, project_id: $pid})
+            CREATE (p)-[:CONTAINS]->(f)
+            "#,
+        )
+        .param("pid", project_id.clone())
+        .param("path", wanted.clone()),
+    )
+    .await
+    .expect("the wanted project is written");
+
+    let found = store
+        .find_project_files_by_path_suffix(Uuid::parse_str(&project_id).unwrap(), &suffix, 2)
+        .await;
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => panic!("the lookup answered an error on a large graph: {err}"),
+    };
+    assert_eq!(found, vec![wanted.clone()], "the wanted file is found");
+
+    // Clean up: the whole labelled population, then the file by its path.
+    raw.run(query("MATCH (n:__SuffixPlannerNoise) DETACH DELETE n"))
+        .await
+        .unwrap();
+    raw.run(query("MATCH (f:File {path: $path}) DETACH DELETE f").param("path", wanted))
+        .await
+        .unwrap();
+}
