@@ -123,7 +123,7 @@ tree-sitter-php = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-swift = "0.7"
 tree-sitter-bash = "0.25"
-tree-sitter-c-sharp = "0.23"
+tree-sitter-c-sharp = "0.24"
 tree-sitter-scala = "0.26"
 tree-sitter-zig = "1.1"
 tree-sitter-hcl = { path = "crates/tree-sitter-hcl" }
