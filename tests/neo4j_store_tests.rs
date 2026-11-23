@@ -2599,17 +2599,17 @@ async fn the_project_suffix_lookup_answers_on_a_large_file_population() {
     let found = store
         .find_project_files_by_path_suffix(Uuid::parse_str(&project_id).unwrap(), &suffix, 2)
         .await;
-    let found = match found {
-        Ok(found) => found,
-        Err(err) => panic!("the lookup answered an error on a large graph: {err}"),
-    };
-    assert_eq!(found, vec![wanted.clone()], "the wanted file is found");
 
-    // Clean up: the whole labelled population, then the file by its path.
+    // Clean up BEFORE asserting. On the failing path — the defect coming back, or
+    // a run interrupted between the two writes — 6 000 nodes would otherwise stay
+    // in the database every neighbouring suite shares. The wanted project and its
+    // file carry the same label, so one delete covers them too.
     raw.run(query("MATCH (n:__SuffixPlannerNoise) DETACH DELETE n"))
         .await
         .unwrap();
-    raw.run(query("MATCH (f:File {path: $path}) DETACH DELETE f").param("path", wanted))
-        .await
-        .unwrap();
+
+    match found {
+        Ok(found) => assert_eq!(found, vec![wanted.clone()], "the wanted file is found"),
+        Err(err) => panic!("the lookup answered an error on a large graph: {err}"),
+    }
 }

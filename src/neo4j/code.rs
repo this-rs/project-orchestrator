@@ -394,23 +394,34 @@ impl Neo4jClient {
         }
     }
 
+    /// The Cypher of [`Self::find_files_by_path_suffix`]. Same shape rule as
+    /// [`Self::PROJECT_FILES_BY_SUFFIX`]: see `tests::the_suffix_lookups_never_offer_the_suffix_to_an_index`.
+    const FILES_BY_SUFFIX: &'static str = r#"
+            MATCH (f:File)
+            WHERE right(f.path, size($suffix)) = $suffix
+            RETURN f.path AS path, f.project_id AS project_id
+            ORDER BY f.path
+            LIMIT $limit
+            "#;
+
     /// Files whose path ends with `suffix`, as `(path, project_id)`.
+    ///
+    /// The suffix is an expression here for the same reason as in
+    /// [`Self::find_project_files_by_path_suffix`]: `ORDER BY f.path` over a
+    /// suffix on the property that carries the `file_path` uniqueness constraint
+    /// is the shape Neo4j's planner can answer by seeking that RANGE index.
+    /// Unlike the project-scoped form, THIS one was not measured failing — a
+    /// graph of 30 000 `File` answered correctly — so the change is a hardening
+    /// of the same shape, not a fix of an observed failure. It costs nothing: a
+    /// range index cannot answer a suffix either way.
     pub async fn find_files_by_path_suffix(
         &self,
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Option<Uuid>)>> {
-        let q = query(
-            r#"
-            MATCH (f:File)
-            WHERE f.path ENDS WITH $suffix
-            RETURN f.path AS path, f.project_id AS project_id
-            ORDER BY f.path
-            LIMIT $limit
-            "#,
-        )
-        .param("suffix", suffix.to_string())
-        .param("limit", limit as i64);
+        let q = query(Self::FILES_BY_SUFFIX)
+            .param("suffix", suffix.to_string())
+            .param("limit", limit as i64);
 
         let mut result = self.graph.execute(q).await?;
         let mut out = Vec::new();
@@ -428,7 +439,7 @@ impl Neo4jClient {
     /// The Cypher of [`Self::find_project_files_by_path_suffix`].
     ///
     /// Held apart from the method so a test can guard its SHAPE — see
-    /// `tests::the_project_suffix_cypher_never_offers_the_suffix_to_an_index`
+    /// `tests::the_suffix_lookups_never_offer_the_suffix_to_an_index`
     /// and the method's doc for what goes wrong when it changes back.
     const PROJECT_FILES_BY_SUFFIX: &'static str = r#"
             MATCH (:Project {id: $project_id})-[:CONTAINS]->(f:File)
@@ -443,21 +454,26 @@ impl Neo4jClient {
     /// `LIMIT`: see [`GraphStore::find_project_files_by_path_suffix`].
     ///
     /// The suffix is written `right(f.path, size($suffix)) = $suffix` and NOT
-    /// `f.path ENDS WITH $suffix`. Measured on 2026-11-23 against the CI's own
-    /// Neo4j image (5.26.31): on a graph carrying thousands of `CONTAINS`
-    /// relations, the plan of the `ENDS WITH` form seeks the RANGE index behind
-    /// the `file_path` uniqueness constraint and the server then fails the query
-    /// at run time — "Tried to query index with illegal query. A STRING_SUFFIX
-    /// predicate is not allowed for a RANGE index"
+    /// `f.path ENDS WITH $suffix`. With `ENDS WITH`, Neo4j 5.26.31 (the CI's
+    /// image) sometimes answers this query by seeking the RANGE index behind the
+    /// `file_path` uniqueness constraint and pushing the suffix into it, which
+    /// the server refuses at run time — "Tried to query index with illegal
+    /// query. A STRING_SUFFIX predicate is not allowed for a RANGE index"
     /// (`Neo.DatabaseError.Statement.ExecutionFailed`). That is what reddened
-    /// `main` (run 45267830143, and in it the `store_conformance` check
+    /// `main` on 2026-11-23 (run 45267830143, the `store_conformance` check
     /// `check_project_scoped_suffix_lookup_filters_before_limit`), and it reaches
     /// production as a 500 on `analyze_impact` with a relative target
-    /// (`src/api/code_handlers.rs`). A range index can never answer a suffix, so
-    /// writing the predicate as an expression costs nothing the index could have
-    /// given: the scan stays bounded by the project's own files (the `CONTAINS`
-    /// expansion), and the plan no longer depends on how large the rest of the
-    /// graph is.
+    /// (`src/api/code_handlers.rs`).
+    ///
+    /// The shape is what has to stay out of reach, not one guessed precondition:
+    /// a suffix on the property carrying a uniqueness constraint, with `ORDER BY`
+    /// on that same property and a `LIMIT`, is what the planner can turn into an
+    /// index query. Measured while chasing this: the failure did not reproduce on
+    /// demand (same data, same image, one instance failed and a fresh one
+    /// answered correctly), so no exact trigger is claimed here. Writing the
+    /// predicate as an expression costs nothing the index could have given — a
+    /// range index cannot answer a suffix either way — and the scan stays bounded
+    /// by the project's own files (the `CONTAINS` expansion).
     pub async fn find_project_files_by_path_suffix(
         &self,
         project_id: Uuid,
@@ -4635,37 +4651,55 @@ impl Neo4jClient {
 mod tests {
     use super::*;
 
-    /// The project-scoped suffix lookup must not hand its suffix to an index.
+    /// Compressed so the guard survives a reformatting of the Cypher (line
+    /// breaks, indentation) that changes nothing to the plan.
+    fn flat(cypher: &str) -> String {
+        cypher.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Neither suffix lookup may hand its suffix to an index.
     ///
-    /// What it guards, measured on 2026-11-23 against the CI's Neo4j image
-    /// (5.26.31): with `f.path ENDS WITH $suffix` in this query — a selective
-    /// `CONTAINS` expansion, an `ORDER BY f.path` and a `LIMIT` — the planner
-    /// sometimes serves the ordering with the RANGE index behind the
-    /// `file_path` uniqueness constraint and pushes the suffix into it. The
-    /// server then refuses the query at run time ("A STRING_SUFFIX predicate is
-    /// not allowed for a RANGE index"), which reddened `main`
-    /// (run 45267830143) and turns a relative `analyze_impact` target into a 500.
+    /// What this guards, measured on 2026-11-23 against the CI's Neo4j image
+    /// (5.26.31): with `f.path ENDS WITH $suffix` in `find_project_files_by_path_suffix`
+    /// — a suffix on the property carrying the `file_path` uniqueness
+    /// constraint, `ORDER BY` on that same property and a `LIMIT` — the planner
+    /// sometimes serves the ordering with that RANGE index and pushes the suffix
+    /// into it. The server then refuses the query at run time ("A STRING_SUFFIX
+    /// predicate is not allowed for a RANGE index"), which reddened `main` (run
+    /// 45267830143) and turns a relative `analyze_impact` target into a 500.
     ///
     /// Why a SHAPE guard and not a behavioural test: that plan choice depends on
-    /// internal planner state a test cannot set. The same data and the same
-    /// image reproduced the failure on one instance and answered correctly on a
-    /// fresh one, so a behavioural test would be green with the defect present —
-    /// a lie. The shape, on the other hand, is exactly what has to stay fixed:
+    /// internal planner state a test cannot set. The same data and the same image
+    /// reproduced the failure on one instance and answered correctly on a fresh
+    /// one, so a behavioural test would be green with the defect present — a lie.
+    /// The shape, on the other hand, is exactly what has to stay fixed:
     /// `right(f.path, size($suffix)) = $suffix` is an expression, so no index can
-    /// be chosen for it, whatever the planner's estimate.
+    /// be chosen for it, whatever the planner estimates.
+    ///
+    /// The unscoped form was never measured failing (30 000 `File` answered
+    /// correctly); it is guarded here because it carries the same shape and the
+    /// same free fix.
     #[test]
-    fn the_project_suffix_cypher_never_offers_the_suffix_to_an_index() {
-        let cypher = Neo4jClient::PROJECT_FILES_BY_SUFFIX;
-        assert!(
-            !cypher.contains("ENDS WITH"),
-            "the suffix must stay an expression: with `ENDS WITH`, Neo4j's planner \
-             seeks the RANGE index of the `file_path` constraint and the server \
-             fails the query at run time. Cypher was:\n{cypher}"
-        );
-        assert!(
-            cypher.contains("right(f.path, size($suffix)) = $suffix"),
-            "the suffix comparison is no longer the index-proof expression the \
-             defect was fixed with. Cypher was:\n{cypher}"
-        );
+    fn the_suffix_lookups_never_offer_the_suffix_to_an_index() {
+        for (name, cypher) in [
+            (
+                "find_project_files_by_path_suffix",
+                Neo4jClient::PROJECT_FILES_BY_SUFFIX,
+            ),
+            ("find_files_by_path_suffix", Neo4jClient::FILES_BY_SUFFIX),
+        ] {
+            let flat = flat(cypher);
+            assert!(
+                !flat.contains("ENDS WITH"),
+                "`{name}` must keep its suffix as an expression: with `ENDS WITH`, \
+                 Neo4j's planner seeks the RANGE index of the `file_path` \
+                 constraint and the server fails the query at run time. Cypher: {flat}"
+            );
+            assert!(
+                flat.contains("right(f.path, size($suffix)) = $suffix"),
+                "`{name}` no longer compares the suffix with the index-proof \
+                 expression the defect was fixed with. Cypher: {flat}"
+            );
+        }
     }
 }
