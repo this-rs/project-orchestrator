@@ -46,7 +46,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 17 autres restent à couvrir sur obrain |
-| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. **Trou** : les ~114 tests unitaires de `src/obrain/` ne tournent dans aucun job (pas de `--lib --features obrain-backend`) |
+| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. Le job exécute les tests unitaires `obrain::` avec la feature, sauf deux tests dépendant de fenêtres temporelles : `auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et `commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`. À synchroniser de façon déterministe avant de les réactiver |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine (imposé dans `copy`) démontrés sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; source non gelée : gel opérationnel exigé ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
@@ -140,6 +140,12 @@ divergence listée est corrigée (« now conforms »), ce qui force à retirer l
 - Jambe obrain : job **Obrain backend**. Le filtre CI retient les modules `obrain_`,
   dont `obrain_transverse`, et aucun test `mock_` ni `neo4j_`.
 - En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
+
+### G5 — refus nommés : les tests unitaires de `src/obrain/`
+Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`, et
+échoue si aucun test n'a tourné. Deux tests sensibles à l'ordonnancement restent exclus
+(`--skip`, qui compare par sous-chaîne) ; ils sont suivis en G11 et leur stabilisation est
+nécessaire avant leur réactivation en CI.
 
 ## Portes manuelles ou non faites
 
@@ -277,6 +283,10 @@ qu'avec, ensemble :
 (« no kill landed inside a creation over 12 rounds ») et un `unwrap()` sur une ligne de
 journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 (manche
 « suspendue ») ; le second n'est corrigé nulle part. Une porte instable ne prouve rien.
+
+Exclus du job Obrain backend tant qu'ils dépendent de l'horloge ou de l'ordonnancement :
+`obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et
+`obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`.
 
 ## Règles de contrôle
 
