@@ -1829,7 +1829,7 @@ pub(crate) async fn launch_delegation(
 
     // A delegation is a pair: `delegation_started` here, and
     // `delegation_completed` / `delegation_failed` from
-    // `listen_delegation_result`. Without the first one a client only learns
+    // `conclude_delegation` (every end goes through it). Without the first one a client only learns
     // about a sub-agent once it has already answered — the parent→child link
     // could never be animated. `provider` and `model` are deliberately absent:
     // the router's pick is not resolved yet at this point, and guessing them
@@ -2145,7 +2145,8 @@ fn delegation_chat_request(
 /// being `None` because its prompt was refused or its channel could not be subscribed —
 /// closes it at once. Both ends go through `DelegationClosure::finish` (#1272): the
 /// execution is closed, the session that delegated is woken, and clients get the
-/// `delegation_failed` that pairs with the `delegation_started` already emitted.
+/// `delegation_failed` that pairs with the `delegation_started` already emitted. A
+/// delegation closed unheard recovers no commit: `cwd` is only used when it is listened to.
 #[allow(clippy::too_many_arguments)]
 async fn conclude_delegation(
     rx: Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>>,
@@ -2167,11 +2168,14 @@ async fn conclude_delegation(
             .await
         }
         None => {
+            // The child never took its prompt: it produced nothing to recover. The agent
+            // worktrees of the repository are therefore NOT swept (`cwd: None`): that sweep
+            // removes the ones with no new commit, and a sibling still at work may own one.
             DelegationClosure {
                 task_id,
                 task_title,
                 event_bus,
-                cwd,
+                cwd: None,
                 close,
                 owner,
                 limits,
@@ -10400,6 +10404,66 @@ pub(crate) mod tests {
         assert_eq!(event["event"], "delegation_failed", "{event}");
     }
 
+    /// #1272 — a delegation closed unheard does not sweep the agent worktrees of the
+    /// repository: its child produced nothing, and the sweep removes every agent worktree
+    /// with no new commit — here, the one a sibling is still working in.
+    #[tokio::test]
+    async fn a_delegation_that_could_not_be_listened_to_leaves_agent_worktrees_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "root"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            ".claude/worktrees/agent-sibling",
+            "-b",
+            "agent-sibling",
+        ]);
+        let sibling = repo.path().join(".claude/worktrees/agent-sibling");
+        assert!(sibling.exists());
+
+        let (_parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+        super::conclude_delegation(
+            None,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            Some(repo.path().to_string_lossy().into_owned()),
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            sibling.exists(),
+            "a delegation that never ran removed a sibling's worktree"
+        );
+    }
+
     /// B36 (review 4) — the delegation's delay (the runner's default, PYSR-3) expires
     /// with no halt wired: the execution is closed `timeout` (it was `failed` under the old
     /// hidden 1 h net).
@@ -11446,9 +11510,10 @@ pub(crate) mod tests {
         assert_eq!(request.max_tokens, defaults.max_tokens);
     }
 
-    /// B36 (review 4) — a delegation that never gets to listen (its prompt
-    /// could not be sent) drops its execution: closed `failed`, after the open
-    /// node is written.
+    /// B36 (review 4) — an execution that is DROPPED without `close` (the delegation's own
+    /// task cut short: a panic, the runtime shutting down) is still closed `failed`, after
+    /// the open node is written. A prompt that could not be sent no longer ends here: it
+    /// goes through `conclude_delegation` (#1272).
     #[tokio::test]
     async fn a_delegation_dropped_before_listening_is_closed_failed() {
         use crate::neo4j::agent_execution::AgentExecutionStatus;
