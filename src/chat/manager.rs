@@ -11609,6 +11609,17 @@ impl ChatManager {
             // Claude Code engine gives the prompt. It used to answer "not found" for a
             // delegated child that was alive.
             if let Some(handle) = self.agent_runtime.get(to_session_id).await {
+                // The message ITSELF is stored and broadcast as a team message — the peer's
+                // raw text and its sender, never the prefixed prompt — exactly as the Claude
+                // Code engine does a few lines below. What the model receives is the prefix,
+                // which the turn that carries the message shows.
+                handle
+                    .emit(ChatEvent::TeamMessage {
+                        from_session_id,
+                        from_name: from_name.to_string(),
+                        content: text.to_string(),
+                    })
+                    .await;
                 return handle
                     .inject_hint(&format!("[team {}] {}", from_name, text))
                     .await;
@@ -27697,6 +27708,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let turns_before = fake.state.turns_started.lock().unwrap().len();
+        // Subscribed BEFORE the message: what the session's observers (the UI, the
+        // transcript) receive is judged here, not the provider's prompt alone.
+        let mut events = handle.events_tx.subscribe();
 
         manager
             .inject_team_message(Uuid::new_v4(), "peer", &sid, "are you there")
@@ -27712,6 +27726,29 @@ mod tests {
         }
         let sent = fake.state.turns_started.lock().unwrap()[turns_before].clone();
         assert!(sent.contains("[team peer] are you there"), "{sent}");
+
+        // The message ITSELF is stored and broadcast as a `TeamMessage`: the peer's raw
+        // text and its sender, as the Claude Code engine does. The prefixed form belongs
+        // to the prompt, never to what the session records.
+        let mut saw_team = false;
+        loop {
+            match events.try_recv() {
+                Ok(ChatEvent::TeamMessage {
+                    from_name, content, ..
+                }) => {
+                    assert_eq!(content, "are you there", "the raw text is what is stored");
+                    assert_eq!(from_name, "peer");
+                    saw_team = true;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_team,
+            "the team message must reach the session as a TeamMessage, not as a user message"
+        );
     }
 
     /// Two first sessions opened at once on an agent that refuses MCP servers per
