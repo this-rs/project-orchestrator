@@ -7255,6 +7255,22 @@ macro_rules! all_checks {
 all_checks!(mock, MockFactory);
 all_checks!(neo4j, Neo4jFactory);
 
+// Cross-domain checks whose dependencies are served by obrain. The protocol and
+// ingress checks from `all_checks!` already run in their own modules below.
+// Other checks are not instantiated for obrain; some need the project cascade
+// or note vectors, which are still explicitly refused by that backend.
+#[cfg(feature = "obrain-backend")]
+conformance_suite!(
+    obrain_transverse,
+    ObrainFactory,
+    [
+        check_pagination,
+        check_note_filters,
+        check_datetime_roundtrip_and_arithmetic,
+        check_ordering_is_deterministic_across_pages,
+    ]
+);
+
 /// The project domain on its own: the checks that call nothing but
 /// `ProjectStore`. Instantiated per backend like the suite above, in modules
 /// of their own — and it is the suite a backend ported one domain at a time

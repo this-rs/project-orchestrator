@@ -730,11 +730,13 @@ jobs:
   # the refused methods (tests/obrain_backend.rs) would protect nothing.
   #
   # No service: every base is a temporary directory, and the obrain conformance
-  # checks (every `obrain_*` module of tests/store_conformance.rs, one per ported
-  # domain) need neither Neo4j nor Meilisearch (the `mock_*`/`neo4j_*` halves run in
-  # the jobs that have them). The filter was `obrain_project::` alone (10 tests):
-  # widened to `obrain_` (86 tests, ~10 s measured locally on 20/11/2026) so the
-  # obrain leg of the conformance gate (docs/migration/GATES.md, G4) actually runs.
+  # checks (every `obrain_*` module of tests/store_conformance.rs: one per ported
+  # domain, plus `obrain_transverse` for the cross-domain checks) need neither Neo4j
+  # nor Meilisearch (the `mock_*`/`neo4j_*` halves run in the jobs that have them).
+  # The filter was `obrain_project::` alone (10 tests): widened to `obrain_` (101
+  # tests measured on 23/11/2026: 97 per-domain, plus the 4 cross-domain checks
+  # of `obrain_transverse`) so the obrain leg of the conformance gate
+  # (docs/migration/GATES.md, G4) actually runs.
   # The kill -9 and inter-process tests re-execute this test binary as their child.
   # ==========================================================================
   obrain-backend:
