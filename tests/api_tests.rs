@@ -33,7 +33,7 @@ fn auth_client() -> Client {
     let token = project_orchestrator::auth::jwt_crypto::encode(
         &jsonwebtoken::Header::default(),
         &claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("Failed to encode test JWT");
 
