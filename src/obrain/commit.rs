@@ -2134,27 +2134,52 @@ mod tests {
     /// before it.
     #[tokio::test]
     async fn les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable() {
-        let store = std::sync::Arc::new(
-            ObrainGraphStore::open_temporary_avec(Durabilite::LenteAPourTest(600)).unwrap(),
-        );
+        let store = std::sync::Arc::new(ObrainGraphStore::open_temporary().unwrap());
         let plan = un_plan(None);
         store.create_plan(&plan).await.unwrap();
         store.create_commit(&un_commit("lent", 0)).await.unwrap();
         store.ecrire_fichier_pour_test("f", None).await.unwrap();
 
+        let (arrivee, attente) = tokio::sync::oneshot::channel();
+        let (reprendre, reprise) = std::sync::mpsc::channel();
+        *store.interne.pause_durabilite.lock().unwrap() = Some((arrivee, reprise));
         let ecrivain = {
             let s = store.clone();
             let plan_id = plan.id;
             tokio::spawn(async move { s.link_commit_to_plan("lent", plan_id).await })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), attente)
+            .await
+            .unwrap()
+            .unwrap();
+        // A regression could hold the index lock over the durability step.
+        // Read on the blocking pool so the timeout can still release the writer.
+        let lecture = {
+            let s = store.clone();
+            let plan_id = plan.id;
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || runtime.block_on(s.get_plan_commits(plan_id)))
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(30), lecture).await;
+        let reprise = reprendre.send(());
+        let ecrit = tokio::time::timeout(std::time::Duration::from_secs(30), ecrivain).await;
         assert!(
-            store.get_plan_commits(plan.id).await.unwrap().is_empty(),
+            lu.expect("RESULTED_IN : lecture bloquée pendant la durabilité")
+                .unwrap()
+                .unwrap()
+                .is_empty(),
             "RESULTED_IN lu avant d'être durable"
         );
-        ecrivain.await.unwrap().unwrap();
+        reprise.unwrap();
+        ecrit
+            .expect("RESULTED_IN : écriture bloquée après la reprise")
+            .unwrap()
+            .unwrap();
         assert_eq!(store.get_plan_commits(plan.id).await.unwrap().len(), 1);
 
+        let (arrivee, attente) = tokio::sync::oneshot::channel();
+        let (reprendre, reprise) = std::sync::mpsc::channel();
+        *store.interne.pause_durabilite.lock().unwrap() = Some((arrivee, reprise));
         let ecrivain = {
             let s = store.clone();
             tokio::spawn(async move {
@@ -2162,16 +2187,38 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), attente)
+            .await
+            .unwrap()
+            .unwrap();
+        let lecture = {
+            let s = store.clone();
+            tokio::task::spawn_blocking(move || {
+                (
+                    s.get_commit_files_porte("lent"),
+                    s.get_file_history_porte("f", None),
+                )
+            })
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(30), lecture).await;
+        let reprise = reprendre.send(());
+        let ecrit = tokio::time::timeout(std::time::Duration::from_secs(30), ecrivain).await;
+        let (fichiers, historique) = lu
+            .expect("TOUCHES : lecture bloquée pendant la durabilité")
+            .unwrap();
         assert!(
-            store.get_commit_files_porte("lent").unwrap().is_empty(),
+            fichiers.unwrap().is_empty(),
             "TOUCHES lu (commit) avant d'être durable"
         );
         assert!(
-            store.get_file_history_porte("f", None).unwrap().is_empty(),
+            historique.unwrap().is_empty(),
             "TOUCHES lu (fichier) avant d'être durable"
         );
-        ecrivain.await.unwrap().unwrap();
+        reprise.unwrap();
+        ecrit
+            .expect("TOUCHES : écriture bloquée après la reprise")
+            .unwrap()
+            .unwrap();
         assert_eq!(store.get_commit_files_porte("lent").unwrap().len(), 1);
         assert_eq!(store.get_file_history_porte("f", None).unwrap().len(), 1);
     }

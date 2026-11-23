@@ -46,13 +46,13 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 17 autres restent à couvrir sur obrain |
-| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. Le job exécute les tests unitaires `obrain::` avec la feature, sauf deux tests dépendant de fenêtres temporelles : `auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et `commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`. À synchroniser de façon déterministe avant de les réactiver |
+| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. Le job exécute les tests unitaires `obrain::` avec la feature, sauf `auth::tests::la_consommation_prend_l_heure_sous_le_verrou`, qui dépend d'une fenêtre temporelle et doit être stabilisé avant sa réactivation |
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine (imposé dans `copy`) démontrés sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; source non gelée : gel opérationnel exigé ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
 | G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **non conçu** |
 | G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge** : sélection de la source implémentée et testée (migrateur factice) ; les écritures faites sur obrain après la bascule sont **perdues** pour la source, ni recopiées ni réconciliées ; un test de bout en bout ne suffirait pas : il faut une réconciliation sans perte, ou un refus du rollback dès qu'une écriture post-bascule existe |
-| G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) |
+| G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) ; `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` exclu de la CI (horloge) ; `storage::migrator` n'est PAS un test instable : ce step est la première compilation à froid de la bibliothèque avec la feature (6 min 26 s sur le run vert 45111474405, 12 min 29 s pour le step précédent). Un run a dépassé le délai du job (45 min, annulé, run 45113636283) et un autre a échoué (run 45103207452, log expiré) : c'est le temps de compilation sur le runner, les 23 tests passent en 25 s en local, 5/5 ; `obrain::chat::tests::c5_empreinte_publie_le_updated_at_ecrit` dépend d'un `sleep` de 5 ms (horloge), non exclu |
 
 ## Détail des portes automatisées
 
@@ -143,9 +143,9 @@ divergence listée est corrigée (« now conforms »), ce qui force à retirer l
 
 ### G5 — refus nommés : les tests unitaires de `src/obrain/`
 Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`, et
-échoue si aucun test n'a tourné. Deux tests sensibles à l'ordonnancement restent exclus
-(`--skip`, qui compare par sous-chaîne) ; ils sont suivis en G11 et leur stabilisation est
-nécessaire avant leur réactivation en CI.
+échoue si aucun test n'a tourné. Un test sensible à l'ordonnancement reste exclu
+(`--skip`, qui compare par sous-chaîne) ; il est suivi en G11 et sa stabilisation est
+nécessaire avant sa réactivation en CI.
 
 ## Portes manuelles ou non faites
 
@@ -284,9 +284,10 @@ qu'avec, ensemble :
 journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 (manche
 « suspendue ») ; le second n'est corrigé nulle part. Une porte instable ne prouve rien.
 
-Exclus du job Obrain backend tant qu'ils dépendent de l'horloge ou de l'ordonnancement :
-`obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` et
-`obrain::commit::tests::les_lectures_ne_voient_pas_une_ecriture_pas_encore_durable`.
+Exclu du job Obrain backend tant qu'il dépend de l'horloge :
+`obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou`. Le test de visibilité
+avant durabilité de `obrain::commit` tourne désormais en CI (il ne tournait dans aucun job) : il se
+synchronise par un crochet de test au lieu d'une fenêtre de temps.
 
 ## Règles de contrôle
 
