@@ -11603,10 +11603,20 @@ impl ChatManager {
             auto_continue,
         )) = session_state
         else {
+            // Held by the agent engine (#1271): the message reaches the live session the way
+            // a hint does — queued behind a running turn without interrupting it, a turn of
+            // its own when the session is idle — under the same `[team name]` prefix the
+            // Claude Code engine gives the prompt. It used to answer "not found" for a
+            // delegated child that was alive.
+            if let Some(handle) = self.agent_runtime.get(to_session_id).await {
+                return handle
+                    .inject_hint(&format!("[team {}] {}", from_name, text))
+                    .await;
+            }
             // Not live on the Claude Code engine. A session released because its segment
             // was Done is resumed by the message, as a person's message would resume it;
-            // anything else (closed by a person, idle cleanup, never existed, held by the
-            // agent engine) stays "not found".
+            // anything else (closed by a person, idle cleanup, never existed) stays
+            // "not found".
             let released = self
                 .released_done
                 .lock()
@@ -27642,6 +27652,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(node.message_count, 1, "1 at creation only: {node:?}");
+    }
+
+    /// #1271 — a team message to a LIVE session of the agent engine is delivered to it
+    /// (it answered "not found"): the provider is sent the text under the `[team name]`
+    /// prefix, as the Claude Code engine does.
+    #[tokio::test]
+    async fn a_team_message_reaches_a_live_agent_session() {
+        use nexus_claude::agent::AgentEvent;
+
+        let (manager, _graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        let sid = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .expect("the session opens")
+            .session_id;
+        fake.state.push(AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: Some("ok".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let handle = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .expect("the agent session is live");
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the opening turn never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let turns_before = fake.state.turns_started.lock().unwrap().len();
+
+        manager
+            .inject_team_message(Uuid::new_v4(), "peer", &sid, "are you there")
+            .await
+            .expect("a live agent session receives the team message");
+
+        while fake.state.turns_started.lock().unwrap().len() == turns_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the team message started no turn"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sent = fake.state.turns_started.lock().unwrap()[turns_before].clone();
+        assert!(sent.contains("[team peer] are you there"), "{sent}");
     }
 
     /// Two first sessions opened at once on an agent that refuses MCP servers per
