@@ -286,8 +286,8 @@ journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 
 
 Exclu du job Obrain backend tant qu'il dépend de l'horloge :
 `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou`. Le test de visibilité
-avant durabilité de `obrain::commit` est réactivé : il se synchronise par un crochet de
-test au lieu d'une fenêtre de temps.
+avant durabilité de `obrain::commit` tourne désormais en CI (il ne tournait dans aucun job) : il se
+synchronise par un crochet de test au lieu d'une fenêtre de temps.
 
 ## Règles de contrôle
 
