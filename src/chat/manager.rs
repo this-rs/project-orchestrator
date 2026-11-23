@@ -27382,6 +27382,22 @@ mod tests {
         (manager, graph, fake)
     }
 
+    /// Waits, at most five seconds, until `done` holds. The sleep runs before each check, so
+    /// the body always executes (no branch is left to a race that rarely fires).
+    async fn settle_until(done: impl Fn() -> bool, what: &str) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if done() {
+                    return;
+                }
+            }
+        })
+        .await;
+        let outcome = format!("{what}: {}", waited.is_ok());
+        assert!(waited.is_ok(), "{outcome}");
+    }
+
     fn agent_request(message: &str) -> ChatRequest {
         let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         req.spawned_by = None;
@@ -27685,19 +27701,16 @@ mod tests {
             structured_output: None,
             error: None,
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let handle = manager
             .agent_runtime
             .get(&sid)
             .await
             .expect("the agent session is live");
-        while handle.is_streaming.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the opening turn never ended"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle_until(
+            || !handle.is_streaming.load(Ordering::SeqCst),
+            "the opening turn ended",
+        )
+        .await;
         let turns_before = fake.state.turns_started.lock().unwrap().len();
         // Subscribed BEFORE the message: what the session's observers (the UI, the
         // transcript) receive is judged here, not the provider's prompt alone.
@@ -27708,13 +27721,11 @@ mod tests {
             .await
             .expect("a live agent session receives the team message");
 
-        while fake.state.turns_started.lock().unwrap().len() == turns_before {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the team message started no turn"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle_until(
+            || fake.state.turns_started.lock().unwrap().len() > turns_before,
+            "the team message starts a turn",
+        )
+        .await;
         let sent = fake.state.turns_started.lock().unwrap()[turns_before].clone();
         assert!(sent.contains("[team peer] are you there"), "{sent}");
 
@@ -27776,27 +27787,21 @@ mod tests {
             .get(&sid)
             .await
             .expect("the agent session is live");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while handle.is_streaming.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the opening turn never ended"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle_until(
+            || !handle.is_streaming.load(Ordering::SeqCst),
+            "the opening turn ended",
+        )
+        .await;
         // A second turn that nothing ends: the session stays busy.
         manager
             .send_message(&sid, "a long task")
             .await
             .expect("the turn starts");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !handle.is_streaming.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the turn never started"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        settle_until(
+            || handle.is_streaming.load(Ordering::SeqCst),
+            "the second turn started",
+        )
+        .await;
 
         manager
             .inject_team_message(Uuid::new_v4(), "peer", &sid, "queued text")
@@ -27804,18 +27809,25 @@ mod tests {
             .expect("inject succeeds");
 
         let queue = handle.pending.lock().await;
-        assert!(
-            queue.iter().any(|m| matches!(
+        let queued = queue.iter().any(|m| {
+            matches!(
                 &m.kind,
-                crate::chat::types::PendingMessageKind::TeamMessage { from_name, .. } if from_name == "peer"
-            ) && m.content == "queued text"),
-            "queued as a team message with its raw text: {:?}",
+                crate::chat::types::PendingMessageKind::TeamMessage { from_name, .. }
+                    if from_name == "peer"
+            ) && m.content == "queued text"
+        });
+        let shown = format!(
+            "{:?}",
             queue
                 .iter()
                 .map(|m| (&m.kind, &m.content))
                 .collect::<Vec<_>>()
         );
         drop(queue);
+        assert!(
+            queued,
+            "queued as a team message with its raw text: {shown}"
+        );
         fake.state.end_turn();
     }
 
