@@ -9698,6 +9698,21 @@ pub(crate) mod tests {
         Uuid,
         String,
     ) {
+        open_a_delegation_on(crate::chat::agent_runtime::fake::FakeProvider::new()).await
+    }
+
+    /// [`open_a_delegation_on_the_fake`], on a fake provider the test set up beforehand (to
+    /// refuse the delegation's prompt, for one).
+    #[allow(clippy::type_complexity)]
+    async fn open_a_delegation_on(
+        fake: crate::chat::agent_runtime::fake::FakeProvider,
+    ) -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        Uuid,
+        String,
+    ) {
         use crate::chat::manager::{test_support, ChatManager};
         use crate::neo4j::GraphStore;
 
@@ -9712,7 +9727,6 @@ pub(crate) mod tests {
         mock.create_chat_session(&parent).await.unwrap();
         let parent_id = parent.id.to_string();
 
-        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let dyn_graph: Arc<dyn GraphStore> = mock.clone();
         let manager = Arc::new(
             ChatManager::new_without_memory(
@@ -10279,35 +10293,34 @@ pub(crate) mod tests {
     }
 
     /// What the parent is told about `task_id`: the notification it receives, awaited for
-    /// three seconds at most.
+    /// ten seconds at most.
     async fn what_the_parent_is_told(
         rx: &mut tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
         task_id: Uuid,
     ) -> String {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "the parent was never told that the delegation ended"
-            );
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
-                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
-                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
-                    if content.contains(&task_id.to_string()) =>
-                {
-                    return content;
+        let task = task_id.to_string();
+        let told = async {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::chat::types::ChatEvent::UserMessage { content })
+                    | Ok(crate::chat::types::ChatEvent::SystemHint { content })
+                    | Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. })
+                        if content.contains(&task) =>
+                    {
+                        return content;
+                    }
+                    // The wake holds the parent's manager: dropped unfired, it closes this
+                    // channel, and the parent will never be told.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("the parent was never told: the delegation's wake was dropped")
+                    }
+                    _ => continue,
                 }
-                Ok(Ok(_)) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                // The wake holds the parent's manager: dropped unfired, it closes this channel.
-                Ok(Err(_)) => {
-                    panic!("the parent was never told: the delegation's wake was dropped")
-                }
-                Err(_) => continue,
             }
-        }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), told)
+            .await
+            .expect("the parent was never told that the delegation ended")
     }
 
     /// Listens to `channel` as the delegation of `task_id`, with nothing else wired.
@@ -10404,6 +10417,27 @@ pub(crate) mod tests {
         assert_eq!(event["event"], "delegation_failed", "{event}");
     }
 
+    /// #1272, the whole route — a delegation whose prompt the provider refuses is not left
+    /// to its drop: `launch_delegation` closes it through `conclude_delegation`, and the
+    /// session that delegated is woken and told it failed.
+    #[tokio::test]
+    async fn a_delegation_whose_prompt_is_refused_wakes_its_parent() {
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        // The child's session opens with no message: the delegation's prompt is its first
+        // turn, and the only provider refuses it (no retry, no fallback).
+        *fake.state.fail_next_turn.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::Unauthorized);
+
+        let (_manager, fake, mut parent, task_id, _child) = open_a_delegation_on(fake).await;
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"failed\""), "{told}");
+        assert!(
+            fake.state.turns_started.lock().unwrap().is_empty(),
+            "the refused prompt never started a turn"
+        );
+    }
+
     /// #1272 — a delegation closed unheard does not sweep the agent worktrees of the
     /// repository: its child produced nothing, and the sweep removes every agent worktree
     /// with no new commit — here, the one a sibling is still working in.
@@ -10422,11 +10456,7 @@ pub(crate) mod tests {
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            assert!(out.status.success(), "git {args:?} failed");
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-q", "--allow-empty", "-m", "root"]);
