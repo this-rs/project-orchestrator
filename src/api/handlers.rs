@@ -10175,6 +10175,91 @@ pub(crate) mod tests {
         assert!(stored.completed_at.is_some());
     }
 
+    /// #1272 — a channel that closes without any `Result` read (lost in a `Lagged`, or
+    /// the child gone) ends the delegation `failed` AND wakes the session that delegated.
+    /// It used to `break`, and the execution's drop closed it `failed` without telling
+    /// the parent: the parent waited for a notification that never came.
+    #[tokio::test]
+    async fn a_delegation_whose_channel_closes_without_result_wakes_its_parent() {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let ae = open_delegation_node();
+        graph.create_agent_execution(&ae).await.unwrap();
+
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            crate::chat::config::ChatConfig::default(),
+        ));
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let mut rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+
+        let task_id = Uuid::new_v4();
+        let wake = super::DelegationWake {
+            manager: Arc::clone(&manager),
+            parent_session_id: parent.id,
+            task_id,
+            task_title: "delegated".to_string(),
+        };
+        let execution = super::DelegationExecution::new(ae, graph, None, Some(wake));
+
+        // A channel that is closed with nothing in it: no `Result` is ever read.
+        let (tx, channel) = tokio::sync::broadcast::channel(16);
+        drop(tx);
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        super::listen_delegation_result(
+            channel,
+            task_id,
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+
+        // The parent hears of it, and the notification says the delegation failed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the parent was never told that the delegation ended"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task_id.to_string()) =>
+                {
+                    assert!(content.contains("failed"), "{content}");
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => panic!("the parent's broadcast closed before the notification"),
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// B36 (review 4) — the delegation's delay (the runner's default, PYSR-3) expires
     /// with no halt wired: the execution is closed `timeout` (it was `failed` under the old
     /// hidden 1 h net).
