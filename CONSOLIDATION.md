@@ -4,12 +4,12 @@ Cette branche (`consolidation/obrain-default`) est le lieu unique du chantier.
 Plan PO : `bf3ab074-467e-4b34-b92e-4b19040d8ece` (projet PO Backend).
 Plan jumeau pour la migration des données : `250c63fb-0298-4980-bb16-7e6d3773b5d7`.
 
-**État au 11/11/2026, 14 h UTC.** Ce fichier dit ce qui est fait, ce qui est en cours et ce qui ne l'est pas. Une ligne « en cours » nomme la PR ou la branche qui la porte ; une ligne sans preuve reste « à faire ».
+**État au 23/11/2026, relu contre `git` et `gh` (voir « Relecture du 23/11 » en fin de fichier pour ce qui a été vérifié et ce qui ne l'a pas été).** Ce fichier dit ce qui est fait, ce qui est en cours et ce qui ne l'est pas. Une ligne « en cours » nomme la PR ou la branche qui la porte ; une ligne sans preuve reste « à faire ». **La définition et l'état détaillé des portes de la migration vivent dans `docs/migration/GATES.md`** : ce fichier ne les recopie pas, il renvoie à elles.
 
 ## Règles de la branche
 
 1. **Rien ne remonte dans `main` avant que la porte de bascule soit verte.** Aucune PR vers `main` n'est ouverte tant que ce fichier dit autre chose.
-2. **`main` redescend ICI** (`git merge origin/main` dans cette branche), jamais l'inverse. Une branche qui ne voit jamais `main` pendant des mois devient infusible : c'est exactement ce qui est arrivé à `consolidation/obrain` (2 commits, abandonnée). Dernière descente : #1249 incluse (20/11/2026, PR `merge/main-into-consolidation-2026-11-20`, draft : #1223 #1237 #1238 #1239 #1240 #1241 #1242 #1243 #1244 #1245 #1247 #1249 ; tests de `manager.rs` côté branche : 577 → 578 (côté main : 559, dont le test ajouté par main), ce test rangé sous `src/chat/manager/tests/tests.rs`). Avant elle : #1235 (`d79bcf30`).
+2. **`main` redescend ICI** (`git merge origin/main` dans cette branche), jamais l'inverse. Une branche qui ne voit jamais `main` pendant des mois devient infusible : c'est exactement ce qui est arrivé à `consolidation/obrain` (2 commits, abandonnée). Dernière descente : #1278 (22/11/2026, `main` descendu en portant #1268 dans la structure découpée de `manager.rs`), suivie de #1279 qui restaure l'ascendance de `main` ; après #1300 (rustix 1.1.6, `main` redescendu), la branche a au 23/11 **144 commits d'avance et 0 de retard** sur `main` (`git rev-list --left-right --count origin/main...origin/consolidation/obrain-default` → `0	144`). Avant : #1253 (20/11, #1223 → #1249), #1235 (`d79bcf30`).
 3. **Chaque agent travaille dans son propre worktree**, sur une branche fille de celle-ci, et ouvre sa PR **vers cette branche**. Jamais dans un checkout principal, jamais directement sur cette branche.
 4. **Un lot = un domaine.** Un commit qui touche stockage ET routes n'est pas relisible : on le coupe.
 5. **Aucun défaut connu ne reste « hors périmètre ».** Ce qu'une revue relève est corrigé, dans la PR ou dans une PR empilée ; il n'est pas listé pour plus tard.
@@ -34,13 +34,17 @@ L'attente est la **nanoseconde sur des millions de nœuds**, pas la centaine de 
 
 ## Porte de bascule (« ça fonctionne complètement »)
 
-| # | Condition | État |
-|---|---|---|
-| a | Conformité générique identique sur Neo4j et Obrain (mêmes valeurs, même ordre) | **en cours** — premier domaine sur la branche `consolidation/o-double` (pas encore de PR) |
-| b | recall@10 ≥ 0,95 à 25 000 vecteurs 768-d, après réouverture | en cours côté obrain (plan O-VEC), non vérifié ici |
-| c | Graphe migré, aller-retour vérifié | **en cours** — source figée et référence par type faites (voir plus bas) ; migrateur en spike |
-| d | Double-run sans divergence de justesse | à faire |
-| e | Retour arrière = une variable de configuration | à faire — la fabrique `src/storage/mod.rs` est le point unique, la variante obrain arrive avec (a) |
+État au 23/11/2026, d'après `docs/migration/GATES.md` (qui fait foi pour le détail et les limites de chaque porte). **Aucune condition n'est verte** : la bascule n'a pas lieu, et la directive du 20/11 la tient fermée tant que la migration n'est pas complète.
+
+| # | Condition | Porte (GATES.md) | État |
+|---|---|---|---|
+| a | Conformité générique identique sur Neo4j et Obrain (mêmes valeurs, même ordre) | G4 | **en cours** — la jambe Neo4j tourne en CI ; sur obrain, 13 des 30 contrôles transverses tournent, **17 restent à couvrir** |
+| b | recall@10 ≥ 0,95 à 25 000 vecteurs 768-d, après réouverture | — | non vérifié ici (côté obrain, plan O-VEC) |
+| c | Graphe migré, aller-retour vérifié | G7 | **en cours** — le migrateur réel est dans le dépôt (#1256) et démontré sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; **non rejoué sur la copie complète** ; composants fail-closed de publication de la copie écrits mais non branchés (#1270) |
+| d | Double-run sans divergence de justesse | G9 | **non conçu** |
+| e | Retour arrière = une variable de configuration | G10 | **rouge** — la sélection de la source est faite et testée, mais les écritures faites sur obrain après la bascule sont perdues pour la source (ni recopiées ni réconciliées) |
+
+Autres portes qui bloquent la bascule : **G6** parité de lecture sur copie (à rejouer, dernière mesure le 16/11 sur une branche antérieure), **G8** performance (barre non tenue sur `SearchStore` : ouverture, filtre par projet, suppression), **G11** stabilité des tests (`kill9_during_creations…` instable ; `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` exclu de la CI).
 
 ## État des lots
 
@@ -61,35 +65,51 @@ L'attente est la **nanoseconde sur des millions de nœuds**, pas la centaine de 
 | Serveur réel démarré sur obrain sans Neo4j ni Meilisearch : `POST`/`GET /api/projects/<slug>` par les vrais handlers, donnée survivant à SIGTERM + redémarrage | O-DOUBLE | mesuré le 11/11 (#1171) |
 | Descente de `main` (#1161 #1167 #1168 #1169 #1170) avec le conflit `manager.rs` résolu, relecture de fidélité (530 tests → 530, zéro perte/doublon) | O-BRANCHE | **#1174 fusionnée** (fast-forward, `origin/main` contenu) |
 | Test instable des ancres : les balayages `backfill_*`/`revert_*` étaient globaux ; bornés par slug/session/id, binaire `anchor_sweeps_unscoped` pour le chemin non borné | — | **#1172 fusionnée dans main** (`f0dbe001`) |
+| Suites de relecture de #1165, #1161, #1166, #1163 et du mode Auto de this-rs | O-DOUBLE, O-HARNESS-PARITE | **#1171** (12/11, branche), **#1173** (11/11, `main`), **#1166** (12/11, `main`), **#1163** (13/11, `main` : référence datée de la migration), this **#254** (11/11) : toutes fusionnées (état lu par `gh pr view`) |
+| Domaines portés sur obrain (vagues V1 à V4) : Workspace, Release, Note, Auth, Fédération, Plan (noyau, contraintes, liens, tâches et étapes), Chat (noyau), Decision (noyau), Commit, Protocole, Code (fichiers et `CO_CHANGED`), Persona, FeatureGraph, Skill, Sharing, Trigger, PlanRun | O-GRAPH | #1182 #1183 #1184 #1185 #1186 #1191 #1210 #1214 #1193 #1195 #1196 #1197 #1194 #1209 #1213 #1208, plus les corrections de relecture #1205 #1206 #1207 #1211 : fusionnées dans la branche |
+| `SearchStore` porté (27 méthodes sur l'index texte d'obrain) | O-SEARCH | #1251 ; **barre de performance non tenue** (porte G8) |
+| `AnalyticsStore` en partie : A1 (25 méthodes), A2 (23), mémoire-maintenance (15), agents et vues (15) | O-GRAPH (V5) | #1250 #1258 #1260 #1261 ; 79 des 145 méthodes servent, 66 refusées par nom (voir le tableau V5 plus bas, GATES.md G2) |
+| Dates migrées lues dans leurs trois formes, plus jamais remplacées par le temps de la lecture ; un refus de store n'est plus affiché comme 0 | PORT-DATES, API-NONPORTE-MASQUE | commits du 16/11 (« une date migrée est LUE… », « un comptage refusé n'est plus affiché comme 0 », « les onze derniers replis silencieux ») ; résidus #1257 |
+| Garde de bascule au démarrage (lecture seule nommée, vérification par type, retour arrière par configuration) | tâche 806bde21 | #1248 — **code inactif** : la production n'appelle pas la bascule |
+| Portes de qualité (cliquet des traits, défaut neo4j, catalogue `docs/migration/GATES.md`) et protection de la branche | O-BRANCHE | #1255 #1263 #1264 ; protection posée le 21/11 (checks requis `Lint & Format`, `Unit Tests`, `Integration Tests`, `Obrain backend`, zéro approbation exigée, `enforce_admins`) |
+| Migrateur réel Neo4j → obrain dans le dépôt, sous `obrain-backend` ; composants fail-closed de publication de la copie (non branchés) ; conformité transversale étendue ; tests unitaires obrain en CI | MIGRATEUR-REEL | #1256 (22/11) ; #1270 #1265 #1266 #1267 (23/11) |
 
 ### En cours
 
-| Lot | Tâche PO | Où |
+**Aucune PR n'est ouverte vers cette branche** (`gh pr list --state open --base consolidation/obrain-default` : vide, relevé le 23/11). La seule PR ouverte du chantier est **#1153**, la branche elle-même vers `main`, en draft (`BEHIND`, 3 commits de retard). Deux PR de la file de lots ont été **closes sans fusion** : #1190 (retrait du flush complet par écriture) et #1219 (quarantaine du domaine Fichier) ; les sujets voisins ont été fusionnés par #1220 et #1194.
+
+| Ce qui reste ouvert | Où | Porte |
 |---|---|---|
-| Suite de #1165 : création atomique au crash (marqueur `_brouillon`), un fsync WAL par écriture ≤ 256 o, compteur O(1) pour la suppression, garde-fou d'ouverture (`storage.obrain_create`) | O-DOUBLE | **#1171** (draft) ; relecture : mise à jour déchirée non réparée, test kill -9 non probant, update/delete visibles avant fsync — en correction |
-| Mode Auto du harnais porté dans `this-harness` (cœur de décision pur, compatible wasm) | O-HARNESS-PARITE | this-rs **#249, #251, #252 fusionnées** (avant corrections) ; **#254** = corrections (consultatif ne bouge rien, réparation survit à un `settle` qui pend, paire jamais atteinte oubliée, JSON seulement) — relecture finale : fusionnable après retouche de doc |
-| Suite de #1161 (fusionnée avant corrections) : `idle_verdict` unique, plafond d'attente humaine 24 h, `AskedRequest.turn`, Claude Code via `can_use_tool` | — | **#1173** (draft) ; relecture : demande orpheline à la fermeture, demande hors tour non protégée — en correction |
-| neo4rs 0.8.0 : entiers négatifs lus de travers (65 `state_timeout_secs = 255` fantômes) : vendor patché, migration au boot, garde d'hôte | — | **#1166** (draft) ; relecture : `tests/data_migrations.rs` visait encore la base VIVANTE (7687) — bloquant en correction |
-| Module `plan` : descripteur, CRUD sans base, adaptateur, écran dérivé | O-MODULE-PLAN | this-rs `main` (#234, #235, #236) ; PO ne le consomme pas encore |
-| Référence de migration et copie figée | plan 250c63fb | PR #1163 (`docs/cartographie/20`, `21`, `22`) |
-| Spike du migrateur : débits de lecture et d'import, fidélité par type et par propriété | plan 250c63fb | hors dépôt (`worktrees/spike-migrateur`) |
+| Disque : la base pèse 35 Go sur obrain contre 12 Go sur Neo4j (mesuré le 15/11, `props.v2` ×5,3) | obrain **#181** (ouverte), tâche PO DISQUE-x3 | G7, bascule |
+| Cypher d'obrain : traversées multi-sauts et agrégats de voisinage 1 000 à 24 000× plus lents que Neo4j | obrain **#189** (ouverte) | G8 |
+| Contrats de livraison de la couche harnais ↔ frontend ↔ providers (reprise durable, garanties WASM/natif, événements, autorisations, matrice providers, livraison reproductible, contexte cognitif) | this-rs **#284 à #290** (toutes ouvertes), suivies par l'issue PO **#1246** (qualification transverse, propriétaire unique par mécanisme, porte de livraison) | hors des portes G1 à G11 |
+| Module `plan` de this-rs : descripteur, CRUD, adaptateur, écran dérivé | this-rs `main` (#234, #235, #236, fusionnées) ; **PO ne le consomme pas encore** | O-MODULE-PLAN |
+| `AnalyticsStore` : 66 méthodes refusées par nom | voir le tableau V5 plus bas | G2 |
+| Instabilité de `kill9_during_creations…` | tâche TEST-KILL9-INSTABLE | G11 |
+| Copie Neo4j de référence (27688) à recréer ou verrouiller en lecture seule | tâche COPIE-REFERENCE | G6, G7 |
 
 ### À faire, dans l'ordre du chemin critique
 
-1. Fusionner les correctifs obrain dont PO dépend (tableau suivant).
-2. **O-BASE** — remonter l'épingle obrain de `pins.toml`, dans le commit qui introduit la première dépendance.
-3. **O-TRAITS** (reliquat) — `GraphStore` exige ses 20 sous-traits en bloc : un backend partiel doit fournir ~730 méthodes d'un coup.
-4. **Magasin de trajectoires** — ouvert en dur sur Neo4j dans `src/storage/mod.rs`, hors de la fabrique ; aucune tâche ne le portait.
-5. **O-GRAPH** — portage par vagues (voir plus bas), puis **O-SEARCH** (27 méthodes de `SearchStore`).
-6. **O-CLONE → O-MIGRATE → O-SOAK → O-FLIP.**
+Fait depuis la dernière version de cette liste : fusion des correctifs obrain dont PO dépend (tous fusionnés, voir le tableau plus bas), `SearchStore` (**O-SEARCH**, #1251), migrateur dans le dépôt (#1256), **magasin de trajectoires** (désormais dans la fabrique : `ObrainTrajectoryStore`, qui **refuse par nom**, voir `src/storage/mod.rs`), cliquet des traits portés (G2).
+
+1. **Rejouer la parité de lecture sur copie (G6)** sur la branche actuelle : la dernière mesure date du 16/11, sur une branche antérieure.
+2. **Résoudre les nanosecondes tronquées du migrateur et le rejouer sur la copie complète** (G7), avec la publication de la copie (#1270, composants non branchés).
+3. **Tenir la barre de performance de `SearchStore`** (G8) : ouverture, filtre par projet, suppression.
+4. **Concevoir le double-run** (G9, non conçu) et **la réconciliation du retour arrière** (G10, rouge : les écritures post-bascule sont perdues).
+5. **Étendre la conformité transversale** : 17 contrôles sur 30 sans jambe obrain (G4) ; stabiliser G11.
+6. **Épingles** : `pins.toml` pointe `this` à `61040a2c` et `obrain` à `82467ff1` ; au 23/11 le `main` de this est à `eec7a96b` et celui d'obrain à `bd9b3b4f`. Une remontée d'épingle est un acte délibéré, dans le commit qui en a besoin.
+7. **Descendre `main`** dans la branche (3 commits de retard) avant toute PR vers `main`.
+8. **O-CLONE → O-SOAK → O-FLIP** : pas commencés ; aucune bascule avant que G6 à G11 soient verts.
 
 Hors chemin critique : **O-THISRS-1** (socle this-rs monté sous `/_this` à côté d'axum ; plan écrit, aucun conflit de version d'axum/tower/tokio ; la dépendance par chemin de this-rs vers obrain et vite-rs est le vrai risque en CI), O-THISRS-2/3, O-NATS-OUT, O-COG, O-REACTIVE.
 
 ## Ce dont PO dépend dans obrain (dépôt `obrain-db/obrain`)
 
-État au 11/11 au soir. Ordre de fusion prévu : #99 → #101 → #117 ; #119 → #121 ; #113 ; #115 → #118. Toute PR reste en **brouillon** jusqu'au verdict du portillon (sept fusions prématurées ce jour : this #249/#251/#252, obrain #108/#110/#114, PO #1165/#1161).
+**État au 23/11/2026 : toutes les PR de ce tableau sont fusionnées** (relevé par `gh pr view -R obrain-db/obrain`, voir la colonne « Fusionnée »). La colonne de droite garde ce que les relectures du 11/11 avaient relevé avant correction : elle dit pourquoi la PR a eu des suites, pas qu'elle est encore ouverte ou « en correction ». Restent ouvertes côté obrain : **#181** (disque ×5,3) et **#189** (traversées multi-sauts très lentes). Rappel de méthode, toujours vrai : une PR reste en **brouillon** jusqu'au verdict du portillon (sept fusions prématurées le 11/11 : this #249/#251/#252, obrain #108/#110/#114, PO #1165/#1161).
 
-| PR | Sujet | État |
+Fusionnées (date de fusion lue sur GitHub) : #110 (11/11), #114 (11/11), #108 (11/11), #115 (11/11), #99 (12/11), #113 (12/11), #118 (12/11), #119 (12/11), #121 (12/11), #101 (13/11), #117 (13/11), #190 (16/11, unicité des relations dans un même `MATCH`, issue #182). Durabilité (issue #120, **close**) : #123, #137, #138 (12/11) et #153 (13/11).
+
+| PR | Sujet | État relevé avant correction (11/11) |
 |---|---|---|
 | #110 | Les tests n'ouvrent plus les bases réelles sous `$HOME` | **fusionnée** (`e871411c`) ; suite #113 (garde contournable, copie sans détection d'écrivain vivant, cibles jamais exécutées) en draft, CI 9/11 verts |
 | #114 | Un `WITH` groupé ne pose plus de projection inutile | **fusionnée** |
@@ -103,15 +123,15 @@ Hors chemin critique : **O-THISRS-1** (socle this-rs monté sous `/_this` à cô
 
 Mesuré sur le premier lot (#1171, bases 0 / 1 M / 5 M, opt-level 3) : `get_project` 128–185 ns indépendant de N ; `create_project` ≤ 256 o = 4–5 ms p50 (fsync WAL) ; `create_project` avec valeur > 256 o = 128 ms → 2,8 s (paie le flush complet) ; ouverture 5 ms (vide), 37 ms (1 M neuf), 1,0 s (1 M hérité), 91 ms (5 M neuf), 5,6 s (5 M hérité) — le format hérité coûte ×10 à ×60. Unicité (#99/#117) : `UNIQUE` entier 22–47 µs/écriture de 100 k à 5 M ; composite 23–42 µs ; flottant non entier 26 ms (100 k) → 237 ms (1 M).
 
-Après le retrait du flush complet par écriture (cette PR, obrain `e5648dbf`) : une valeur > 256 o paie le MÊME fsync WAL qu'une valeur ≤ 256 o — mesuré en debug sur 10 k nœuds / 20 k arêtes, `create_blob_p50` = 4,3 ms contre `create_wal_p50` = 5,2 ms, là où le pas « flush complet après chaque écriture » (`create_flush_complet_p50`) reste à 40,7 ms. Le test `a_write_past_the_blob_threshold_pays_no_full_flush` verrouille l'égalité des fsyncs (rouge sans le correctif, vert avec), et `kill9_during_creations…` rejoue les descriptions longues depuis le WAL.
+Après le retrait du flush complet par écriture (PR de l'époque, 11/11, obrain `e5648dbf`) : une valeur > 256 o paie le MÊME fsync WAL qu'une valeur ≤ 256 o — mesuré en debug sur 10 k nœuds / 20 k arêtes, `create_blob_p50` = 4,3 ms contre `create_wal_p50` = 5,2 ms, là où le pas « flush complet après chaque écriture » (`create_flush_complet_p50`) reste à 40,7 ms. Le test `a_write_past_the_blob_threshold_pays_no_full_flush` verrouille l'égalité des fsyncs (rouge sans le correctif, vert avec), et `kill9_during_creations…` rejoue les descriptions longues depuis le WAL.
 
 Mesuré sur `main` d'obrain (`c4b6ada9`) : `MATCH (n) WITH n.p AS p, count(*) AS c RETURN p, c` échoue en Cypher (`Undefined variable 'p'`) et passe en GQL ; un second `MATCH` dont la cible est déjà liée rend 36 lignes au lieu de 14 en Cypher. #108 et ses suites #119 et #121 sont fusionnées sur `main` d'obrain et incluses dans l'épingle `e5648dbf` (de même que #99, #115 et #118 ; #117 n'y est pas) ; ces deux mesures n'ont PAS été refaites à `e5648dbf`, et les réserves de relecture notées plus haut sur #119/#121 n'ont pas été re-vérifiées. Le backend obrain de PO passe donc toujours par l'API Rust, jamais par une requête, jusqu'à un lot qui mesure les requêtes dont il a besoin.
 
 ## Migration des données : ce qui est établi
 
 - **Source figée** : copie du volume Neo4j vivant monté en lecture seule, prise le 11/11 à 11:36 UTC, servie par un Neo4j jetable (ports 27474 / 27687). **3 901 702 nœuds, 6 013 360 relations**, 64 labels peuplés sur 70, 80 types de relation sur 82, un seul label par nœud. Deux méthodes de comptage indépendantes concordent. Détail : `docs/cartographie/22-copie-figee.md` (PR #1163).
-- **Convertisseur existant** (`obrain/neo4j2obrain`) : ne satisfait pas « aucune perte » (nulls retirés des listes, dates aplaties en texte).
-- **Volume** : la cible obrain du seul sous-ensemble sans `ChatEvent` (~1,2 M nœuds) pèse 16 Go, contre 14,6 Go pour la source Neo4j entière. À expliquer avant la migration.
+- **Convertisseur existant** (`obrain/neo4j2obrain`) : ne satisfait pas « aucune perte » (nulls retirés des listes, dates aplaties en texte). **Remplacé par le migrateur réel du dépôt** (`src/storage/migrator/`, feature `obrain-backend`, #1256) ; son état est la porte **G7** de `docs/migration/GATES.md` : comptes par type, empreinte par label et zéro quarantaine démontrés sur une base jetable de 13 nœuds, **nanosecondes tronquées non résolu**, **non rejoué sur la copie complète**.
+- **Volume** : mesuré le 15/11 sur la copie complète (run4), **35 Go alloués sur obrain contre 12 Go sur Neo4j**, surcoût concentré dans `substrate.props.v2` (×5,3 ; une chaîne de pages par nœud). Ticket moteur obrain **#181**, toujours ouvert au 23/11 ; tâche PO DISQUE-x3. L'ancienne mesure (16 Go pour un sous-ensemble sans `ChatEvent`) est dépassée.
 
 ## Portage de `GraphStore` : vagues
 
@@ -125,6 +145,8 @@ Compté dans le code : 724 méthodes à porter, dont 198 dures (agrégats dans `
 | V3 | Chat-reste, Decision, Commit, Note, Sharing, Code | 209 (79) |
 | V4 | FeatureGraph, Skill, Persona | 72 (20) |
 | V5 | Analytics en 13 sous-lots, cascade de suppression de projet | 127 (58) |
+
+**État au 23/11** : les domaines des vagues V1 à V4 sont portés (voir « Fait sur cette branche »), **Decision et Plan par leur noyau seulement** (#1195, #1191 puis #1210, #1214 : le reste refuse par nom), V5 en partie (79 des 145 méthodes d'`AnalyticsStore`). Le cliquet des traits portés (G2 de `GATES.md`) est le compte opposable ; ce tableau est le plan de découpe, pas un état.
 
 Les domaines d'une vague se portent en parallèle à condition d'écrire un fichier par sous-trait côté obrain. **Premier jalon visible : un chat de bout en bout sur obrain = 44 méthodes** (Project 4, Chat 40), toutes en V1 ; +17 si l'authentification est active (estimation par graphe d'appels, pas par exécution).
 
@@ -140,7 +162,7 @@ Classement des 145 méthodes de `AnalyticsStore` (`src/neo4j/traits.rs`), fait l
 
 | Sous-lot | Contenu | Méthodes | Écr. | Lect. | Dures | Dépend de (domaines) | État |
 |---|---|---|---|---|---|---|---|
-| **A1** | Profils d'analyse, règles de topologie, profils utilisateur + `WORKS_ON`, bras et décisions de routage, frustration, parent d'étape, `health_check`, réglages LLM par clé, `run_data_migrations` | 26 | 13 | 13 | 0 | projet, tâches (index), chat (réglages) | **porté** (cette PR) |
+| **A1** | Profils d'analyse, règles de topologie, profils utilisateur + `WORKS_ON`, bras et décisions de routage, frustration, parent d'étape, `health_check`, réglages LLM par clé, `run_data_migrations` | 26 | 13 | 13 | 0 | projet, tâches (index), chat (réglages) | **porté** (#1250) |
 | A2 | Synapses de notes, énergie, cicatrices, consolidation, `init_note_energy`, synapses inter-entités, graphe de synapses (skills) | 24 | 13 | 11 | 8 | notes, décisions, projet | **porté en partie** (23 méthodes, voir ci-dessous) |
 | A3 | Synapses fantômes (`shadow_*`, traces, récompense, clôtures de tâche) | 8 | 4 | 4 | 4 | notes, plan, exécutions d'agent | **porté en partie** (7 méthodes, mémoire-maintenance ci-dessous) ; `shadow_trace_closures` refusée (lit `AgentExecution`, non créable sans `Task`, `planrun.rs`) |
 | A4 | Embeddings de fichiers/fonctions, recherche vectorielle, embeddings de notes | 5 | 3 | 2 | 4 | code (`File`/`Function` non portés), index vectoriel obrain 384-d | refusé, nommé |
@@ -171,8 +193,8 @@ Décisions nommées (la tâche demandait de ne pas les prendre en silence) : (1)
 
 ## Sécurité des données (incidents du 11/11)
 
-- **Les tests d'obrain ouvraient les bases réelles** sous `~/.obrain/db` en écriture (`cargo test -p obrain-engine` sur `main`). Tant que #110 n'est pas fusionnée : toute commande `cargo test` / `cargo bench` d'obrain se lance avec un `HOME` vide.
-- **Le mode « lecture seule » d'obrain écrit** (rejeu du journal dans les zones, reconstruction des degrés, création de fichiers). Tant que ce n'est pas corrigé : une base réelle ne se sonde que sur une copie, y compris avec `--read-only`.
+- **Les tests d'obrain ouvraient les bases réelles** sous `~/.obrain/db` en écriture (`cargo test -p obrain-engine` sur `main`). **#110 et sa suite #113 sont fusionnées** (11/11 et 12/11) : une base réelle ne s'ouvre plus que si on la désigne. Par prudence, une commande `cargo test` / `cargo bench` d'obrain sur une machine qui porte une base réelle se lance quand même avec un `HOME` vide tant qu'on n'a pas relu la garde sur l'épingle utilisée.
+- **Le mode « lecture seule » d'obrain écrivait** (rejeu du journal dans les zones, reconstruction des degrés, création de fichiers). **#115 et #118 sont fusionnées** (11/11 et 12/11). La règle pratique reste : une base réelle ne se sonde que sur une copie, y compris avec `--read-only`.
 - **PO** : un binaire de test a ouvert la base vivante parce que les clés de `config.yaml` sont imbriquées. Les tests du backend obrain n'ouvrent que des répertoires temporaires.
 
 ## Les portillons de cette branche (en place)
@@ -184,7 +206,7 @@ Décisions nommées (la tâche demandait de ne pas les prendre en silence) : (1)
 
 Les deux tournent dans le job « Lint & Format », donc ils sont bloquants par héritage — sans toucher à la protection de branche de `main`.
 
-`pins.toml` dit contre QUELS commits on construit. Mettre un `rev` à jour est un acte délibéré, dans le même commit que le besoin qui le motive. **État au 11/11** : `path-pins` est rouge EN LOCAL, parce que les checkouts voisins ont avancé (this-rs de 9 commits, obrain de 20) alors qu'aucune dépendance par chemin n'existe encore dans PO ; il sort 0 en CI, où les voisins sont absents. Les épingles se remontent avec la première dépendance réelle.
+`pins.toml` dit contre QUELS commits on construit. Mettre un `rev` à jour est un acte délibéré, dans le même commit que le besoin qui le motive. **État au 23/11** : `pins.toml` pointe `this` à `61040a2c`, `obrain` à `82467ff1` et `atelier` à `261237bc` ; le `main` de this est à `eec7a96b` et celui d'obrain à `bd9b3b4f` (relevé par l'API GitHub). Le portillon n'a **pas été rejoué** lors de cette relecture ; l'état du 11/11 (rouge en local parce que les voisins avaient avancé, 0 en CI où ils sont absents) n'est donc pas confirmé. Les épingles se remontent dans le commit qui a besoin du nouveau comportement.
 
 `path-pins` ne fait pas de `git fetch` par défaut : un voisin dont le remote est en ssh bloquerait le portillon. `--fetch` l'active.
 
@@ -197,3 +219,20 @@ Conséquences, mesurées le 10/11/2026 :
 - Éditer `backend/` **c'est** éditer le service vivant. La consigne « ne jamais toucher `~/.openclaw/workspace/skills/project-orchestrator` » est donc impossible à tenir en même temps que « éditer `backend/` » : ce sont les mêmes fichiers (même inode).
 - Le `pre-push` partage `CARGO_TARGET_DIR` avec cette copie principale : un build lancé depuis un worktree écrit dans le `target/` du service vivant.
 - D'où la règle : **tout travail passe par un worktree**, jamais par `backend/`. C'est déjà le cas pour cette branche.
+
+## Relecture du 23/11/2026 : ce qui a été vérifié, et ce qui ne l'a pas été
+
+Ce fichier avait dérivé : son en-tête et ses tableaux « En cours », « À faire » et « Ce dont PO dépend dans obrain » disaient l'état du 11/11, alors que le corps avait été enrichi jusqu'au 21/11 (sous-lots d'`AnalyticsStore`). Une relecture contre le réel a corrigé les lignes périmées.
+
+**Relevé directement (commande rejouable)**
+- Avance et retard de la branche : `git rev-list --left-right --count origin/main...origin/consolidation/obrain-default` → 3 / 141.
+- Ce qui est entré depuis le 11/11 : `git log --first-parent origin/consolidation/obrain-default --since=2026-11-11` (82 entrées).
+- État de chaque PR et issue citée : `gh pr view` / `gh issue view` sur `this-rs/project-orchestrator`, `obrain-db/obrain`, `this-rs/this`. Un premier listage par `gh pr list --search` mélangeait des PR fusionnées à des PR ouvertes ; seul `--state open --base consolidation/obrain-default` (vide) et la lecture PR par PR font foi.
+- Fabrique de stockage : `ObrainTrajectoryStore` dans `src/storage/mod.rs`. Épingles : `pins.toml`. Têtes de `main` de this et d'obrain : API GitHub.
+- Définition et état des portes : `docs/migration/GATES.md`, lu en entier jusqu'à G4 ; G5 à G11 repris de son tableau d'ensemble.
+
+**Non vérifié (à ne pas lire comme confirmé)**
+- Le plan PO `bf3ab074` (trop volumineux pour une lecture complète) : les statuts de ses tâches n'ont pas été relus. Le plan jumeau `250c63fb` l'a été : MIGRATEUR-REEL y reste « pending » alors que #1256 est fusionné, à corriger côté plan.
+- Aucune porte n'a été rejouée : ni `cargo xtask path-pins`, ni le test du cliquet, ni G6 (parité de lecture sur copie).
+- Les chiffres de performance (barre de la nanoseconde, 8,3 → 0,7 ms, etc.) et le recall@10 viennent des mesures datées de ce fichier, non refaites.
+- L'état des PR de la file de lots #1214, #1250, #1258 est déduit du journal de la branche (elles y figurent), pas d'un `gh pr view`.
