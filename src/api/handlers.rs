@@ -2182,9 +2182,10 @@ async fn listen_delegation_result(
     // delegation ends when the child has nothing left to do, on the LAST `Result` it gave —
     // the spend it states is cumulative, so the later one is also the true total.
     //
-    // Every `break` leaves `execution` to drop: closed `failed` (channel closed with nothing
-    // to close on). Every other end — a `Result` with nothing left behind it, the child's
-    // death, the delay — goes through ONE closure (`DelegationClosure::finish`, PYSR-3b).
+    // Every end — a `Result` with nothing left behind it, the child's death, the delay, a
+    // channel closed with nothing to close on — goes through ONE closure
+    // (`DelegationClosure::finish`, PYSR-3b), which closes the execution AND wakes the parent
+    // (#1272). The loop never falls through: only a `return` leaves it.
     let mut ended_turn: Option<(DelegationEnd, Option<serde_json::Value>)> = None;
     // Whether a NEW turn began since `ended_turn` (#1239). Decided on the ORDER of the events
     // of this one channel — `StreamingStatus { true }` (emitted when a turn starts) comes
@@ -2313,12 +2314,18 @@ async fn listen_delegation_result(
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 // The child left with nothing more to say: close on its last finished turn,
-                // otherwise `failed` (the `execution` drop, below).
+                // otherwise `failed`. Both go through the closure, so the parent is woken
+                // (#1272): a bare `break` dropped the execution, and a drop closes it without
+                // notifying the session that delegated.
                 if let Some((end, cost_detail)) = ended_turn.take() {
                     return closure.finish(end, cost_detail, execution).await;
                 }
                 tracing::warn!(task_id = %task_id, "Delegation channel closed");
-                break;
+                let end = DelegationEnd {
+                    duration_secs: Some(start.elapsed().as_secs_f64()),
+                    ..DelegationEnd::failed()
+                };
+                return closure.finish(end, None, execution).await;
             }
             Err(_) => {
                 // The tick: close on the finished turn once the child has nothing left to do
@@ -2333,7 +2340,6 @@ async fn listen_delegation_result(
             }
         }
     }
-    None
 }
 
 /// How often the listener polls its channel while the child works and says nothing.
