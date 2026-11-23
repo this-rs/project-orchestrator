@@ -920,14 +920,36 @@ jobs:
             '  key: "test-master-key"' \
             > config.yaml
 
+      # The server loads its embedding model at startup (fastembed, `.fastembed_cache` in the
+      # working directory) and downloads it when it is not there. With no cache, every run
+      # fetched it from the network inside the health wait below: on 23/11/2026 this job ended
+      # `exit 124` four times out of six, on unrelated PRs, each time right after
+      # "NATS not configured" — the line a green run follows with "FastEmbed provider
+      # initialized" seven seconds later. Like the cargo caches, only main writes it.
+      - name: Restore the embedding model
+        id: embedding-model
+        uses: actions/cache/restore@v6
+        with:
+          path: .fastembed_cache
+          key: fastembed-model-${{ runner.os }}-multilingual-e5-base-${{ env.CACHE_VERSION }}
+
       - name: Start server in background
         env:
           RUST_LOG: info
         run: |
           ./target/release/orchestrator serve --port 8080 &
           echo "Waiting for server to start..."
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
+          # 300 s, not 60: a run that finds no cached model (the first one after the key
+          # changes, or before main has saved it) still has to download it and pass.
+          timeout 300 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
           echo "Server is ready!"
+
+      - name: Save the embedding model (main only)
+        if: steps.embedding-model.outputs.cache-hit != 'true' && env.CACHE_SAVE == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .fastembed_cache
+          key: ${{ steps.embedding-model.outputs.cache-primary-key }}
 
       - name: Run API tests
         run: cargo test --test api_tests

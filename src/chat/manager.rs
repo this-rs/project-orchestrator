@@ -11614,10 +11614,22 @@ impl ChatManager {
             auto_continue,
         )) = session_state
         else {
+            // Held by the agent engine (#1271): the message reaches the live session the way
+            // a hint does — queued behind a running turn without interrupting it, a turn of
+            // its own when the session is idle — under the same `[team name]` prefix the
+            // Claude Code engine gives the prompt. It used to answer "not found" for a
+            // delegated child that was alive.
+            if let Some(handle) = self.agent_runtime.get(to_session_id).await {
+                // Queued or sent as a TEAM message (the peer's raw text and sender; the prefix
+                // is what the model reads): see `AgentSessionHandle::inject_team_message`.
+                return handle
+                    .inject_team_message(text, from_session_id, from_name)
+                    .await;
+            }
             // Not live on the Claude Code engine. A session released because its segment
             // was Done is resumed by the message, as a person's message would resume it;
-            // anything else (closed by a person, idle cleanup, never existed, held by the
-            // agent engine) stays "not found".
+            // anything else (closed by a person, idle cleanup, never existed) stays
+            // "not found".
             let released = self
                 .released_done
                 .lock()

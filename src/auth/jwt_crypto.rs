@@ -177,11 +177,11 @@ mod tests {
 
     #[test]
     fn hs256_round_trips() {
-        let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef");
+        let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap();
         let token = encode(&Header::default(), &claims(), &key).unwrap();
         let back: TokenData<C> = decode(
             &token,
-            &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef"),
+            &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap(),
             &Validation::new(Algorithm::HS256),
         )
         .unwrap();
@@ -193,12 +193,12 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims(),
-            &EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef"),
+            &EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap(),
         )
         .unwrap();
         let err = decode::<C>(
             &token,
-            &DecodingKey::from_secret(b"fedcba9876543210fedcba9876543210"),
+            &DecodingKey::from_secret(b"fedcba9876543210fedcba9876543210").unwrap(),
             &Validation::new(Algorithm::HS256),
         )
         .unwrap_err();
@@ -208,11 +208,11 @@ mod tests {
     #[test]
     fn hs384_and_hs512_work_too() {
         for alg in [Algorithm::HS384, Algorithm::HS512] {
-            let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef");
+            let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap();
             let token = encode(&Header::new(alg), &claims(), &key).unwrap();
             decode::<C>(
                 &token,
-                &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef"),
+                &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap(),
                 &Validation::new(alg),
             )
             .unwrap();
@@ -222,14 +222,14 @@ mod tests {
     #[test]
     fn a_non_hmac_algorithm_is_refused_by_the_provider() {
         ensure_installed();
-        let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef");
+        let key = EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap();
         for alg in [Algorithm::RS256, Algorithm::ES256, Algorithm::EdDSA] {
             assert!(
                 signer(&alg, &key).is_err(),
                 "{alg:?} must not be signable here"
             );
             assert!(
-                verifier(&alg, &DecodingKey::from_secret(b"k")).is_err(),
+                verifier(&alg, &DecodingKey::from_secret(b"k").unwrap()).is_err(),
                 "{alg:?} must not be verifiable here"
             );
         }
@@ -242,7 +242,7 @@ mod tests {
             "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1IiwiZXhwIjo5OTk5OTk5OTk5fQ.AAAA";
         let r = decode::<C>(
             forged,
-            &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef"),
+            &DecodingKey::from_secret(b"0123456789abcdef0123456789abcdef").unwrap(),
             &Validation::new(Algorithm::HS256),
         );
         assert!(r.is_err());
