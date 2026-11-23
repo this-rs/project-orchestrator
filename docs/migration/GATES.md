@@ -185,7 +185,7 @@ démontre pas une copie « strictement identique » à la source. Trois points p
    Le marqueur de base PO (`po-obrain-base`) doit exister pour cette ouverture ; il est retiré en
    cas de refus, et le marqueur de fin `.po-migration-done` n'est écrit qu'après.
 2. **Datetimes : la troncature à la microseconde vient de la représentation choisie et des
-   lecteurs, pas du stockage d'obrain.** Au rev épinglé `82467ff`, `Timestamp` stocke des
+   lecteurs, pas du stockage d'obrain.** Au rev épinglé `345d5ea7`, `Timestamp` stocke des
    **nanosecondes** (`obrain-common/src/types/timestamp.rs` l.17) ; seul `ZonedDatetime` stocke des
    microsecondes (`zoned_datetime.rs` l.16-17, champ `utc_micros` l.44). La copie convertit vers `ZonedDatetime`, et les
    décodeurs de PO lisent par `as_micros` : c'est là que les nanosecondes se perdent. Une piste
