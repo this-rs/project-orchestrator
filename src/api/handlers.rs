@@ -2357,6 +2357,28 @@ async fn listen_delegation_result(
                 // A turn began (`true`) after the finished one, or this turn ended (`false`).
                 new_turn_since_end = is_streaming && ended_turn.is_some();
             }
+            Ok(Ok(crate::chat::types::ChatEvent::ProviderSwitched { to_provider, .. })) => {
+                // The child's provider was switched IN PLACE (#1301): its event channel was
+                // replaced, and this one — on which this event is the last word — stays open
+                // and mute, so the child's `Result` would never be heard and the delegation
+                // would only end at its delay, stopping a child that finished long ago. Follow
+                // the session onto its new channel. Events sent between the switch and this
+                // subscription are lost, like a `Lagged`: take the same prudent path.
+                if let Some(next) = match &closure.halt {
+                    Some(halt) => halt.resubscribe().await,
+                    None => None,
+                } {
+                    // A switch that kept the channel needs no move, and a move would drop
+                    // what is already queued on this receiver, a `Result` among it.
+                    if !rx.same_channel(&next) {
+                        tracing::info!(task_id = %task_id, %to_provider, "Delegation: the child's provider changed in place; following it on its new channel");
+                        rx = next;
+                        new_turn_since_end = true;
+                    }
+                } else {
+                    tracing::warn!(task_id = %task_id, %to_provider, "Delegation: the child's provider changed in place and its new channel could not be followed; the delegation can only end at its delay");
+                }
+            }
             Ok(Ok(_)) => {
                 // Other event types — keep listening
             }
@@ -2676,6 +2698,15 @@ pub(crate) trait DelegationHalt: Send + Sync {
     /// The session is closed with every session it spawned (cascade): a sub-agent of the
     /// child does not outlive the stop.
     async fn close(&self);
+    /// A fresh subscription to the child's CURRENT event channel (#1301). An in-place provider
+    /// switch replaces the session's channel: the one the listener holds then stays open and
+    /// mute, and the child's `Result` goes out on the new one. `None` = no way to follow it
+    /// (the default): the listener keeps the channel it has, bounded by the delegation's delay.
+    async fn resubscribe(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>> {
+        None
+    }
 }
 
 /// [`DelegationHalt`] on a chat session.
@@ -2686,6 +2717,18 @@ struct HaltSession {
 
 #[async_trait::async_trait]
 impl DelegationHalt for HaltSession {
+    async fn resubscribe(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>> {
+        match self.manager.subscribe(&self.session_id).await {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                tracing::warn!(session_id = %self.session_id, "following the child through a provider switch: {e}");
+                None
+            }
+        }
+    }
+
     async fn is_working(&self) -> bool {
         self.manager.is_session_working(&self.session_id).await
     }
@@ -10393,6 +10436,100 @@ pub(crate) mod tests {
         assert!(told.contains("status=\"failed\""), "{told}");
     }
 
+    /// The switch statement an in-place provider switch leaves on the channel it replaces.
+    fn a_provider_switch() -> crate::chat::types::ChatEvent {
+        crate::chat::types::ChatEvent::ProviderSwitched {
+            session_id: "child".to_string(),
+            from_provider: "claude-code".to_string(),
+            to_provider: "deepseek".to_string(),
+            model: "child-model".to_string(),
+            relayed_entries: None,
+            omitted_entries: None,
+        }
+    }
+
+    /// Listens on `channel` with `halt` as the handle on the child, with nothing else wired.
+    async fn listen_with(
+        channel: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        task_id: Uuid,
+        execution: super::DelegationExecution,
+        halt: Arc<dyn super::DelegationHalt>,
+    ) {
+        super::listen_delegation_result(
+            channel,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt),
+        )
+        .await;
+    }
+
+    /// #1301 — the child's provider is switched IN PLACE: its channel is replaced, and the
+    /// old one stays open and mute after `provider_switched`. The listener followed the old
+    /// one for good, never heard the `Result` the child gave on the new one, and the
+    /// delegation only ended at its delay (stopping a child that had finished long before).
+    /// It now follows the session onto its new channel and ends `completed`.
+    #[tokio::test]
+    async fn a_delegation_follows_its_child_through_an_in_place_provider_switch() {
+        let (mut parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+
+        // The old channel: the switch statement, then nothing — and it is NOT closed.
+        let (old_tx, old_channel) = tokio::sync::broadcast::channel(16);
+        old_tx.send(a_provider_switch()).unwrap();
+        // The new channel: where the child's `Result` goes out.
+        let (new_tx, new_channel) = tokio::sync::broadcast::channel(16);
+        new_tx
+            .send(delegation_result(Some(0.01), None, None))
+            .unwrap();
+        let halt = Arc::new(HaltRecorder::moved_to(new_channel));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listen_with(old_channel, task_id, execution, halt),
+        )
+        .await
+        .expect("the delegation never heard the child's Result: it stayed on the replaced channel");
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"completed\""), "{told}");
+        drop(old_tx);
+    }
+
+    /// #1301 — a switch that kept the channel is not a move: what is already queued on the
+    /// receiver, a `Result` among it, must not be dropped by following it.
+    #[tokio::test]
+    async fn a_provider_switch_that_kept_the_channel_loses_nothing_queued() {
+        let (mut parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+
+        let (tx, channel) = tokio::sync::broadcast::channel(16);
+        tx.send(a_provider_switch()).unwrap();
+        tx.send(delegation_result(Some(0.01), None, None)).unwrap();
+        // The same channel again, as `ChatManager::subscribe` gives it back: a receiver that
+        // starts at the TAIL, after the two events above. Swapping the listener's receiver
+        // for it would lose the `Result` queued on the first one.
+        let same = tx.subscribe();
+        let halt = Arc::new(HaltRecorder::moved_to(same));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listen_with(channel, task_id, execution, halt),
+        )
+        .await
+        .expect("the Result queued behind the switch statement was dropped");
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"completed\""), "{told}");
+        drop(tx);
+    }
+
     /// #1272 — a delegation nobody could listen to (its prompt was refused, its channel
     /// could not be subscribed) is not left to its drop either: it is closed `failed`, the
     /// session that delegated is woken, and the `delegation_failed` that pairs with
@@ -10550,9 +10687,23 @@ pub(crate) mod tests {
         on_interrupt:
             std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>>>,
         result: std::sync::Mutex<Option<crate::chat::types::ChatEvent>>,
+        /// The channel an in-place provider switch moved the child onto (#1301): what
+        /// `resubscribe` hands back, once.
+        moved_to: std::sync::Mutex<
+            Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>>,
+        >,
     }
 
     impl HaltRecorder {
+        /// The child's channel is replaced by `channel` when its provider is switched.
+        fn moved_to(
+            channel: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        ) -> Self {
+            Self {
+                moved_to: std::sync::Mutex::new(Some(channel)),
+                ..Default::default()
+            }
+        }
         fn answering(
             tx: tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>,
             result: crate::chat::types::ChatEvent,
@@ -10590,6 +10741,11 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl super::DelegationHalt for HaltRecorder {
+        async fn resubscribe(
+            &self,
+        ) -> Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>> {
+            self.moved_to.lock().unwrap().take()
+        }
         async fn is_turn_running(&self) -> bool {
             self.turn_running.load(std::sync::atomic::Ordering::SeqCst)
         }
