@@ -29,6 +29,13 @@ pub struct Losses {
     pub no_equivalent: u64,
     /// An embedding with an element not representable in f32: kept as a list.
     pub inexact_vector: u64,
+    /// A SIGNED instant (a tombstone's `issued_at`, see [`SIGNED_INSTANTS`]) whose
+    /// nanoseconds are not a multiple of 1 000: REFUSED. The Ed25519 payload covers
+    /// `issued_at` at nanosecond precision (`sharing::tombstone::build_signing_payload`),
+    /// and obrain stores microseconds: truncating it would make the signature
+    /// invalid after the copy, and neither the counts nor the fingerprint would
+    /// show it. Unlike `sub_microsecond`, this is NOT an accepted narrowing.
+    pub signed_instant_narrowed: u64,
 }
 
 impl Losses {
@@ -52,6 +59,11 @@ impl Losses {
                 "local datetime(s) (obrain stores a UTC instant)",
             ),
             (self.no_equivalent, "value(s) with no equivalent type"),
+            (
+                self.signed_instant_narrowed,
+                "signed instant(s) with sub-microsecond nanoseconds (a tombstone's `issued_at`: \
+                 its signature covers the nanoseconds and obrain stores microseconds)",
+            ),
         ] {
             if n > 0 {
                 causes.push(format!("{n} {what}"));
@@ -66,6 +78,27 @@ impl Losses {
         self.local_datetime += o.local_datetime;
         self.no_equivalent += o.no_equivalent;
         self.inexact_vector += o.inexact_vector;
+        self.signed_instant_narrowed += o.signed_instant_narrowed;
+    }
+}
+
+/// `(label, property)` pairs whose value is covered by a signature at nanosecond
+/// precision. The general rule is to truncate datetimes to the microsecond and
+/// count them (see [`Losses::sub_microsecond`]); for these, a truncation is a
+/// corruption, so the copy refuses instead (docs/migration/GATES.md, G7).
+/// Add a pair here when a new signed payload embeds a stored instant.
+const SIGNED_INSTANTS: &[(&str, &str)] = &[("Tombstone", "issued_at")];
+
+/// Record, in [`Losses::signed_instant_narrowed`], a signed instant that the
+/// conversion of `value` would truncate. A no-op for any other `(label, key)`,
+/// and for a value that is not a datetime.
+pub(super) fn note_signed_instant(label: &str, key: &str, value: &BoltType, losses: &mut Losses) {
+    if !SIGNED_INSTANTS.contains(&(label, key)) {
+        return;
+    }
+    let mut probe = Losses::default();
+    if import_value(key, value, &mut probe).is_ok() && probe.sub_microsecond > 0 {
+        losses.signed_instant_narrowed += 1;
     }
 }
 
@@ -282,6 +315,47 @@ mod tests {
         ] {
             assert!(l.refusal().is_some(), "{l:?}");
         }
+    }
+
+    fn bolt_datetime(rfc3339: &str) -> BoltType {
+        BoltType::DateTime(neo4rs::BoltDateTime::from(
+            chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn a_signed_tombstone_instant_with_nanoseconds_refuses_the_copy() {
+        let mut l = Losses::default();
+        note_signed_instant(
+            "Tombstone",
+            "issued_at",
+            &bolt_datetime("2026-11-20T10:00:00.123456789Z"),
+            &mut l,
+        );
+        assert_eq!(l.signed_instant_narrowed, 1);
+        let why = l.refusal().expect("a truncated signed instant is refused");
+        assert!(why.contains("issued_at"), "{why}");
+    }
+
+    #[test]
+    fn the_signed_instant_guard_refuses_only_what_a_signature_covers() {
+        let nanos = bolt_datetime("2026-11-20T10:00:00.123456789Z");
+        let aligned = bolt_datetime("2026-11-20T10:00:00.123456Z");
+        let mut l = Losses::default();
+        // A microsecond-aligned tombstone instant survives the copy exactly.
+        note_signed_instant("Tombstone", "issued_at", &aligned, &mut l);
+        // The same nanoseconds anywhere else keep the accepted truncation.
+        note_signed_instant("Note", "issued_at", &nanos, &mut l);
+        note_signed_instant("Tombstone", "created_at", &nanos, &mut l);
+        // A value that is not a datetime is not an instant.
+        note_signed_instant(
+            "Tombstone",
+            "issued_at",
+            &BoltType::String(BoltString::new("x")),
+            &mut l,
+        );
+        assert_eq!(l, Losses::default());
+        assert_eq!(l.refusal(), None);
     }
 
     #[test]
