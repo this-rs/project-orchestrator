@@ -1077,6 +1077,26 @@ pub(crate) struct OpeningTurn<'a> {
     pub owner: Option<&'a str>,
 }
 
+/// Marks a session as being switched to another provider IN PLACE, from before its running
+/// turn is cut until the switch has been announced on the channel it replaced (#1301). Held
+/// by `switch_session_provider` for its whole duration, so every exit (success, refusal,
+/// restore after a failed reopen) clears the mark. Read by the delegation listener
+/// ([`ChatManager::is_switching`]): the `Result` of the cut turn is then not the child's end.
+pub(crate) struct SwitchMark<'a> {
+    manager: &'a ChatManager,
+    session_id: String,
+}
+
+impl Drop for SwitchMark<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .switching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
+    }
+}
+
 /// Manages chat sessions and their lifecycle
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
@@ -1246,6 +1266,9 @@ pub struct ChatManager {
     /// Done. Only those are resumed by a team message (`inject_team_message`); any other
     /// close (a person's, the idle cleanup's) clears the mark.
     pub(crate) released_done: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Sessions whose provider is being switched in place right now (#1301): see
+    /// [`SwitchMark`] and [`Self::is_switching`].
+    pub(crate) switching: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Test seam: runs in the release loop after the second verdict read, before the
     /// recheck, so a test can make a session busy at exactly that point.
     #[cfg(test)]
@@ -4005,6 +4028,7 @@ impl ChatManager {
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
             released_done: Default::default(),
+            switching: Default::default(),
             #[cfg(test)]
             release_hook: Default::default(),
             #[cfg(test)]
@@ -4127,6 +4151,7 @@ impl ChatManager {
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
             released_done: Default::default(),
+            switching: Default::default(),
             #[cfg(test)]
             release_hook: Default::default(),
             #[cfg(test)]
@@ -12787,6 +12812,11 @@ impl ChatManager {
         self.authorize_provider_switch(&node, provider, &target_model, claims.as_ref())
             .await?;
 
+        // From here to the end of this function the session is SWITCHING (#1301): the
+        // delegation listener of a delegated child reads the mark to hold the `Result` of the
+        // turn cut just below instead of taking it for the child's end. Every exit clears it.
+        let _switching = self.mark_switching(session_id);
+
         // A turn still streaming is cut by the move: keep the answer it had produced before the
         // conversation so far is read from what was stored.
         self.settle_cut_turn(session_id).await;
@@ -14754,6 +14784,29 @@ impl ChatManager {
         self.graph
             .get_chat_events(uuid, after_seq, 10000) // generous limit for replay
             .await
+    }
+
+    /// Whether `session_id` is being switched to another provider in place right now
+    /// (#1301): from before its running turn is cut until the switch is announced on the
+    /// channel it replaced. The delegation listener reads it to tell the `Result` of a cut
+    /// turn from the child's end.
+    pub(crate) fn is_switching(&self, session_id: &str) -> bool {
+        self.switching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+    }
+
+    /// Marks `session_id` as switching for as long as the returned guard lives.
+    fn mark_switching(&self, session_id: &str) -> SwitchMark<'_> {
+        self.switching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string());
+        SwitchMark {
+            manager: self,
+            session_id: session_id.to_string(),
+        }
     }
 
     /// Whether the session is working: a turn running (or a mirrored turn) or a background
