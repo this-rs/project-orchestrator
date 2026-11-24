@@ -173,7 +173,10 @@ async fn counts(graph: &Graph, cypher: &str) -> Result<BTreeMap<String, usize>> 
     Ok(out)
 }
 
-fn props_of(row: &Row, losses: &mut Losses) -> Result<Props> {
+/// `label` is the label of the node the row belongs to (`""` for a link): the
+/// conversion of a few `(label, property)` pairs is stricter than the general
+/// rule, see `conv::note_signed_instant`.
+fn props_of(row: &Row, label: &str, losses: &mut Losses) -> Result<Props> {
     // A row that does not carry its properties as a map is a FAILED READ, not an
     // entity without properties: reading it as empty would make the fingerprint
     // agree on a loss.
@@ -186,6 +189,7 @@ fn props_of(row: &Row, losses: &mut Losses) -> Result<Props> {
     for (k, v) in &map.value {
         let value = import_value(k.value.as_str(), v, losses)
             .map_err(|e| anyhow::anyhow!("property '{}': {e}", k.value))?;
+        conv::note_signed_instant(label, k.value.as_str(), v, losses);
         props.push((intern(&k.value), value));
     }
     Ok(props)
@@ -388,7 +392,7 @@ async fn copy_into(
                     src: row.get("s")?,
                     dst: row.get("d")?,
                     kind: t2.index(&row.get::<String>("t")?)?,
-                    props: props_of(row, &mut losses)?,
+                    props: props_of(row, "", &mut losses)?,
                 });
             }
             Ok((v, losses))
@@ -487,7 +491,7 @@ async fn copy_into(
                 (first..first + size).contains(&rank),
                 "node {id} answered outside its batch"
             );
-            packet[rank - first] = props_of(row, &mut losses)?;
+            packet[rank - first] = props_of(row, ln2[lk2[rank] as usize].as_str(), &mut losses)?;
             seen[rank - first] = true;
         }
         // The source is read live, not frozen: a node deleted since phase A is
@@ -677,10 +681,10 @@ mod tests {
     fn a_row_whose_properties_are_not_a_map_fails_instead_of_reading_empty() {
         let mut l = Losses::default();
         let not_a_map = row(&["p"], vec![BoltType::Integer(neo4rs::BoltInteger::new(1))]);
-        let err = props_of(&not_a_map, &mut l).unwrap_err().to_string();
+        let err = props_of(&not_a_map, "", &mut l).unwrap_err().to_string();
         assert!(err.contains("not a map"), "{err}");
         let absent = row(&["i"], vec![BoltType::Integer(neo4rs::BoltInteger::new(1))]);
-        let err = props_of(&absent, &mut l).unwrap_err().to_string();
+        let err = props_of(&absent, "", &mut l).unwrap_err().to_string();
         assert!(err.contains("cannot be read"), "{err}");
         let empty = row(
             &["p"],
@@ -688,7 +692,35 @@ mod tests {
                 value: Default::default(),
             })],
         );
-        assert!(props_of(&empty, &mut l).unwrap().is_empty());
+        assert!(props_of(&empty, "", &mut l).unwrap().is_empty());
+    }
+
+    /// The glue, not only the guard: a row read from the source as a `Tombstone`
+    /// whose `issued_at` has nanoseconds fails the early refusal check by name,
+    /// and the same row under another label does not.
+    #[test]
+    fn a_tombstone_row_with_nanoseconds_fails_the_early_check_and_a_note_row_does_not() {
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            neo4rs::BoltString::new("issued_at"),
+            BoltType::DateTime(neo4rs::BoltDateTime::from(
+                chrono::DateTime::parse_from_rfc3339("2026-11-20T10:00:00.123456789Z").unwrap(),
+            )),
+        );
+        let r = row(
+            &["p"],
+            vec![BoltType::Map(neo4rs::BoltMap { value: props })],
+        );
+
+        let mut l = Losses::default();
+        props_of(&r, "Tombstone", &mut l).unwrap();
+        let err = check_no_refusal(&l).unwrap_err().to_string();
+        assert!(err.contains("issued_at"), "{err}");
+
+        let mut l = Losses::default();
+        props_of(&r, "Note", &mut l).unwrap();
+        check_no_refusal(&l).expect("the accepted truncation still passes elsewhere");
+        assert_eq!(l.sub_microsecond, 1, "and it is still counted");
     }
 
     // ── The checks that follow the write, without Neo4j ───────────────────
