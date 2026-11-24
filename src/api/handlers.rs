@@ -2247,6 +2247,15 @@ async fn listen_delegation_result(
     // after the fact (`is_turn_running`): the runtime resets its streaming flag with no
     // synchronisation with the emission of the death, so a late read could see « no turn ».
     let mut new_turn_since_end = false;
+    // A turn cut by an in-place provider switch of the child (#1301): its `Result` is held
+    // aside, not read as the delegation's end, until the switch is followed (the child goes
+    // on; the held turn is dropped) or turns out not to reach this channel (closed on it).
+    let mut cut_turn: Option<(DelegationEnd, Option<serde_json::Value>)> = None;
+    // When the listener followed the child onto a new channel and has heard nothing on it
+    // yet (#1301): a `Result` sent before the subscription is lost for good — unlike a
+    // `Lagged`, nothing follows a `Result` — so a child found idle and silent for
+    // `SWITCH_SILENCE_GRACE` after the switch has ended unseen.
+    let mut unheard_switch: Option<tokio::time::Instant> = None;
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -2304,17 +2313,33 @@ async fn listen_delegation_result(
         // Once a turn has ended but the child may still be working, look again soon enough
         // that a delegation which really ended is not held back by a finished task's last
         // bookkeeping. The rest of the time, the 10 s tick is enough.
-        let tick = if ended_turn.is_some() {
+        let tick = if ended_turn.is_some() || cut_turn.is_some() || unheard_switch.is_some() {
             DELEGATION_SETTLE_TICK
         } else {
             DELEGATION_LISTEN_TICK
         };
         match tokio::time::timeout(tick, rx.recv()).await {
             Ok(Ok(result @ crate::chat::types::ChatEvent::Result { .. })) => {
+                unheard_switch = None;
+                let interrupted = matches!(
+                    &result,
+                    crate::chat::types::ChatEvent::Result { stop_reason: Some(r), .. } if r == "interrupted"
+                );
                 let (end, cost_detail) =
                     end_of_result(result, &limits, start.elapsed().as_secs_f64());
                 // This `Result` is the newest turn's end: no turn began since it.
                 new_turn_since_end = false;
+                // The listener never interrupts through this arm (the delay's interrupt reads
+                // its `Result` in `result_after_interrupt`): an interrupted turn here was cut
+                // by someone else — by an in-place provider switch when one is under way
+                // (#1301). That turn is not the child's end: the child goes on, on the new
+                // provider, with the same message relayed. Hold it until the switch is
+                // followed, or until it is clear the switch did not reach this channel.
+                if interrupted && delegation_switching(&closure.halt).await {
+                    tracing::info!(task_id = %task_id, "Delegation: the child's turn was cut by a provider switch; waiting for the switch");
+                    cut_turn = Some((end, cost_detail));
+                    continue;
+                }
                 if delegation_child_has_work(&closure.halt).await {
                     ended_turn = Some((end, cost_detail));
                     continue;
@@ -2354,6 +2379,7 @@ async fn listen_delegation_result(
                 return closure.finish(end, None, execution).await;
             }
             Ok(Ok(crate::chat::types::ChatEvent::StreamingStatus { is_streaming })) => {
+                unheard_switch = None;
                 // A turn began (`true`) after the finished one, or this turn ended (`false`).
                 new_turn_since_end = is_streaming && ended_turn.is_some();
             }
@@ -2374,13 +2400,18 @@ async fn listen_delegation_result(
                         tracing::info!(task_id = %task_id, %to_provider, "Delegation: the child's provider changed in place; following it on its new channel");
                         rx = next;
                         new_turn_since_end = true;
+                        // The turn the switch cut is not the end: the child goes on.
+                        cut_turn = None;
+                        unheard_switch = Some(tokio::time::Instant::now());
                     }
                 } else {
                     tracing::warn!(task_id = %task_id, %to_provider, "Delegation: the child's provider changed in place and its new channel could not be followed; the delegation can only end at its delay");
                 }
             }
             Ok(Ok(_)) => {
-                // Other event types — keep listening
+                // Other event types — keep listening. Anything heard on a channel just
+                // followed says the child is there.
+                unheard_switch = None;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!("Delegation listener lagged by {} events", n);
@@ -2404,6 +2435,37 @@ async fn listen_delegation_result(
                 return closure.finish(end, None, execution).await;
             }
             Err(_) => {
+                // A turn cut by a switch that did not reach this channel after all — the reopen
+                // failed and the old provider was restored, or the switch is over and the
+                // child sits idle: the cut turn is the end, as it was before the switch was
+                // known (#1301).
+                if cut_turn.is_some()
+                    && !delegation_switching(&closure.halt).await
+                    && !delegation_child_has_work(&closure.halt).await
+                {
+                    if let Some((end, cost_detail)) = cut_turn.take() {
+                        tracing::warn!(task_id = %task_id, "Delegation: the switch that cut the child's turn did not reach this channel; closing on the cut turn");
+                        return closure.finish(end, cost_detail, execution).await;
+                    }
+                }
+                // Followed the child onto its new channel, heard nothing on it, and the child
+                // has neither a turn nor work for the grace: its end went out before the
+                // subscription and will never come. Close `failed` now — the work it did
+                // stands, the parent decides — rather than at the delay, which would
+                // interrupt a child that finished long ago (#1301).
+                if let Some(since) = unheard_switch {
+                    if since.elapsed() >= SWITCH_SILENCE_GRACE
+                        && !delegation_child_has_work(&closure.halt).await
+                        && !delegation_turn_running(&closure.halt).await
+                    {
+                        tracing::warn!(task_id = %task_id, "Delegation: nothing heard from the child since its provider switch and it has no work: its end was missed; closing failed");
+                        let end = DelegationEnd {
+                            duration_secs: Some(start.elapsed().as_secs_f64()),
+                            ..DelegationEnd::failed()
+                        };
+                        return closure.finish(end, None, execution).await;
+                    }
+                }
                 // The tick: close on the finished turn once the child has nothing left to do
                 // (the background task it waited on is over), else keep waiting for its wake.
                 if let Some((end, cost_detail)) = ended_turn.take() {
@@ -2446,6 +2508,21 @@ async fn delegation_turn_running(halt: &Option<Arc<dyn DelegationHalt>>) -> bool
         None => false,
     }
 }
+
+/// Whether an in-place provider switch of the child is under way
+/// ([`ChatManager::is_switching`], #1301). Without a handle on the child, none.
+async fn delegation_switching(halt: &Option<Arc<dyn DelegationHalt>>) -> bool {
+    match halt {
+        Some(halt) => halt.is_switching().await,
+        None => false,
+    }
+}
+
+/// How long, after following the child onto the channel an in-place provider switch gave it,
+/// the listener waits for a first sign of it before concluding that the child's end went out
+/// before the subscription (#1301). The reopened provider sets its turn as running before any
+/// event is emitted, so a child that is starting is never idle for this long.
+const SWITCH_SILENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long the listener waits, once it interrupted a delegation past its delay, for the
 /// `Result` of the interrupted turn — what tells what the child spent. Past it the end is
@@ -2707,6 +2784,14 @@ pub(crate) trait DelegationHalt: Send + Sync {
     ) -> Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>> {
         None
     }
+    /// Whether an in-place provider switch of the child is under way (#1301). The switch cuts
+    /// a running turn FIRST, and that turn's `Result { stop_reason: "interrupted" }` reaches
+    /// the listener before `provider_switched` does: read as the delegation's end, it told the
+    /// parent `completed` while the child went on working on the new provider. `false` (the
+    /// default): no switch is known, and an interrupted turn ends the delegation as before.
+    async fn is_switching(&self) -> bool {
+        false
+    }
 }
 
 /// [`DelegationHalt`] on a chat session.
@@ -2727,6 +2812,10 @@ impl DelegationHalt for HaltSession {
                 None
             }
         }
+    }
+
+    async fn is_switching(&self) -> bool {
+        self.manager.is_switching(&self.session_id)
     }
 
     async fn is_working(&self) -> bool {
@@ -10512,9 +10601,11 @@ pub(crate) mod tests {
         let (tx, channel) = tokio::sync::broadcast::channel(16);
         tx.send(a_provider_switch()).unwrap();
         tx.send(delegation_result(Some(0.01), None, None)).unwrap();
-        // The same channel again, as `ChatManager::subscribe` gives it back: a receiver that
-        // starts at the TAIL, after the two events above. Swapping the listener's receiver
-        // for it would lose the `Result` queued on the first one.
+        // A receiver of the SAME channel, positioned at its tail, after the two events above.
+        // `ChatManager::subscribe` always returns the new channel after a real in-place
+        // switch, so production does not reach this case; the guard exists for a
+        // `provider_switched` read on a channel that was not replaced, and swapping the
+        // listener's receiver there would lose the `Result` queued on the first one.
         let same = tx.subscribe();
         let halt = Arc::new(HaltRecorder::moved_to(same));
 
@@ -10528,6 +10619,123 @@ pub(crate) mod tests {
         let told = what_the_parent_is_told(&mut parent, task_id).await;
         assert!(told.contains("status=\"completed\""), "{told}");
         drop(tx);
+    }
+
+    /// The `Result` the agent runtime gives for a turn that was interrupted from outside
+    /// (`agent_runtime.rs`: `subtype` and `stop_reason` both `interrupted`, not an error).
+    fn interrupted_result(cost_usd: Option<f64>) -> crate::chat::types::ChatEvent {
+        let mut result = delegation_result(cost_usd, None, None);
+        if let crate::chat::types::ChatEvent::Result {
+            subtype,
+            stop_reason,
+            ..
+        } = &mut result
+        {
+            *subtype = "interrupted".to_string();
+            *stop_reason = Some("interrupted".to_string());
+        }
+        result
+    }
+
+    /// #1301, review F2 — the child is switched while a turn RUNS. The switch cuts that turn
+    /// first (`settle_cut_turn`): its `Result { stop_reason: "interrupted" }` goes out on the
+    /// old channel ahead of `provider_switched`, and the listener took it for the child's end:
+    /// the parent read `completed` on a partial answer while the child went on, on the new
+    /// provider, with the same message — two agents on one task. While the session is marked
+    /// as switching, the cut turn is held, the switch is followed, and the delegation ends on
+    /// the `Result` the new provider gives.
+    #[tokio::test]
+    async fn a_delegation_whose_child_is_switched_mid_turn_ends_on_the_new_providers_result() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+
+        let (old_tx, old_channel) = tokio::sync::broadcast::channel(16);
+        old_tx.send(interrupted_result(Some(0.01))).unwrap();
+        old_tx.send(a_provider_switch()).unwrap();
+        let (new_tx, new_channel) = tokio::sync::broadcast::channel(16);
+        new_tx
+            .send(delegation_result(Some(0.02), None, None))
+            .unwrap();
+        let halt = Arc::new(HaltRecorder::moved_to(new_channel).switching());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listen_with(old_channel, task_id, execution, halt),
+        )
+        .await
+        .expect("the delegation did not end on the new provider's Result");
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(
+            stored.cost_usd, 0.02,
+            "the delegation was closed on the cut turn, not on the child's real end"
+        );
+        drop(old_tx);
+        drop(new_tx);
+    }
+
+    /// #1301, review F2 — the switch that cut the turn never reaches this channel (the reopen
+    /// failed and the old provider was restored, or the switch ended with the child idle):
+    /// once the session is no longer switching and the child has no work, the held turn is
+    /// the end, as it was before the switch was known. A regression guard for the fallback,
+    /// not a red-without test: without the change the outcome is the same, reached at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_turn_whose_switch_never_reaches_the_listener_ends_the_delegation() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+
+        let (tx, channel) = tokio::sync::broadcast::channel(16);
+        tx.send(interrupted_result(Some(0.01))).unwrap();
+        let halt = Arc::new(HaltRecorder::default().switching());
+        let rolled_back = halt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            rolled_back.switch_over();
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            listen_with(channel, task_id, execution, halt),
+        )
+        .await
+        .expect("the delegation did not close on the cut turn once the switch was over");
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        assert_eq!(stored.cost_usd, 0.01);
+        drop(tx);
+    }
+
+    /// #1301, review F1 — the child's `Result` went out on the new channel BEFORE the listener
+    /// subscribed to it. Unlike a `Lagged`, nothing follows a `Result`: the listener would
+    /// hear nothing until the delegation's delay (3 h by default), then interrupt a child that
+    /// finished long before. Found idle and silent for the grace after the switch, the child
+    /// has ended unseen: the delegation closes `failed` now, and the parent decides.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_whose_end_went_out_before_it_was_followed_ends_failed_not_at_the_delay() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+
+        let (old_tx, old_channel) = tokio::sync::broadcast::channel(16);
+        old_tx.send(a_provider_switch()).unwrap();
+        let (new_tx, _) = tokio::sync::broadcast::channel::<crate::chat::types::ChatEvent>(16);
+        // Sent with no subscriber yet: a receiver made afterwards never sees it.
+        let _ = new_tx.send(delegation_result(Some(0.02), None, None));
+        let new_channel = new_tx.subscribe();
+        let halt = Arc::new(HaltRecorder::moved_to(new_channel));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            listen_with(old_channel, task_id, execution, halt),
+        )
+        .await
+        .expect("the delegation waited for its delay although its child had ended");
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Failed);
+        drop(old_tx);
+        drop(new_tx);
     }
 
     /// #1272 — a delegation nobody could listen to (its prompt was refused, its channel
@@ -10692,9 +10900,22 @@ pub(crate) mod tests {
         moved_to: std::sync::Mutex<
             Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>>,
         >,
+        /// Whether the child's provider is being switched in place (#1301).
+        switching: std::sync::atomic::AtomicBool,
     }
 
     impl HaltRecorder {
+        /// The child's provider is being switched in place, until [`Self::switch_over`].
+        fn switching(self) -> Self {
+            self.switching
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        /// The switch is over (it reached its end, or was rolled back).
+        fn switch_over(&self) {
+            self.switching
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         /// The child's channel is replaced by `channel` when its provider is switched.
         fn moved_to(
             channel: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
@@ -10745,6 +10966,9 @@ pub(crate) mod tests {
             &self,
         ) -> Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>> {
             self.moved_to.lock().unwrap().take()
+        }
+        async fn is_switching(&self) -> bool {
+            self.switching.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn is_turn_running(&self) -> bool {
             self.turn_running.load(std::sync::atomic::Ordering::SeqCst)
