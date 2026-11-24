@@ -10250,12 +10250,6 @@ impl ChatManager {
                     // Now we select! between the two sources so control messages are
                     // processed even when the stream is idle (waiting for permission).
                     let mut interrupted_in_stream = false;
-                    // Set when THIS turn was ended by the backend to pose a question (§15.6):
-                    // the CLI then closes it `subtype: "error_during_execution"` (we interrupted
-                    // it), and that label must not be read as a failure — a failed turn closes
-                    // the question it had just opened (measured 24/11/2026, session 76faba47:
-                    // the card was unanswerable 8 ms after it appeared).
-                    let mut ended_on_question = false;
                     loop {
                         let result = if let Some(ref mut rx) = sdk_control_rx {
                             tokio::select! {
@@ -10311,12 +10305,13 @@ impl ChatManager {
                                                 // answer" and the model would go on without it.
                                                 // Do NOT store in pending_perm_inputs (it's not a permission).
                                                 if let ChatEvent::AskUserQuestion { ref id, .. } = evt {
-                                                    ended_on_question = close_question(
-                                                        stdin_tx_for_auto_allow.as_ref(),
-                                                        id,
-                                                        false,
-                                                    )
-                                                    .await;
+                                                    if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                        let control_response = question_closing_response(id);
+                                                        if let Ok(json) = serde_json::to_string(&control_response) {
+                                                            let _ = tx.send(json).await;
+                                                            info!(request_id = %id, "Closed AskUserQuestion control request (answer comes as the next turn)");
+                                                        }
+                                                    }
                                                 } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                     // Regular permission (its input stored above): a session grant may answer it
                                                     if !id.is_empty() {
@@ -10374,12 +10369,14 @@ impl ChatManager {
                                                     announce_control_event(&evt);
                                                     // AskUserQuestion: close it, as above (§15.6)
                                                     if let ChatEvent::AskUserQuestion { ref id, .. } = evt {
-                                                        ended_on_question = close_question(
-                                                            stdin_tx_for_auto_allow.as_ref(),
-                                                            id,
-                                                            true,
-                                                        )
-                                                        .await;
+                                                        if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                            let control_response = question_closing_response(id);
+                                                            if let Ok(json) = serde_json::to_string(&control_response) {
+                                                                // try_send here because we're in a sync-ish drain loop
+                                                                let _ = tx.try_send(json);
+                                                                info!(request_id = %id, "Closed AskUserQuestion control request (drain)");
+                                                            }
+                                                        }
                                                     } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
                                                         if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
@@ -10600,11 +10597,19 @@ impl ChatManager {
 
                                 // Convert to ChatEvent(s) and emit + persist structured events
                                 let mut events = Self::message_to_events(msg);
-                                // The turn the backend ended to pose a question COMPLETED: the
-                                // CLI's `error_during_execution` is the interruption we sent, not
-                                // a failure. The engine's own `stop_reason` is what the state model
-                                // reads before the raw subtype (segment_state::signal_of).
-                                if ended_on_question {
+                                // A turn the historical engine ended to POSE A QUESTION completed:
+                                // the CLI labels it `error_during_execution` because we denied the
+                                // call (§15.6), and read as a failure it closes the question it has
+                                // just opened — measured 24/11/2026 on the orchestrator (session
+                                // 76faba47, events 39613-39618), the card was unanswerable 8 ms
+                                // after it appeared. The turn's own events say whether it asked:
+                                // no new state to keep in step with the two control branches.
+                                if streaming_events
+                                    .lock()
+                                    .await
+                                    .iter()
+                                    .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
+                                {
                                     for event in events.iter_mut() {
                                         if let ChatEvent::Result {
                                             stop_reason,
@@ -10615,7 +10620,6 @@ impl ChatManager {
                                             if !*is_error && stop_reason.is_none() {
                                                 *stop_reason = Some("completed".to_string());
                                             }
-                                            ended_on_question = false;
                                         }
                                     }
                                 }
@@ -21320,42 +21324,6 @@ fn notify_attention_for_chat_event(
 /// The control response that closes an `AskUserQuestion` request (§15.6): a denial with
 /// the question-posed message, so the turn ends and the user's answer comes as the next
 /// turn. Must match `nexus_claude`'s `QUESTION_POSED_MESSAGE` (the SDK's own copy).
-/// §15.6, historical engine: closes the control request of a question with a DENIAL — never
-/// an `allow`, which the CLI would read as "the user did not answer" and the model would go
-/// on without the answer. Returns whether the request was closed, i.e. whether the turn now
-/// running ends ON THE QUESTION: its `result` then has to be reported `completed`, not failed
-/// (the CLI labels it `error_during_execution` because the tool call was rejected — measured
-/// 24/11/2026, session 76faba47: read as a failure, it closed the question it had just
-/// opened, and the card was unanswerable 8 ms after it appeared).
-///
-/// `drain`: the caller is the buffer-draining loop of the stream (`try_send`, nothing to
-/// await) rather than the control channel itself.
-async fn close_question(
-    tx: Option<&tokio::sync::mpsc::Sender<String>>,
-    request_id: &str,
-    drain: bool,
-) -> bool {
-    let Some(tx) = tx else {
-        return false;
-    };
-    let Ok(json) = serde_json::to_string(&question_closing_response(request_id)) else {
-        return false;
-    };
-    let closed = if drain {
-        tx.try_send(json).is_ok()
-    } else {
-        tx.send(json).await.is_ok()
-    };
-    if closed {
-        info!(
-            request_id = %request_id,
-            drain,
-            "Closed AskUserQuestion control request (the answer comes as the next turn)"
-        );
-    }
-    closed
-}
-
 fn question_closing_response(request_id: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "control_response",
