@@ -1710,7 +1710,6 @@ branch refs/heads/feature
         );
     }
 
-
     /// A clean checkout has nothing to stash: `stash_if_needed` returns `None`
     /// without creating an entry on the shared stash stack.
     #[tokio::test]
