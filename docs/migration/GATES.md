@@ -50,8 +50,8 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 | G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
 | G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine (imposé dans `copy`) démontrés sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; source non gelée : gel opérationnel exigé ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
 | G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
-| G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **conçue le 24/11 (`9bbbbbb1`), non implémentée** : N1 corpus figé de 325 requêtes, quatre classes D1–D4, sortie D1 = D2 = 0 ; N2 miroir de lecture derrière `PO_DOUBLE_RUN=lecture`, écritures jamais doublées ; N3 = G10 |
-| G10 | retour arrière | rollback = une variable de configuration, la source jamais modifiée | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge, conception arrêtée le 24/11 (`9bbbbbb1`)** : journal des écritures au point d'écriture unique + **refus nommé par domaine** livré en premier (rend la porte verte), rejeu par domaine à inverse prouvé ensuite ; détection des écrivains inconnus (#1270) écrite mais non branchée |
+| G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **conçue le 24/11 (`859da3d6`), non implémentée** : N1 corpus figé VERSIONNÉ dans le dépôt (requêtes réelles + réponses Neo4j, à committer), quatre classes D1–D4, sortie D1 = D2 = 0 ; N2 miroir de lecture derrière `PO_DOUBLE_RUN=lecture`, écritures jamais doublées ; N3 = G10 |
+| G10 | retour arrière | une bascule qui ne perd aucune écriture en silence : le rollback rejoue ce qui a un inverse prouvé, refuse le reste par son nom et désigne le repli (restauration de sauvegarde) | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge, conception arrêtée le 24/11 (`9bbbbbb1`)** : journal des écritures au point d'écriture unique + **refus nommé par domaine** + détection des écrivains inconnus (#1270, écrite non branchée) livrés en premier — le vert signifie « aucune perte silencieuse », pas « retour arrière à chaud dans tous les cas » ; rejeu des domaines à inverse prouvé ensuite |
 | G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) ; `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` exclu de la CI (horloge) ; `storage::migrator` n'est PAS un test instable : ce step est la première compilation à froid de la bibliothèque avec la feature (6 min 26 s sur le run vert 45111474405, 12 min 29 s pour le step précédent). Un run a dépassé le délai du job (45 min, annulé, run 45113636283) et un autre a échoué (run 45103207452, log expiré) : c'est le temps de compilation sur le runner, les 23 tests passent en 25 s en local, 5/5 ; `obrain::chat::tests::c5_empreinte_publie_le_updated_at_ecrit` dépend d'un `sleep` de 5 ms (horloge), non exclu |
 
 ## Détail des portes automatisées
@@ -245,14 +245,19 @@ consolidation) : ouverture 0,6 s → 7 s, filtre par projet 0,4 ms → 8,9 ms, s
 
 ### G9 — double-run
 
-Non conçue au 23/11/2026. **Conçue le 24/11/2026** (décision `9bbbbbb1`) ; rien n'est encore implémenté.
+Non conçue au 23/11/2026. **Conçue le 24/11/2026** (décision `859da3d6`) ; rien n'est encore implémenté.
 
 But : un même trafic, deux moteurs, des divergences **classées** — pas une impression de parité.
 Trois niveaux, chacun avec son critère de sortie ; aucun ne dispense du précédent.
 
 **N1 — corpus figé, exécuté et classé (obligatoire, hors ligne).**
-Entrées : les 325 requêtes réelles de PO (`plan_reel.tsv`) et les réponses Neo4j enregistrées sur
-la copie gelée (`resultats_neo4j.tsv`, prise du 17/11 — à refaire sous `COPIE-REFERENCE`).
+Entrées : les requêtes réelles de PO et les réponses Neo4j du MÊME jeu, **versionnées dans le
+dépôt**. Elles n'y sont pas aujourd'hui : le banc du 23/11 (requêtes réelles rejouées par Neo4j 5.26
+et par obrain sur 4 327 350 nœuds) vit sur la machine de banc et non dans le dépôt, et
+`CONSOLIDATION.md` cite un autre compte (104) pour une mesure différente. N1 commence donc par
+**committer les deux fichiers** (`plan_reel.tsv` des requêtes, `resultats_neo4j.tsv` des réponses) ou
+par les régénérer sous `COPIE-REFERENCE` : le corpus qui fait foi est le fichier versionné, jamais un
+chiffre recopié dans un plan.
 Exécution : chaque requête sur obrain **contre la même copie gelée**, comparaison positionnelle
 (noms de colonnes, ordre des lignes, valeurs). Quatre classes, pas de « autre » : **D1** valeur
 fausse, **D2** ordre non total (même multiensemble, ordre différent), **D3** refus nommé
@@ -310,7 +315,7 @@ Les quatre pièces, et ce que chacune empêche :
    WAL est interne, non rejouable vers un autre moteur) : la traçabilité s'accroche donc au **point
    d'écriture unique de PO** (une porte par domaine : `ObrainGraphStore` et ses sous-traits). Chaque
    écriture réussie ajoute une ligne append-only avec domaine, opération, clé et horodatage monotone,
-   `fsync` au commit — même discipline que `writer_lease`.
+   `fsync` au commit — même discipline que `writer_lease` de **this-rs** (`this/src/storage/writer_lease.rs`, dépôt voisin, hors de celui-ci).
 2. **Rejeu idempotent, dans l'ordre du journal**, `MERGE` sur la clé du domaine, avec vérification
    après rejeu (compte par type + échantillon relu). Un domaine sans inverse prouvé ne rejoue pas :
    il **refuse par son nom** (`RollbackRefused { domaines_non_couverts, premiere_ecriture }`).
@@ -333,11 +338,20 @@ Les quatre pièces, et ce que chacune empêche :
 - `rollback_with_proven_inverse_replays_in_journal_order_and_is_idempotent` — un domaine à inverse
   prouvé, rejoué deux fois : même état, zéro doublon.
 
-**État de la porte** : rouge tant que les quatre pièces et les cinq tests ne sont pas là. Quand le
-refus nommé et la détection d'écrivain inconnu seront livrés (tests 1, 2, 3 et 4), elle passe au
-**vert** ; les domaines recopiés (test 5) élargissent ensuite la réversibilité à chaud **sans changer
-l'état de la porte** — c'est ce qui rend l'élargissement incrémental sans jamais mentir sur ce qui
-reste.
+**État de la porte** : rouge tant que les quatre pièces ne sont pas là et que les tests **1, 2 et 3**
+ne passent pas. Les tests **4** (reprise après interruption) et **5** (rejeu idempotent d'un domaine)
+**ne conditionnent pas le vert** : ils conditionnent le PREMIER DOMAINE RECOPIÉ, donc
+l'élargissement. Un vert obtenu sur « refus nommé seulement » est un vert honnête, mais il ne dit pas
+que le retour arrière fonctionne à chaud.
+
+**Ce que « vert » veut dire, et ce que ça ne veut pas dire.** Vert = **aucune perte silencieuse** : le
+rollback rejoue les domaines dont l'inverse est prouvé et, pour tous les autres, il **refuse par son
+nom** et désigne le repli. Il ne veut pas dire « retour arrière = une variable, dans tous les cas » :
+à la première bascule, le repli des domaines non couverts est la **restauration de sauvegarde** —
+procédure écrite et exercée sur une copie — et c'est ce que la décision `9bbbbbb1` appelle « le repli
+livré à la première bascule ». La ligne « e » de la porte de bascule de `CONSOLIDATION.md` doit donc
+se lire avec cette réserve : tant que les domaines ne sont pas recopiés, revenir en arrière est une
+restauration, pas un basculement de variable, et la décision de basculer se prend en le sachant.
 
 ### G11 — stabilité des tests
 `kill9_during_creations…` échoue au hasard, de deux façons mesurées : le garde-fou de timing
