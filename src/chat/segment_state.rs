@@ -296,10 +296,22 @@ pub fn signal_of(event: &ChatEvent) -> Option<Signal> {
         } => {
             // The two spellings the engines use: a `stop_reason` on the result, or a
             // `subtype` that names the interruption (`error_interrupted`).
+            //
+            // `stop_reason` WINS over the `subtype` when it says the turn completed: the
+            // subtype is the CLI's raw wire label, and Claude Code writes
+            // `error_during_execution` for a turn its host ended ON A QUESTION (the host
+            // denies the question then interrupts to end the turn, §15.6). Read as
+            // `Failed`, that closed the question the host had just been given: measured
+            // 24/11/2026, orchestrator session 76faba47, the card was unanswerable 8 ms
+            // after it appeared, and the parity matrix showed `TurnFailed` for a turn both
+            // engines report `completed`. A real failure keeps `is_error` (an API refusal),
+            // and an interruption keeps its own spellings.
             let how = if stop_reason.as_deref() == Some("interrupted")
                 || subtype.contains("interrupted")
             {
                 TurnEnd::Interrupted
+            } else if stop_reason.as_deref() == Some("completed") && !*is_error {
+                TurnEnd::Completed
             } else if *is_error || subtype.starts_with("error") {
                 TurnEnd::Failed
             } else {
@@ -1519,6 +1531,58 @@ mod tests {
         assert_eq!(
             signal_of(&ChatEvent::PendingQueue { messages: vec![] }),
             None
+        );
+    }
+
+    /// A turn the ENGINE says completed is completed, whatever its raw `subtype` says.
+    ///
+    /// Measured 2026-11-24 (orchestrator session 76faba47, events 39613-39618): to pose a
+    /// question, the Claude Code engine denies the tool then interrupts the turn to end it
+    /// (§15.6), and the CLI closes it with `subtype: "error_during_execution"` while the
+    /// engine reports `stop_reason: completed` — as the native engine does for the same
+    /// turn (A45). Reading the subtype first made this turn `Failed`, and a failed turn
+    /// closes the question it had just opened: the parity matrix measured `TurnFailed` and
+    /// the card was unanswerable 8 ms after it appeared.
+    #[test]
+    fn a_completed_turn_is_completed_whatever_its_subtype_says() {
+        let result = |stop: Option<&str>, subtype: &str, is_error: bool| ChatEvent::Result {
+            session_id: "s".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: subtype.to_string(),
+            is_error,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: stop.map(str::to_string),
+            error_code: None,
+            error_message: None,
+        };
+        assert_eq!(
+            signal_of(&result(Some("completed"), "error_during_execution", false)),
+            Some(Signal::Ended {
+                how: TurnEnd::Completed,
+                text: false
+            }),
+            "the engine's verdict wins: this turn ended on a question, not in failure"
+        );
+        // A real refusal keeps its failure, even on a completed turn.
+        assert_eq!(
+            signal_of(&result(Some("completed"), "error_during_execution", true)),
+            Some(Signal::Ended {
+                how: TurnEnd::Failed,
+                text: false
+            })
+        );
+        // No verdict from the engine: the subtype decides, as before.
+        assert_eq!(
+            signal_of(&result(None, "error_during_execution", false)),
+            Some(Signal::Ended {
+                how: TurnEnd::Failed,
+                text: false
+            })
         );
     }
 }

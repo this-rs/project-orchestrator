@@ -50,7 +50,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok | ok | not_measured | not_measured | not_measured |
 | `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
-| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
+| `ask_user_question` | une question du modèle s'affiche (ask_user_question), la carte reste répondable tant qu'elle attend (waiting_on_person + question_open, ce que lit le frontend) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
 | `subagents.background` | un sous-agent lancé en arrière-plan (run_in_background: true) rend la main au parent immédiatement ; sa fin est injectée comme task_notification au tour suivant | not_measured | not_measured | not_measured | not_measured | not_measured | not_measured |
 | `subagents.types` | subagent_type valide parmi les types déclarés ; un type inconnu est refusé avec la liste des types connus | not_measured | not_measured | ok | not_measured | not_measured | not_measured |

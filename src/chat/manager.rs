@@ -10596,7 +10596,33 @@ impl ChatManager {
                                 }
 
                                 // Convert to ChatEvent(s) and emit + persist structured events
-                                let events = Self::message_to_events(msg);
+                                let mut events = Self::message_to_events(msg);
+                                // A turn the historical engine ended to POSE A QUESTION completed:
+                                // the CLI labels it `error_during_execution` because we denied the
+                                // call (§15.6), and read as a failure it closes the question it has
+                                // just opened — measured 24/11/2026 on the orchestrator (session
+                                // 76faba47, events 39613-39618), the card was unanswerable 8 ms
+                                // after it appeared. The turn's own events say whether it asked:
+                                // no new state to keep in step with the two control branches.
+                                if streaming_events
+                                    .lock()
+                                    .await
+                                    .iter()
+                                    .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
+                                {
+                                    for event in events.iter_mut() {
+                                        if let ChatEvent::Result {
+                                            stop_reason,
+                                            is_error,
+                                            ..
+                                        } = event
+                                        {
+                                            if !*is_error && stop_reason.is_none() {
+                                                *stop_reason = Some("completed".to_string());
+                                            }
+                                        }
+                                    }
+                                }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
                                     if let Some(call) = super::session_grants::observed_call(
