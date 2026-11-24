@@ -293,9 +293,12 @@ qu'avec, ensemble :
 ### G11 — stabilité des tests
 `kill9_during_creations…` échoue au hasard, de deux façons mesurées : le garde-fou de timing
 (« no kill landed inside a creation over 12 rounds ») et un `unwrap()` sur une ligne de
-journal tronquée par le SIGKILL. Le correctif du premier mode n'existait que sur #1222 (manche
-« suspendue »), **close sans fusion** : relu le 24/11/2026, aucun des deux modes n'est corrigé
-sur la consolidation. Une porte instable ne prouve rien.
+journal tronquée par le SIGKILL. #1222 (manche « suspendue ») est close sans fusion, mais son
+résidu a été porté par **#1257** (`987480e2`, ancêtre de la consolidation, relu le 24/11/2026) :
+`tests/obrain_backend.rs` arme le kill dans une création par construction (`suspendu`, tour 0)
+et écarte la ligne de journal tronquée avant de la lire. Ce que cela ne prouve pas : que le test
+soit devenu stable — il n'a pas été re-mesuré en boucle depuis ; le statut « ouvert » tient
+jusqu'à cette mesure. Une porte instable ne prouve rien.
 
 Exclu du job Obrain backend tant qu'il dépend de l'horloge :
 `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou`. Le test de visibilité

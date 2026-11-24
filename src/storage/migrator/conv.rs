@@ -32,7 +32,9 @@ pub struct Losses {
     /// A SIGNED instant (a tombstone's `issued_at`, see [`SIGNED_INSTANTS`]) whose
     /// nanoseconds are not a multiple of 1 000: REFUSED. The Ed25519 payload covers
     /// `issued_at` at nanosecond precision (`sharing::tombstone::build_signing_payload`),
-    /// and obrain stores microseconds: truncating it would make the signature
+    /// and the value it becomes in obrain, a `ZonedDatetime`, stores microseconds
+    /// (`Timestamp` itself is nanoseconds; the loss is in the representation the
+    /// copy chooses, see [`zoned`]): truncating it would make the signature
     /// invalid after the copy, and neither the counts nor the fingerprint would
     /// show it. Unlike `sub_microsecond`, this is NOT an accepted narrowing.
     pub signed_instant_narrowed: u64,
@@ -62,7 +64,7 @@ impl Losses {
             (
                 self.signed_instant_narrowed,
                 "signed instant(s) with sub-microsecond nanoseconds (a tombstone's `issued_at`: \
-                 its signature covers the nanoseconds and obrain stores microseconds)",
+                 its signature covers the nanoseconds and the copy keeps microseconds)",
             ),
         ] {
             if n > 0 {
