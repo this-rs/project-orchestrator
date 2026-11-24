@@ -9498,6 +9498,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// #1301 — `HaltSession` is the halt a real delegation uses; the listener tests drive
+    /// `HaltRecorder` instead, so the two delegations that go through the manager are
+    /// exercised here: the in-place switch predicate the listener reads, and a subscription
+    /// the manager cannot honour (the child it names does not exist).
+    #[tokio::test]
+    async fn a_halt_session_reads_the_switch_and_cannot_follow_an_unknown_child() {
+        use crate::chat::manager::{test_support, ChatManager};
+
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_support::chat_config(),
+        ));
+        let halt = super::HaltSession {
+            manager,
+            session_id: "no-such-session".to_string(),
+        };
+
+        assert!(
+            !super::DelegationHalt::is_switching(&halt).await,
+            "a session nobody marked is not switching"
+        );
+        assert!(
+            super::DelegationHalt::resubscribe(&halt).await.is_none(),
+            "a session the manager does not know cannot be followed"
+        );
+    }
+
     /// A delegation a plan run owns builds no wake at all, and a parent that is gone is
     /// not an error: the delegation still ended, its result is on the task.
     #[tokio::test]
@@ -10736,6 +10765,65 @@ pub(crate) mod tests {
         assert_eq!(stored.status, AgentExecutionStatus::Failed);
         drop(old_tx);
         drop(new_tx);
+    }
+
+    /// #1301 — a provider switch with no handle on the child cannot be followed: the
+    /// listener keeps the channel it has, the switch is reported unfollowed, and
+    /// `delegation_switching`'s `None` says no switch is held against the child's end.
+    #[tokio::test]
+    async fn a_provider_switch_with_no_handle_cannot_be_followed() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+
+        let (tx, channel) = tokio::sync::broadcast::channel(16);
+        tx.send(a_provider_switch()).unwrap();
+        tx.send(interrupted_result(Some(0.01))).unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::listen_delegation_result(
+                channel,
+                task_id,
+                "delegated",
+                std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                    crate::events::EventBus::default(),
+                ))),
+                None,
+                None,
+                execution,
+                super::DelegationOwner::default(),
+                crate::runner::DelegationLimits::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("the delegation did not end");
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Completed);
+        drop(tx);
+    }
+
+    /// The `DelegationHalt` defaults: without a real handle, `resubscribe` gives nothing and
+    /// `is_switching` reports no switch. Exercised directly — the test double overrides both,
+    /// which would otherwise leave these lines uncovered.
+    #[tokio::test]
+    async fn the_delegation_halt_defaults_give_nothing_and_no_switch() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl super::DelegationHalt for Bare {
+            async fn interrupt(&self) {}
+            async fn is_working(&self) -> bool {
+                false
+            }
+            async fn is_turn_running(&self) -> bool {
+                false
+            }
+            async fn close(&self) {}
+        }
+        let bare: std::sync::Arc<dyn super::DelegationHalt> = std::sync::Arc::new(Bare);
+        assert!(bare.resubscribe().await.is_none());
+        assert!(!bare.is_switching().await);
     }
 
     /// #1272 — a delegation nobody could listen to (its prompt was refused, its channel
