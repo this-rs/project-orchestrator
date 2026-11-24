@@ -2374,6 +2374,25 @@ mod tests {
     /// this server?" is fixed (`Some(present)`): the listing's default does not depend on
     /// the machine the tests run on.
     async fn mock_server_state_with(claude_cli: Option<bool>) -> OrchestratorState {
+        // A root account is configured; the usual test token is NOT root.
+        let auth = crate::AuthConfig {
+            root_account: Some(crate::RootAccountConfig {
+                email: ROOT_EMAIL.to_string(),
+                name: "Root".to_string(),
+                password_hash: "unused".to_string(),
+            }),
+            ..crate::test_helpers::test_auth_config()
+        };
+        mock_server_state_authenticated(claude_cli, Some(auth)).await
+    }
+
+    /// [`mock_server_state_with`] with an explicit auth configuration — what the tests
+    /// about the account that decides for everyone need to vary (`auth.root_email` and no
+    /// `root_account`, as on an OIDC-only server; or no deciding account at all).
+    async fn mock_server_state_authenticated(
+        claude_cli: Option<bool>,
+        auth_config: Option<crate::AuthConfig>,
+    ) -> OrchestratorState {
         let app_state = mock_app_state();
         let chat_manager = claude_cli.map(|present| {
             Arc::new(
@@ -2397,15 +2416,7 @@ mod tests {
                 crate::events::EventBus::default(),
             ))),
             nats_emitter: None,
-            // A root account is configured; the usual test token is NOT root.
-            auth_config: Some(crate::AuthConfig {
-                root_account: Some(crate::RootAccountConfig {
-                    email: ROOT_EMAIL.to_string(),
-                    name: "Root".to_string(),
-                    password_hash: "unused".to_string(),
-                }),
-                ..crate::test_helpers::test_auth_config()
-            }),
+            auth_config,
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -2686,6 +2697,134 @@ mod tests {
             "base_url": url, "default_model": "deepseek-chat",
             "cost_source": "priced", "credential_ref": "vault:deepseek"
         })
+    }
+
+    // ====================================================================
+    // The account that decides for everyone on a server that signs in
+    // through OIDC (auth.root_email, 24/11/2026)
+    // ====================================================================
+
+    const OWNER_EMAIL: &str = "owner@ffs.holdings";
+
+    /// OIDC-only sign-in: no password `root_account`, so the deterministic identifier
+    /// derived from an email can recognise nobody. This is the measured deployment.
+    fn oidc_only_auth() -> crate::AuthConfig {
+        crate::AuthConfig {
+            root_account: None,
+            root_email: None,
+            ..crate::test_helpers::test_auth_config()
+        }
+    }
+
+    /// A JSON request signed as an ordinary signed-in person with this identifier and
+    /// email — what an OIDC account looks like: a RANDOM UUID, not one derived from the
+    /// email.
+    fn json_as(
+        id: Uuid,
+        email: &str,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        let token = crate::auth::jwt::encode_jwt(
+            id,
+            email,
+            "A Person",
+            "test-secret-key-minimum-32-chars!!",
+            3600,
+        )
+        .unwrap();
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn call_text(app: &axum::Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn the_named_oidc_account_allows_an_endpoint_for_the_chats_outside_any_project() {
+        // Before auth.root_email this was impossible: `is_root` was false for everybody
+        // (no root_account on an OIDC server) and the route answered root_required to the
+        // owner himself. The email is the only identity an OIDC account shares with the
+        // configuration.
+        let mut auth = oidc_only_auth();
+        auth.root_email = Some(OWNER_EMAIL.to_string());
+        let app = create_router(mock_server_state_authenticated(None, Some(auth)).await);
+
+        let person = Uuid::new_v4();
+        let (status, body) = call_json(
+            &app,
+            json_as(
+                person,
+                "person@ffs.holdings",
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{status} {body}");
+
+        // The named account — a random UUID, matched on its email — may allow it.
+        let (status, body) = call_json(
+            &app,
+            json_as(
+                Uuid::new_v4(),
+                "Owner@FFS.holdings",
+                "PUT",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Anybody else still may not: the setting is server-wide.
+        let (status, text) = call_text(
+            &app,
+            json_as(
+                person,
+                "person@ffs.holdings",
+                "PUT",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(text.contains("root_required"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_names_nobody_says_so_instead_of_sending_you_to_an_absent_admin() {
+        // Measured on dev.ffs.dev: OIDC only, no root_account — and the screen said « ask
+        // the administrator », which was nobody. The refusal must name the missing setting.
+        let app = create_router(mock_server_state_authenticated(None, Some(oidc_only_auth())).await);
+        let (status, text) = call_text(
+            &app,
+            json_as(
+                Uuid::new_v4(),
+                OWNER_EMAIL,
+                "PUT",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert!(text.contains("deciding_account_missing"), "{text}");
+        assert!(text.contains("auth.root_email"), "{text}");
     }
 
     #[tokio::test]

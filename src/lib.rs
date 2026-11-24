@@ -675,6 +675,23 @@ pub struct AuthConfig {
     /// Root account defined in config.yaml — always available, no DB needed.
     pub root_account: Option<RootAccountConfig>,
 
+    // ── The account that decides for everyone (any sign-in method) ─────
+    /// Email of the account that decides for everyone on this server: the server-wide
+    /// settings (the consent of the chats outside any project, the global pilot and
+    /// executor roles, the model policy, the routing) are writable by it and by nobody
+    /// else.
+    ///
+    /// Matched by EMAIL, so it works with any sign-in method. It is the only way to have
+    /// a deciding account on a server whose sign-in is OIDC: an OIDC user gets a RANDOM
+    /// UUID in Neo4j (MERGE by email), so the deterministic identifier derived from an
+    /// email — what `root_account` relies on — can never recognise it (measured
+    /// 24/11/2026: an OIDC-only server had no root at all, and `is_root` was false for
+    /// everyone, the owner included).
+    ///
+    /// Coexists with `root_account`: when both are set, both accounts decide.
+    #[serde(default)]
+    pub root_email: Option<String>,
+
     // ── OIDC auth (generic OpenID Connect) ─────────────────────────────
     /// Generic OIDC provider configuration.
     pub oidc: Option<OidcConfig>,
@@ -766,6 +783,13 @@ const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
 
+/// An email as the configuration and an identity provider mean it: trimmed, lowercased.
+/// The same normalisation everywhere an account is compared, so `Me@Example.com` and
+/// `me@example.com` are one person.
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
 impl AuthConfig {
     /// Returns the effective OIDC config, preferring the explicit `oidc` section
     /// and falling back to legacy `google_*` fields for backward compatibility.
@@ -809,6 +833,43 @@ impl AuthConfig {
     pub fn has_oidc(&self) -> bool {
         self.effective_oidc().is_some()
     }
+
+    /// The email of the account that decides for everyone, when the server names one
+    /// (`auth.root_email`, else the configured `root_account`). `None` = nobody does the
+    /// server-wide settings: every one of them is then unreachable, which is a fact the
+    /// screens have to say instead of sending someone to ask an administrator.
+    pub fn deciding_email(&self) -> Option<&str> {
+        match (self.root_email.as_deref(), self.root_account.as_ref()) {
+            (Some(email), _) if !email.trim().is_empty() => Some(email),
+            (_, Some(root)) => Some(root.email.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this signed-in person is the one who decides for everyone.
+    ///
+    /// The comparison is on the EMAIL, case-insensitively: an account that signed in
+    /// through OIDC carries a random UUID (Neo4j MERGEs by email), so an identity derived
+    /// from the email — the deterministic v5 identifier `root_account` uses — would never
+    /// match it. `user_id` still counts for the password `root_account`, which lives in
+    /// the configuration and not in Neo4j, so a token issued for it carries that v5 id.
+    pub fn is_deciding_account(&self, user_id: uuid::Uuid, email: &str) -> bool {
+        let who = normalize_email(email);
+        if let Some(named) = self.root_email.as_deref() {
+            if !named.trim().is_empty() && normalize_email(named) == who {
+                return true;
+            }
+        }
+        match self.root_account.as_ref() {
+            Some(root) => {
+                normalize_email(&root.email) == who
+                    || uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, root.email.as_bytes())
+                        == user_id
+            }
+            None => false,
+        }
+    }
+
 
     /// Check whether a given email is allowed by the configured restrictions.
     ///
@@ -1470,6 +1531,31 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Hash root account password at startup (if plaintext)
     if let Some(ref mut auth) = config.auth_config {
         auth.ensure_root_password_hashed()?;
+        // The account that decides for everyone is named once, here. Two silences were
+        // possible and both are dead ends: no deciding account at all (every root-only
+        // setting — the consent of the chats outside any project, the global roles, the
+        // model policy, the routing — answers 403 to everyone), and a named account the
+        // allowlist keeps out (it can never sign in, so the setting looks like it was
+        // ignored). Neither is fatal to booting, so both are said and the server starts.
+        match auth.deciding_email() {
+            Some(email) if auth.is_email_allowed(email) => tracing::info!(
+                deciding_account = %email,
+                "server-wide settings are writable by this account and by nobody else"
+            ),
+            Some(email) => tracing::warn!(
+                deciding_account = %email,
+                "auth.root_email / auth.root_account names an account that \
+                 allowed_email_domain / allowed_emails does not let sign in: every \
+                 server-wide setting will be refused to everyone until the allowlist \
+                 accepts it"
+            ),
+            None => tracing::warn!(
+                "no deciding account (auth.root_email, or auth.root_account): the \
+                 server-wide settings — consent of the chats outside any project, global \
+                 provider roles, model policy, routing — will be refused to EVERYONE. Set \
+                 auth.root_email to the account that decides, then restart"
+            ),
+        }
     }
 
     // Fail-fast: reject an invalid remote MCP config before any expensive init.
@@ -3491,6 +3577,7 @@ server:
             google_client_id: None,
             google_client_secret: None,
             google_redirect_uri: None,
+            root_email: None,
         }
     }
 
@@ -3500,6 +3587,80 @@ server:
         let config = base_auth_config();
         assert!(config.is_email_allowed("anyone@gmail.com"));
         assert!(config.is_email_allowed("someone@company.org"));
+    }
+
+    // ========================================================================
+    // The account that decides for everyone (auth.root_email, 24/11/2026)
+    // ========================================================================
+
+    /// An OIDC account carries a RANDOM identifier: nothing derived from its email.
+    fn oidc_user() -> uuid::Uuid {
+        uuid::Uuid::new_v4()
+    }
+
+    #[test]
+    fn root_email_names_the_deciding_account_whatever_the_sign_in_method() {
+        let mut config = base_auth_config();
+        config.root_email = Some("Owner@FFS.holdings".to_string());
+
+        assert_eq!(config.deciding_email(), Some("Owner@FFS.holdings"));
+        // An OIDC account is recognised on its email (case does not matter), never on its id.
+        assert!(config.is_deciding_account(oidc_user(), "owner@ffs.holdings"));
+        assert!(config.is_deciding_account(oidc_user(), "  OWNER@ffs.HOLDINGS "));
+        // Someone else on the same server is not the deciding account.
+        assert!(!config.is_deciding_account(oidc_user(), "other@ffs.holdings"));
+    }
+
+    #[test]
+    fn no_root_email_and_no_root_account_means_nobody_decides() {
+        let config = base_auth_config();
+        assert_eq!(config.deciding_email(), None);
+        assert!(!config.is_deciding_account(oidc_user(), "owner@ffs.holdings"));
+    }
+
+    #[test]
+    fn an_emptied_root_email_names_nobody() {
+        // A key left in the file with no value must not read as "the empty-string person".
+        let mut config = base_auth_config();
+        config.root_email = Some("   ".to_string());
+        assert_eq!(config.deciding_email(), None);
+        assert!(!config.is_deciding_account(oidc_user(), ""));
+    }
+
+    #[test]
+    fn root_account_keeps_working_by_identifier_and_by_email() {
+        let mut config = base_auth_config();
+        config.root_account = Some(RootAccountConfig {
+            email: "root@ffs.holdings".to_string(),
+            name: "Root".to_string(),
+            password_hash: String::new(),
+        });
+
+        // The password root lives in the configuration, not in Neo4j: its token carries
+        // the deterministic identifier derived from its email.
+        let deterministic = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"root@ffs.holdings");
+        assert!(config.is_deciding_account(deterministic, "root@ffs.holdings"));
+        // …and the email alone decides as well, so an OIDC account with the same address
+        // (and any other identifier) decides too.
+        assert!(config.is_deciding_account(oidc_user(), "ROOT@ffs.holdings"));
+        assert!(!config.is_deciding_account(oidc_user(), "other@ffs.holdings"));
+        assert_eq!(config.deciding_email(), Some("root@ffs.holdings"));
+    }
+
+    #[test]
+    fn root_email_and_root_account_can_both_decide() {
+        let mut config = base_auth_config();
+        config.root_email = Some("owner@ffs.holdings".to_string());
+        config.root_account = Some(RootAccountConfig {
+            email: "root@ffs.holdings".to_string(),
+            name: "Root".to_string(),
+            password_hash: String::new(),
+        });
+
+        assert!(config.is_deciding_account(oidc_user(), "owner@ffs.holdings"));
+        assert!(config.is_deciding_account(oidc_user(), "root@ffs.holdings"));
+        // `root_email` is what the server displays as the named account.
+        assert_eq!(config.deciding_email(), Some("owner@ffs.holdings"));
     }
 
     #[test]

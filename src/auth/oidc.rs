@@ -559,6 +559,7 @@ mod tests {
             google_client_id: None,
             google_client_secret: None,
             google_redirect_uri: None,
+            root_email: None,
         };
 
         let client = OidcClient::from_auth_config_sync(&config).unwrap();

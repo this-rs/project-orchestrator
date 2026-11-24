@@ -106,6 +106,11 @@ pub struct AuthProvidersResponse {
     pub auth_required: bool,
     pub providers: Vec<AuthProviderInfo>,
     pub allow_registration: bool,
+    /// Whether this server names the account that decides for everyone
+    /// (`auth.root_email`, else `auth.root_account`). `false` means nobody can write a
+    /// server-wide setting — the screens say so instead of sending someone to ask an
+    /// administrator that does not exist. Names no email: this route is public.
+    pub has_deciding_account: bool,
 }
 
 /// Public user info (safe to send to client)
@@ -191,6 +196,9 @@ pub async fn get_auth_providers(
                 auth_required: false,
                 providers: vec![],
                 allow_registration: false,
+                // Without authentication there is one person and no third party: that
+                // person decides for everyone, so nothing is out of reach.
+                has_deciding_account: true,
             });
         }
         Some(config) => config,
@@ -220,6 +228,7 @@ pub async fn get_auth_providers(
         auth_required: true,
         providers,
         allow_registration: auth_config.allow_registration,
+        has_deciding_account: auth_config.deciding_email().is_some(),
     })
 }
 
@@ -642,25 +651,21 @@ pub async fn oidc_callback(
     ))
 }
 
-/// Whether `user_id` is the root account of this server: the deterministic UUID of the
-/// configured root email. No root account configured → nobody is root.
-pub(crate) fn is_root_user(auth_config: Option<&AuthConfig>, user_id: Uuid) -> bool {
-    auth_config
-        .and_then(|c| c.root_account.as_ref())
-        .is_some_and(|root| Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes()) == user_id)
-}
-
 /// GET /auth/me — Returns the authenticated user's info.
 ///
 /// Requires a valid JWT token (via `require_auth` middleware + `AuthUser` extractor).
 /// Falls back to JWT claims when the user isn't found in Neo4j (e.g. root account).
-/// Sets `is_root: true` when the user ID matches the root account's deterministic UUID.
+/// Sets `is_root: true` when this person is the account that decides for everyone:
+/// `auth.root_email` matched on the email (works for any sign-in method), or the
+/// configured password `root_account` (its deterministic UUID, or its email).
 pub async fn get_me(
     State(state): State<OrchestratorState>,
     user: AuthUser,
 ) -> Result<Json<UserResponse>, AppError> {
-    // Check if this user is the root account (deterministic UUID from email)
-    let is_root = is_root_user(state.auth_config.as_ref(), user.user_id);
+    let is_root = state
+        .auth_config
+        .as_ref()
+        .is_some_and(|auth| auth.is_deciding_account(user.user_id, user.email.as_str()));
 
     // Try to fetch full user from Neo4j (may have updated picture, etc.)
     match state
@@ -1172,6 +1177,7 @@ mod tests {
             google_client_id: Some("test-id".to_string()),
             google_client_secret: Some("test-secret".to_string()),
             google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
+            root_email: None,
         }
     }
 
@@ -1748,6 +1754,7 @@ mod tests {
             google_client_id: None,
             google_client_secret: None,
             google_redirect_uri: None,
+            root_email: None,
         }
     }
 
@@ -2017,6 +2024,101 @@ mod tests {
     }
 
     // ================================================================
+    // has_deciding_account (24/11/2026): the screens must be able to say
+    // « nobody decides on this server » instead of « ask the administrator »
+    // ================================================================
+
+    #[tokio::test]
+    async fn providers_say_no_deciding_account_when_the_server_names_none() {
+        // OIDC only, no root_account and no root_email: every server-wide setting is
+        // refused to everyone. This is the state that made dev.ffs.dev a dead end.
+        let app = test_auth_app(Some(test_auth_config())).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["has_deciding_account"], false);
+    }
+
+    #[tokio::test]
+    async fn providers_say_a_deciding_account_exists_without_naming_it() {
+        let mut config = test_auth_config();
+        config.root_email = Some("Owner@FFS.holdings".to_string());
+
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["has_deciding_account"], true);
+        // This route is public: it must not leak the address it names.
+        let body = json.to_string().to_lowercase();
+        assert!(!body.contains("owner@"), "public body leaks the account: {body}");
+    }
+
+    #[tokio::test]
+    async fn providers_say_everyone_decides_without_authentication() {
+        // No auth at all: one person, no third party — nothing is out of reach.
+        let app = test_auth_app(None).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], false);
+        assert_eq!(json["has_deciding_account"], true);
+    }
+
+    #[tokio::test]
+    async fn get_me_is_root_for_the_oidc_account_named_by_root_email() {
+        // The measured case: an OIDC user has a RANDOM UUID (MERGE by email), so the
+        // deterministic identifier derived from an email can never recognise it. Only
+        // the email comparison can, hence auth.root_email.
+        let mut config = test_auth_config();
+        config.root_email = Some("owner@ffs.holdings".to_string());
+        let state = make_server_state(Some(config)).await;
+
+        let owner_id = Uuid::new_v4();
+        let token = encode_jwt(
+            owner_id,
+            "Owner@ffs.holdings",
+            "Owner",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+        let app = Router::new()
+            .route("/auth/me", get(get_me))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state.clone());
+
+        let req = HttpRequest::builder()
+            .uri("/auth/me")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["is_root"], true);
+
+        // Somebody else, on the same server, is not root.
+        let other = encode_jwt(Uuid::new_v4(), "other@ffs.holdings", "Other", TEST_SECRET, 3600)
+            .unwrap();
+        let app = Router::new()
+            .route("/auth/me", get(get_me))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+        let req = HttpRequest::builder()
+            .uri("/auth/me")
+            .header("authorization", format!("Bearer {}", other))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["is_root"], false);
+    }
+
+    // ================================================================
     // POST /auth/register tests
     // ================================================================
 
@@ -2208,6 +2310,7 @@ mod tests {
             google_client_id: None,
             google_client_secret: None,
             google_redirect_uri: None,
+            root_email: None,
         };
 
         let app = test_auth_app(Some(config)).await;
