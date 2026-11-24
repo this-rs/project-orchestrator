@@ -438,7 +438,18 @@ jobs:
       # prend 21 s et l'installation 50 s. Le repli ne s'active que si la résolution
       # échoue : un jour normal, rien ne change.
       - name: Install Tauri system dependencies
-        timeout-minutes: 10
+        # Budget DIMENSIONNÉ sur une mesure, 23/11/2026. L'étape a expiré TROIS fois
+        # dans la même soirée (deux fois sur la PR #1304, une fois sur main, commit
+        # 5a72068f2) avec `##[error]Process completed with exit code 124` — toujours
+        # pendant les téléchargements, donc AVANT toute compilation : le job rouge ne
+        # disait rien du code. Le dernier échec, mesuré : `apt-get install` a tourné
+        # 400 s et n'a atteint que le paquet 70 sur 114, soit ~5,7 s par paquet ; les
+        # 114 demandent donc ~650 s. Quatre paquets déclarés tirent 114 dépendances,
+        # d'où l'écart avec le budget d'origine. 900 s couvrent la mesure avec ~40 %
+        # de marge, et 20 min pour l'étape laissent la place à `update` (300 s) plus
+        # `install` (900 s). Les reprises passent de 2 à 5 pour qu'un paquet qui
+        # traîne soit réessayé au lieu de consommer le budget en attente.
+        timeout-minutes: 20
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -461,9 +472,9 @@ jobs:
             sudo sed -i -E 's#mirror\+file:/etc/apt/apt-mirrors\.txt#https://archive.ubuntu.com/ubuntu/#g' \
               /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
           fi
-          apt_opts="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
-          sudo -E timeout 240 apt-get $apt_opts update
-          sudo -E timeout 400 apt-get $apt_opts install -y --no-install-recommends \
+          apt_opts="-o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo -E timeout 300 apt-get $apt_opts update
+          sudo -E timeout 900 apt-get $apt_opts install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
 
       # build.rs refuses to build without desktop/dist/index.html, and tauri-build checks
