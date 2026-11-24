@@ -306,7 +306,7 @@ const FUNCTIONS: &[(&str, &str)] = &[
     ("cancel_task", "cancel_task arrête une tâche d'arrière-plan"),
     (
         "ask_user_question",
-        "une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant",
+        "une question du modèle s'affiche (ask_user_question), la carte reste répondable tant qu'elle attend (waiting_on_person + question_open, ce que lit le frontend) et la réponse de l'utilisateur lui revient au tour suivant",
     ),
     (
         "subagents",
@@ -2159,9 +2159,21 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         cc_tool_use("t-ask", "AskUserQuestion", question_input()),
         permission_request("req-ask", "AskUserQuestion", question_input(), "t-ask"),
         await_in("req-ask"),
-        cc_tool_result("t-ask", "the user was asked", false),
-        text("asked"),
-        result_ok("asked"),
+        // §15.6 : la façade clôt la question par un refus PUIS interrompt le tour pour le
+        // terminer ; le CLI répond alors par un `tool_result` en ERREUR et un `result`
+        // `error_during_execution` / `is_error: false` — mesuré le 24/11/2026 sur
+        // l'orchestrateur (session 76faba47, événements 39616 et 39618). Ce tour doit rester
+        // `completed` : rapporté `interrupted`, l'hôte ferme la question qu'il vient de
+        // recevoir et la carte meurt avant que la personne puisse cliquer.
+        await_in("\"subtype\":\"interrupt\""),
+        cc_tool_result(
+            "t-ask",
+            "The user doesn't want to proceed with this tool use. The tool use was rejected \
+             (eg. if it was a file edit, the new_string was NOT written to the file). STOP what \
+             you are doing and wait for the user to tell you how to proceed.",
+            true,
+        ),
+        result("error_during_execution", "", false),
     ]);
     t.extend(answer(&k.k("ANSWER"), "answered ask"));
     // TURN-AGENT: a sub-agent (the CLI's Task): its messages carry the parent tool_use id,
@@ -3947,6 +3959,32 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         closing.contains("\"behavior\":\"deny\"") && closing.contains("posed to the user");
     w.settle(ends, &manager).await;
     let ends = w.turn_ends();
+    // LA CARTE DOIT ÊTRE RÉPONDABLE. C'est exactement ce que lit le portail du frontend
+    // (`questionAwaitsPerson`) : `waiting_on_person` + `question_open`, au-delà de la fenêtre
+    // de stabilisation. Sans un tour rapporté `completed`, l'hôte lit « interrompu » et ferme
+    // la question qu'il vient de recevoir — mesuré le 24/11/2026 sur l'orchestrateur
+    // (session 76faba47) : carte morte 8 ms après son apparition, réponse retapée à la main.
+    let (answerable, last_verdict) = {
+        let now =
+            crate::chat::segment_tap::now_ms() + crate::chat::segment_state::SETTLE_MS + 1_000;
+        let id = Uuid::parse_str(&sid).unwrap();
+        let mut wanted = None;
+        let mut last = None;
+        for _ in 0..200 {
+            let snap = manager.live_session_snapshot_at(now).await;
+            last = snap.states.get(&id).cloned();
+            if let Some(v) = &last {
+                if v.state == crate::chat::segment_state::SessionState::WaitingOnPerson
+                    && v.reason.rule == crate::chat::segment_state::Rule::QuestionOpen
+                {
+                    wanted = Some(v.clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        (wanted, last)
+    };
     // What the frontend sends for the answer (`input_response`): an inert user turn.
     manager
         .send_message(
@@ -3962,10 +4000,14 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         shown
             && closed_by_denial
             && answer_read
+            && answerable.is_some()
             && w.said(WAIT, "answered ask").await,
         Cause::Harness,
         format!(
-            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, réponse lue au tour suivant={answer_read}"
+            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, \
+             réponse lue au tour suivant={answer_read}, carte encore répondable (waiting_on_person / \
+             question_open)={} — dernier verdict : {last_verdict:?}",
+            answerable.is_some()
         ),
     );
     w.settle(ends, &manager).await;
