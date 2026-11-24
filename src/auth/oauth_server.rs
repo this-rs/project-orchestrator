@@ -171,7 +171,7 @@ fn mint_client_id(client_name: &str, redirect_uris: &[String], secret: &str) -> 
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).ok()?,
     )
     .ok()
 }
@@ -179,7 +179,7 @@ fn mint_client_id(client_name: &str, redirect_uris: &[String], secret: &str) -> 
 fn validate_client_id(client_id: &str, secret: &str) -> Option<ClientIdClaims> {
     let data = decode::<ClientIdClaims>(
         client_id,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(secret.as_bytes()).ok()?,
         &Validation::default(),
     )
     .ok()?;
@@ -250,7 +250,7 @@ fn mint_consent_token(claims: &ConsentClaims, secret: &str) -> Option<String> {
     encode(
         &Header::default(),
         claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).ok()?,
     )
     .ok()
 }
@@ -258,7 +258,7 @@ fn mint_consent_token(claims: &ConsentClaims, secret: &str) -> Option<String> {
 fn validate_consent_token(token: &str, secret: &str) -> Option<ConsentClaims> {
     let data = decode::<ConsentClaims>(
         token,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(secret.as_bytes()).ok()?,
         &Validation::default(),
     )
     .ok()?;
