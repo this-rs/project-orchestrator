@@ -480,7 +480,18 @@ jobs:
       # prend 21 s et l'installation 50 s. Le repli ne s'active que si la résolution
       # échoue : un jour normal, rien ne change.
       - name: Install Tauri system dependencies
-        timeout-minutes: 10
+        # Budget DIMENSIONNÉ sur une mesure, 23/11/2026. L'étape a expiré TROIS fois
+        # dans la même soirée (deux fois sur la PR #1304, une fois sur main, commit
+        # 5a72068f2) avec `##[error]Process completed with exit code 124` — toujours
+        # pendant les téléchargements, donc AVANT toute compilation : le job rouge ne
+        # disait rien du code. Le dernier échec, mesuré : `apt-get install` a tourné
+        # 400 s et n'a atteint que le paquet 70 sur 114, soit ~5,7 s par paquet ; les
+        # 114 demandent donc ~650 s. Quatre paquets déclarés tirent 114 dépendances,
+        # d'où l'écart avec le budget d'origine. 900 s couvrent la mesure avec ~40 %
+        # de marge, et 20 min pour l'étape laissent la place à `update` (300 s) plus
+        # `install` (900 s). Les reprises passent de 2 à 5 pour qu'un paquet qui
+        # traîne soit réessayé au lieu de consommer le budget en attente.
+        timeout-minutes: 20
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -503,9 +514,9 @@ jobs:
             sudo sed -i -E 's#mirror\+file:/etc/apt/apt-mirrors\.txt#https://archive.ubuntu.com/ubuntu/#g' \
               /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
           fi
-          apt_opts="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
-          sudo -E timeout 240 apt-get $apt_opts update
-          sudo -E timeout 400 apt-get $apt_opts install -y --no-install-recommends \
+          apt_opts="-o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo -E timeout 300 apt-get $apt_opts update
+          sudo -E timeout 900 apt-get $apt_opts install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
 
       # build.rs refuses to build without desktop/dist/index.html, and tauri-build checks
@@ -920,14 +931,36 @@ jobs:
             '  key: "test-master-key"' \
             > config.yaml
 
+      # The server loads its embedding model at startup (fastembed, `.fastembed_cache` in the
+      # working directory) and downloads it when it is not there. With no cache, every run
+      # fetched it from the network inside the health wait below: on 23/11/2026 this job ended
+      # `exit 124` four times out of six, on unrelated PRs, each time right after
+      # "NATS not configured" — the line a green run follows with "FastEmbed provider
+      # initialized" seven seconds later. Like the cargo caches, only main writes it.
+      - name: Restore the embedding model
+        id: embedding-model
+        uses: actions/cache/restore@v6
+        with:
+          path: .fastembed_cache
+          key: fastembed-model-${{ runner.os }}-multilingual-e5-base-${{ env.CACHE_VERSION }}
+
       - name: Start server in background
         env:
           RUST_LOG: info
         run: |
           ./target/release/orchestrator serve --port 8080 &
           echo "Waiting for server to start..."
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
+          # 300 s, not 60: a run that finds no cached model (the first one after the key
+          # changes, or before main has saved it) still has to download it and pass.
+          timeout 300 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
           echo "Server is ready!"
+
+      - name: Save the embedding model (main only)
+        if: steps.embedding-model.outputs.cache-hit != 'true' && env.CACHE_SAVE == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .fastembed_cache
+          key: ${{ steps.embedding-model.outputs.cache-primary-key }}
 
       - name: Run API tests
         run: cargo test --test api_tests

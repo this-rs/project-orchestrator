@@ -151,6 +151,10 @@ impl Claims {
     }
 }
 
+/// What a token function answers when it is given no secret: jsonwebtoken 12 refuses an
+/// empty HMAC key, so nothing is signed or verified with one.
+const EMPTY_SECRET: &str = "the JWT secret is empty";
+
 /// Encode a JWT token for the given user.
 ///
 /// Uses HS256 signing with the provided secret.
@@ -176,7 +180,7 @@ pub fn encode_jwt(
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).context(EMPTY_SECRET)?,
     )
     .context("Failed to encode JWT")
 }
@@ -276,7 +280,7 @@ pub fn generate_session_token(
     let token = encode(
         &Header::default(),
         &session_claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).context(EMPTY_SECRET)?,
     )
     .context("Failed to encode session token")?;
     Ok((token, jti))
@@ -348,7 +352,7 @@ pub fn generate_vault_token(
     encode(
         &Header::default(),
         &vault_claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).context(EMPTY_SECRET)?,
     )
     .context("Failed to encode vault token")
 }
@@ -395,7 +399,7 @@ pub fn encode_mcp_token(
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).context(EMPTY_SECRET)?,
     )
     .context("Failed to encode MCP token")?;
     Ok((token, jti))
@@ -408,7 +412,7 @@ pub fn encode_mcp_token(
 pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims> {
     let token_data: TokenData<Claims> = decode(
         token,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(secret.as_bytes()).context(EMPTY_SECRET)?,
         &Validation::default(),
     )
     .context("Failed to decode JWT")?;
@@ -442,6 +446,26 @@ mod tests {
         assert_eq!(claims.exp - claims.iat, 3600);
     }
 
+    /// jsonwebtoken 12 refuses an empty HMAC key: an empty secret signs nothing (it used to
+    /// mint a token anybody could forge) and verifies nothing.
+    #[test]
+    fn an_empty_secret_signs_nothing_and_verifies_nothing() {
+        let err = encode_jwt(Uuid::new_v4(), "alice@ffs.holdings", "Alice", "", 3600)
+            .expect_err("an empty secret must not sign");
+        assert!(format!("{err:#}").contains(EMPTY_SECRET), "{err:#}");
+
+        let token = encode_jwt(
+            Uuid::new_v4(),
+            "alice@ffs.holdings",
+            "Alice",
+            TEST_SECRET,
+            3600,
+        )
+        .expect("encode should succeed");
+        let err = decode_jwt(&token, "").expect_err("an empty secret must not verify");
+        assert!(format!("{err:#}").contains(EMPTY_SECRET), "{err:#}");
+    }
+
     #[test]
     fn test_expired_token_rejected() {
         // Manually craft a token with exp in the past
@@ -460,7 +484,7 @@ mod tests {
         let token = crate::auth::jwt_crypto::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()).unwrap(),
         )
         .expect("encode should succeed");
 
