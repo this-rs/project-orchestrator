@@ -1986,6 +1986,12 @@ impl PlanRunner {
                                     worktrees_cleaned: wt_result.cleaned_up.len(),
                                 });
                             }
+                            if let Some(what) = &wt_result.unpopped_stash {
+                                warn!(
+                                    "Wave {}: the uncommitted changes of {} were stashed for the recovery and NOT restored: {}",
+                                    wave_number, cwd, what
+                                );
+                            }
                             for conflict in &wt_result.conflicts {
                                 warn!(
                                     "Worktree conflict: {} on branch {} (commit {}): {}",

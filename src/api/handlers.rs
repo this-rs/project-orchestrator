@@ -2609,6 +2609,12 @@ impl DelegationClosure<'_> {
                                     "Delegation: recovered commits from agent worktrees"
                                 );
                             }
+                            if let Some(what) = &wt_result.unpopped_stash {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    "Delegation: the uncommitted changes of {cwd} were stashed for the recovery and NOT restored: {what}"
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
