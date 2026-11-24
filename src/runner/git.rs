@@ -1709,4 +1709,155 @@ branch refs/heads/feature
             "someone else's stash entry is gone"
         );
     }
+
+
+    /// A clean checkout has nothing to stash: `stash_if_needed` returns `None`
+    /// without creating an entry on the shared stash stack.
+    #[tokio::test]
+    async fn test_stash_if_needed_returns_none_when_checkout_is_clean() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        let cwd = root.to_string_lossy().to_string();
+
+        let stashed = stash_if_needed(&cwd).await.unwrap();
+
+        assert!(stashed.is_none());
+        assert!(git(root, &["stash", "list"]).is_empty());
+    }
+
+    /// When `git stash push` cannot write its ref, the sweep must not pretend a
+    /// stash was made: it returns `None` and leaves the working tree untouched.
+    #[tokio::test]
+    async fn test_stash_if_needed_returns_none_when_push_fails() {
+        let (dir, _git) = sweep_repo();
+        let root = dir.path();
+        std::fs::write(root.join("f.txt"), "ours").unwrap();
+        // A non-empty directory in place of `refs/stash` makes the ref write
+        // fail, while `git status --porcelain` still reports the tracked edit.
+        let stash_ref = root.join(".git/refs/stash");
+        std::fs::create_dir_all(&stash_ref).unwrap();
+        std::fs::write(stash_ref.join("blocker"), "blocked").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let stashed = stash_if_needed(&cwd).await.unwrap();
+
+        assert!(stashed.is_none());
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "ours");
+    }
+
+    /// A nonce that is no longer on the stack must be reported, not silently
+    /// ignored: the caller learns the entry is gone so it can carry the loss.
+    #[tokio::test]
+    async fn test_unstash_reports_an_entry_no_longer_on_the_stack() {
+        let (dir, _git) = sweep_repo();
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let what = unstash_if_needed(&cwd, Some("absent-nonce".to_string())).await;
+        let what = what.expect("an absent entry must be reported");
+
+        assert!(what.contains("no longer on the stack"), "{what}");
+    }
+
+    /// In a directory that is not a git repository, the stash entry cannot even
+    /// be looked up: the sweep says so and reports it, rather than failing open.
+    #[tokio::test]
+    async fn test_unstash_reports_a_lookup_failure_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let what = unstash_if_needed(&cwd, Some("some-nonce".to_string())).await;
+        let what = what.expect("a failed lookup must be reported");
+
+        assert!(what.contains("could not look"), "{what}");
+    }
+
+    /// On a conflict, `git stash pop` keeps the entry: the sweep reports the
+    /// failure and the changes stay in the named stash entry.
+    #[tokio::test]
+    async fn test_unstash_reports_a_pop_conflict_and_keeps_the_entry() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        std::fs::write(root.join("f.txt"), "ours").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let nonce = stash_if_needed(&cwd)
+            .await
+            .unwrap()
+            .expect("a tracked change must be stashed");
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "base");
+        // Commit a different content so the pop conflicts.
+        std::fs::write(root.join("f.txt"), "theirs").unwrap();
+        git(root, &["commit", "-q", "-am", "theirs"]);
+
+        let what = unstash_if_needed(&cwd, Some(nonce.clone())).await;
+        let what = what.expect("a conflicting pop must be reported");
+
+        assert!(what.contains("failed"), "{what}");
+        assert!(git(root, &["stash", "list"]).contains(&nonce));
+    }
+
+    /// `worktree_is_clean` fails CLOSED: git mute means an error, never "clean".
+    #[tokio::test]
+    async fn test_worktree_is_clean_fails_closed_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let result = worktree_is_clean(&cwd).await;
+
+        assert!(result.is_err());
+    }
+
+    /// A worktree whose git status cannot be run is KEPT: the sweep warns and
+    /// returns false instead of deleting something it could not verify.
+    #[tokio::test]
+    async fn test_cleanup_keeps_a_worktree_it_cannot_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let wt = WorktreeInfo {
+            path: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let kept = WorktreeCollector::cleanup_single_worktree(&cwd, &wt).await;
+
+        assert!(!kept);
+        assert!(dir.path().exists());
+    }
+
+    /// A commit whose patch already landed on the run branch (under another
+    /// SHA) is skipped, not reported as a new commit to recover.
+    #[tokio::test]
+    async fn test_collect_commits_skips_patch_equivalent_commits() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        let cwd = root.to_string_lossy().to_string();
+        git(root, &["checkout", "-q", "-b", "agent-x"]);
+        std::fs::write(root.join("f.txt"), "agent work").unwrap();
+        git(root, &["commit", "-q", "-am", "agent work"]);
+        let agent_sha = git(root, &["rev-parse", "HEAD"]);
+        // The same patch lands on `main` under a different SHA.
+        git(root, &["checkout", "-q", "main"]);
+        git(root, &["cherry-pick", &agent_sha]);
+
+        let commits = WorktreeCollector::collect_commits("agent-x", "main", &cwd)
+            .await
+            .unwrap();
+
+        assert!(commits.is_empty(), "{commits:?}");
+    }
+
+    /// The backward-compat shim surfaces the unpopped-stash message: a sweep
+    /// that could not restore its stash reports it through the returned struct.
+    #[tokio::test]
+    async fn test_collect_worktree_commits_returns_empty_without_agent_worktrees() {
+        let (dir, _git) = sweep_repo();
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let result = collect_worktree_commits(&cwd, "main").await.unwrap();
+
+        assert!(result.recovered_commits.is_empty());
+        assert!(result.conflicts.is_empty());
+        assert!(result.cleaned_up.is_empty());
+        assert!(result.unpopped_stash.is_none());
+    }
 }
