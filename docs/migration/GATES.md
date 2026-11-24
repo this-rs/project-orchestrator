@@ -42,7 +42,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 
 | # | Porte | Ce qu'elle prouve | Où elle tourne | État réel (20/11/2026) |
 |---|---|---|---|---|
-| G1 | containment | la branche contient `origin/main` | CI, Lint & Format | vert sur la consolidation après la descente #1253 |
+| G1 | containment | la branche contient `origin/main` | CI, Lint & Format | **non contenue à l'instant de la mesure** (23/11/2026, 23:05 UTC, après `git fetch origin`) : `origin/main` a des commits absents de `origin/consolidation/obrain-default` ; commande et nombres dans `CONSOLIDATION.md`, règle 2. Vert après #1253 (20/11), puis `main` a avancé |
 | G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 17 autres restent à couvrir sur obrain |
@@ -185,7 +185,7 @@ démontre pas une copie « strictement identique » à la source. Trois points p
    Le marqueur de base PO (`po-obrain-base`) doit exister pour cette ouverture ; il est retiré en
    cas de refus, et le marqueur de fin `.po-migration-done` n'est écrit qu'après.
 2. **Datetimes : la troncature à la microseconde vient de la représentation choisie et des
-   lecteurs, pas du stockage d'obrain.** Au rev épinglé `82467ff`, `Timestamp` stocke des
+   lecteurs, pas du stockage d'obrain.** Au rev épinglé `345d5ea7`, `Timestamp` stocke des
    **nanosecondes** (`obrain-common/src/types/timestamp.rs` l.17) ; seul `ZonedDatetime` stocke des
    microsecondes (`zoned_datetime.rs` l.16-17, champ `utc_micros` l.44). La copie convertit vers `ZonedDatetime`, et les
    décodeurs de PO lisent par `as_micros` : c'est là que les nanosecondes se perdent. Une piste
@@ -219,6 +219,18 @@ démontre pas une copie « strictement identique » à la source. Trois points p
    l'autorité. Tant qu'une représentation et des lecteurs fidèles n'existent pas, la copie d'un
    tombstone dont `issued_at` a des nanosecondes non multiples de 1000 doit être **refusée**
    explicitement, et non acceptée.
+   **Fait (24/11/2026)** : le refus existe. `conv::SIGNED_INSTANTS` nomme les paires
+   `(label, propriété)` couvertes par une signature (`("Tombstone", "issued_at")` seule pour
+   l'instant) ; `note_signed_instant`, appelé par `props_of` pour chaque propriété d'un nœud,
+   compte dans `Losses::signed_instant_narrowed` un tel instant que la conversion tronquerait,
+   et `Losses::refusal` en fait une cause de refus nommée, vue dès la lecture des propriétés
+   (`check_no_refusal`). La troncature générale reste acceptée et comptée pour toute autre
+   propriété. Démontré sans Neo4j (`a_signed_tombstone_instant_with_nanoseconds_refuses_the_copy`,
+   `the_signed_instant_guard_refuses_only_what_a_signature_covers`,
+   `a_tombstone_row_with_nanoseconds_fails_the_early_check_and_a_note_row_does_not`). **Reste
+   dû** : le test de bout en bout sur base jetable (signature relue par PO après migration), et
+   la représentation fidèle qui permettra de lever ce refus. Un tombstone à nanosecondes dans la
+   source réelle rend donc la copie **impossible**, par son nom, jusque-là.
 3. **Source non gelée.** La source est lue en direct, en plusieurs phases (identifiants, structure,
    propriétés) par plages parallèles. Le verrou `LOCK_SUFFIX` est un fichier local à la machine et
    `ReadOnlyGate` est interne au processus : ni l'un ni l'autre n'arrête un écrivain externe (autre
@@ -238,8 +250,8 @@ Rejouer : voir l'en-tête de `tests/obrain_migrateur.rs` (Neo4j jetable sur 2768
 
 ### G8 — performance
 Barre de `CONSOLIDATION.md`. Mesurée le 20/11 à 100 k et 1 M documents sur SearchStore, avec
-l'exemple `examples/obrain_mesures_recherche.rs` **de la branche de #1251** (absent de la
-consolidation) : ouverture 0,6 s → 7 s, filtre par projet 0,4 ms → 8,9 ms, suppression par id
+l'exemple `examples/obrain_mesures_recherche.rs` (alors sur la branche de #1251 ; **présent
+dans la consolidation** depuis la fusion de #1251, relu le 24/11/2026) : ouverture 0,6 s → 7 s, filtre par projet 0,4 ms → 8,9 ms, suppression par id
 5 ms → 21 ms. Barre non tenue. Une PR qui touche un chemin chaud doit livrer ses mesures à
 1 M et 5 M avant et après.
 
@@ -281,8 +293,12 @@ qu'avec, ensemble :
 ### G11 — stabilité des tests
 `kill9_during_creations…` échoue au hasard, de deux façons mesurées : le garde-fou de timing
 (« no kill landed inside a creation over 12 rounds ») et un `unwrap()` sur une ligne de
-journal tronquée par le SIGKILL. Le correctif du premier mode existe sur #1222 (manche
-« suspendue ») ; le second n'est corrigé nulle part. Une porte instable ne prouve rien.
+journal tronquée par le SIGKILL. #1222 (manche « suspendue ») est close sans fusion, mais son
+résidu a été porté par **#1257** (`987480e2`, ancêtre de la consolidation, relu le 24/11/2026) :
+`tests/obrain_backend.rs` arme le kill dans une création par construction (`suspendu`, tour 0)
+et écarte la ligne de journal tronquée avant de la lire. Ce que cela ne prouve pas : que le test
+soit devenu stable — il n'a pas été re-mesuré en boucle depuis ; le statut « ouvert » tient
+jusqu'à cette mesure. Une porte instable ne prouve rien.
 
 Exclu du job Obrain backend tant qu'il dépend de l'horloge :
 `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou`. Le test de visibilité
