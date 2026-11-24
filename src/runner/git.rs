@@ -515,12 +515,37 @@ impl WorktreeCollector {
     }
 
     /// Remove a single worktree and optionally delete its branch.
+    ///
+    /// A worktree with anything uncommitted in it (tracked changes or untracked
+    /// files) is KEPT. "No new commit" does not mean "stale": it is also the
+    /// state of a worktree in which another agent is still working and has not
+    /// committed yet (#1299). Removal is therefore never forced, and the check
+    /// fails closed: if git cannot say the worktree is clean, it stays.
     async fn cleanup_single_worktree(cwd: &str, wt: &WorktreeInfo) -> bool {
         let wt_path = wt.path.to_string_lossy();
 
-        // Remove the worktree
+        match worktree_is_clean(&wt_path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Keeping worktree {}: it has uncommitted changes (another agent may still be working in it)",
+                    wt_path
+                );
+                return false;
+            }
+            Err(e) => {
+                warn!(
+                    "Keeping worktree {}: cannot verify it is clean: {}",
+                    wt_path, e
+                );
+                return false;
+            }
+        }
+
+        // Remove the worktree (no `--force`: git itself refuses a dirty or
+        // locked worktree, a second line of defence behind the check above)
         let output = Command::new("git")
-            .args(["worktree", "remove", &*wt_path, "--force"])
+            .args(["worktree", "remove", &*wt_path])
             .current_dir(cwd)
             .output()
             .await;
@@ -605,9 +630,54 @@ async fn has_uncommitted_changes(cwd: &str) -> Result<bool> {
     Ok(!stdout.trim().is_empty())
 }
 
+/// Whether the worktree at `path` has nothing uncommitted: no tracked change
+/// and no untracked file.
+///
+/// Unlike [`has_uncommitted_changes`], this fails CLOSED: when git itself
+/// fails, the answer is an error, never "clean". It guards a deletion, so a
+/// doubt must keep the worktree.
+async fn worktree_is_clean(path: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .await
+        .context("Failed to run git status")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed in {}: {}",
+            path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+/// The commit `refs/stash` points at, or `None` when the stash is empty.
+async fn stash_tip(cwd: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "refs/stash"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Stash uncommitted changes if any exist.
+///
+/// Returns `true` only when an entry was really created. `git stash push`
+/// leaves untracked files alone and, when nothing else changed, answers
+/// "No local changes to save" with exit code 0: believing that a stash was made
+/// would make the later `stash pop` restore an entry that belongs to someone
+/// else (the stash stack is shared by every worktree of the repository).
 async fn stash_if_needed(cwd: &str) -> Result<bool> {
     if has_uncommitted_changes(cwd).await? {
+        let before = stash_tip(cwd).await;
         let output = Command::new("git")
             .args(["stash", "push", "-m", "runner-worktree-collector"])
             .current_dir(cwd)
@@ -616,21 +686,38 @@ async fn stash_if_needed(cwd: &str) -> Result<bool> {
             .context("Failed to git stash")?;
 
         if output.status.success() {
-            info!("Stashed uncommitted changes before worktree collection");
-            return Ok(true);
+            if stash_tip(cwd).await != before {
+                info!("Stashed uncommitted changes before worktree collection");
+                return Ok(true);
+            }
+            debug!("Nothing to stash (only untracked files): no stash entry created");
         }
     }
     Ok(false)
 }
 
-/// Pop stash if we stashed earlier.
+/// Pop stash if we stashed earlier. A failure is reported, never swallowed: on
+/// a conflict git keeps the entry, and the person must know where their changes
+/// are.
 async fn unstash_if_needed(cwd: &str, was_stashed: bool) -> Result<()> {
     if was_stashed {
-        let _ = Command::new("git")
+        match Command::new("git")
             .args(["stash", "pop"])
             .current_dir(cwd)
             .output()
-            .await;
+            .await
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => warn!(
+                "`git stash pop` failed in {}: {} — the changes stay in the stash entry 'runner-worktree-collector'",
+                cwd,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => warn!(
+                "Could not run `git stash pop` in {}: {} — the changes stay in the stash entry 'runner-worktree-collector'",
+                cwd, e
+            ),
+        }
     }
     Ok(())
 }
@@ -1167,5 +1254,148 @@ branch refs/heads/feature
 
         assert_eq!(cleaned, 1);
         assert!(!wt.exists(), "recovered agent worktree kept");
+    }
+
+    /// Throwaway repository with one tracked file, for the #1299 tests.
+    fn sweep_repo() -> (
+        tempfile::TempDir,
+        impl Fn(&std::path::Path, &[&str]) -> String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "base").unwrap();
+        git(dir.path(), &["add", "f.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        (dir, git)
+    }
+
+    /// #1299 — a delegation that ends NORMALLY sweeps every agent worktree of
+    /// the repository, not only its own. A worktree with no new commit is not
+    /// "stale": it is also the state of one where another agent is still working
+    /// and has not committed yet. Its modified and untracked files, and its
+    /// branch, must survive; a clean worktree with no commit is still cleaned.
+    #[tokio::test]
+    async fn test_resolve_worktrees_spares_a_neighbour_with_uncommitted_work() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        for (branch, path) in [
+            ("agent-busy", ".claude/worktrees/agent-busy"),
+            ("agent-idle", ".claude/worktrees/agent-idle"),
+        ] {
+            git(root, &["worktree", "add", "-q", "-b", branch, path]);
+        }
+        let busy = root.join(".claude/worktrees/agent-busy");
+        std::fs::write(busy.join("f.txt"), "edited, not committed").unwrap();
+        std::fs::write(busy.join("new.txt"), "untracked, not committed").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let lock = Arc::new(Mutex::new(()));
+        WorktreeCollector::resolve_worktrees("main", &cwd, lock)
+            .await
+            .unwrap();
+
+        assert!(busy.exists(), "a neighbour's worktree was removed");
+        assert_eq!(
+            std::fs::read_to_string(busy.join("f.txt")).unwrap(),
+            "edited, not committed",
+            "a neighbour's tracked edit was lost"
+        );
+        assert_eq!(
+            std::fs::read_to_string(busy.join("new.txt")).unwrap(),
+            "untracked, not committed",
+            "a neighbour's untracked file was lost"
+        );
+        assert!(
+            git(root, &["branch", "--list", "agent-busy"]).contains("agent-busy"),
+            "a neighbour's branch was deleted"
+        );
+        assert!(
+            !root.join(".claude/worktrees/agent-idle").exists(),
+            "a clean worktree with no commit must still be cleaned up"
+        );
+    }
+
+    /// The same guard covers the end-of-run sweep.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_spares_a_worktree_with_uncommitted_work() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-busy",
+                ".claude/worktrees/agent-busy",
+            ],
+        );
+        let busy = root.join(".claude/worktrees/agent-busy");
+        std::fs::write(busy.join("new.txt"), "untracked, not committed").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert_eq!(cleaned, 0);
+        assert!(busy.join("new.txt").exists(), "uncommitted work was lost");
+    }
+
+    /// #1299 (point 3) — `git stash push` leaves untracked files alone and, when
+    /// nothing else changed, says "No local changes to save" with exit code 0.
+    /// Believing a stash was made, the sweep popped the top entry of the stash
+    /// stack, which is shared by every worktree: someone else's stash was
+    /// restored into the working directory. It must be left where it is.
+    #[tokio::test]
+    async fn test_resolve_worktrees_does_not_pop_a_stash_it_did_not_create() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        // Somebody else's stash entry.
+        std::fs::write(root.join("f.txt"), "someone else's change").unwrap();
+        git(root, &["stash", "push", "-q", "-m", "not-ours"]);
+        // The checkout now only has an untracked file, which stash ignores.
+        std::fs::write(root.join("scratch.txt"), "untracked").unwrap();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-x",
+                ".claude/worktrees/agent-x",
+            ],
+        );
+
+        let cwd = root.to_string_lossy().to_string();
+        let lock = Arc::new(Mutex::new(()));
+        WorktreeCollector::resolve_worktrees("main", &cwd, lock)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "base",
+            "someone else's stash entry was popped into the checkout"
+        );
+        assert!(
+            git(root, &["stash", "list"]).contains("not-ours"),
+            "someone else's stash entry is gone"
+        );
     }
 }
