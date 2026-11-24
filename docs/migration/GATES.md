@@ -42,7 +42,7 @@ Ce que ça **ne** couvre pas, et qu'il faut savoir :
 
 | # | Porte | Ce qu'elle prouve | Où elle tourne | État réel (20/11/2026) |
 |---|---|---|---|---|
-| G1 | containment | la branche contient `origin/main` | CI, Lint & Format | vert sur la consolidation après la descente #1253 |
+| G1 | containment | la branche contient `origin/main` | CI, Lint & Format | **non contenue à l'instant de la mesure** (23/11/2026, 23:05 UTC, après `git fetch origin`) : `origin/main` a des commits absents de `origin/consolidation/obrain-default` ; commande et nombres dans `CONSOLIDATION.md`, règle 2. Vert après #1253 (20/11), puis `main` a avancé |
 | G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
 | G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
 | G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 17 autres restent à couvrir sur obrain |
