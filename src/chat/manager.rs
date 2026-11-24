@@ -10225,6 +10225,12 @@ impl ChatManager {
                     // Now we select! between the two sources so control messages are
                     // processed even when the stream is idle (waiting for permission).
                     let mut interrupted_in_stream = false;
+                    // Set when THIS turn was ended by the backend to pose a question (§15.6):
+                    // the CLI then closes it `subtype: "error_during_execution"` (we interrupted
+                    // it), and that label must not be read as a failure — a failed turn closes
+                    // the question it had just opened (measured 24/11/2026, session 76faba47:
+                    // the card was unanswerable 8 ms after it appeared).
+                    let mut ended_on_question = false;
                     loop {
                         let result = if let Some(ref mut rx) = sdk_control_rx {
                             tokio::select! {
@@ -10286,6 +10292,7 @@ impl ChatManager {
                                                             let _ = tx.send(json).await;
                                                             info!(request_id = %id, "Closed AskUserQuestion control request (answer comes as the next turn)");
                                                         }
+                                                        ended_on_question = true;
                                                     }
                                                 } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                     // Regular permission (its input stored above): a session grant may answer it
@@ -10352,6 +10359,7 @@ impl ChatManager {
                                                                 info!(request_id = %id, "Closed AskUserQuestion control request (drain)");
                                                             }
                                                         }
+                                                        ended_on_question = true;
                                                     } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
                                                         if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
@@ -10571,7 +10579,26 @@ impl ChatManager {
                                 }
 
                                 // Convert to ChatEvent(s) and emit + persist structured events
-                                let events = Self::message_to_events(msg);
+                                let mut events = Self::message_to_events(msg);
+                                // The turn the backend ended to pose a question COMPLETED: the
+                                // CLI's `error_during_execution` is the interruption we sent, not
+                                // a failure. The engine's own `stop_reason` is what the state model
+                                // reads before the raw subtype (segment_state::signal_of).
+                                if ended_on_question {
+                                    for event in events.iter_mut() {
+                                        if let ChatEvent::Result {
+                                            stop_reason,
+                                            is_error,
+                                            ..
+                                        } = event
+                                        {
+                                            if !*is_error && stop_reason.is_none() {
+                                                *stop_reason = Some("completed".to_string());
+                                            }
+                                            ended_on_question = false;
+                                        }
+                                    }
+                                }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
                                     if let Some(call) = super::session_grants::observed_call(
