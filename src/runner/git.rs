@@ -67,6 +67,11 @@ pub struct WorktreeResolution {
     pub total_merged: usize,
     pub total_conflicts: usize,
     pub details: Vec<WorktreeResult>,
+    /// The collector stashed the uncommitted changes of `cwd` before recovering
+    /// commits and could NOT restore them: what went wrong, and the name of the
+    /// stash entry that still holds them (#1299). `None`: nothing was stashed,
+    /// or it was restored.
+    pub unpopped_stash: Option<String>,
 }
 
 // ============================================================================
@@ -169,11 +174,17 @@ impl WorktreeCollector {
     // Step 2 — collect_commits
     // --------------------------------------------------------------------
 
-    /// List commit SHAs present in `worktree_branch` but NOT in `run_branch`.
+    /// List commit SHAs present in `worktree_branch` that still need to be
+    /// cherry-picked onto `run_branch`, oldest first.
     ///
-    /// Uses `git log <worktree_branch> --not <run_branch> --format=%H` to get
-    /// only the commits that need to be cherry-picked. Results are returned in
-    /// reverse chronological order (oldest first for cherry-pick).
+    /// `git log <worktree_branch> --not <run_branch>` gives the commits that are
+    /// not ANCESTORS of the run branch. A recovered commit is a cherry-pick (a
+    /// new SHA), so a worktree that is kept after its recovery (#1299: another
+    /// agent still works in it) would list the same commits again at every
+    /// sweep; cherry-picking them a second time gives an empty pick, which was
+    /// read as a conflict and stopped the recovery of every commit behind it.
+    /// The list is therefore narrowed to the commits with no patch-equivalent
+    /// on the run branch (`git cherry`, as `cleanup_worktrees` already judges).
     pub async fn collect_commits(
         worktree_branch: &str,
         run_branch: &str,
@@ -209,6 +220,48 @@ impl WorktreeCollector {
             .filter(|l| !l.is_empty())
             .map(|l| l.trim().to_string())
             .collect();
+
+        if commits.is_empty() {
+            return Ok(commits);
+        }
+
+        // `+ <sha>`: no patch-equivalent commit on the run branch; `- <sha>`:
+        // already there under another SHA. When `git cherry` itself fails, the
+        // ancestry list stands, as before.
+        let cherry = Command::new("git")
+            .args(["cherry", run_branch, worktree_branch])
+            .current_dir(cwd)
+            .output()
+            .await
+            .context("Failed to run git cherry")?;
+        if !cherry.status.success() {
+            debug!(
+                "git cherry {} {} failed, recovering every non-ancestor commit: {}",
+                run_branch,
+                worktree_branch,
+                String::from_utf8_lossy(&cherry.stderr).trim()
+            );
+            return Ok(commits);
+        }
+        let unrecovered: std::collections::HashSet<String> =
+            String::from_utf8_lossy(&cherry.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix("+ "))
+                .map(|sha| sha.trim().to_string())
+                .collect();
+        let already = commits.len();
+        let commits: Vec<String> = commits
+            .into_iter()
+            .filter(|sha| unrecovered.contains(sha))
+            .collect();
+        if commits.len() < already {
+            debug!(
+                "{} commit(s) of {} already recovered onto {} (patch-equivalent), skipped",
+                already - commits.len(),
+                worktree_branch,
+                run_branch
+            );
+        }
 
         Ok(commits)
     }
@@ -328,7 +381,13 @@ impl WorktreeCollector {
         info!("Found {} agent worktrees to resolve", agent_worktrees.len());
 
         // Stash uncommitted changes to avoid conflicts
-        let was_stashed = stash_if_needed(cwd).await.unwrap_or(false);
+        let stashed = match stash_if_needed(cwd).await {
+            Ok(stashed) => stashed,
+            Err(e) => {
+                warn!("Could not stash the uncommitted changes of {}: {}", cwd, e);
+                None
+            }
+        };
 
         // 2–3. For each worktree: collect commits → cherry-pick
         for wt in &agent_worktrees {
@@ -368,7 +427,8 @@ impl WorktreeCollector {
                     wt.path.display(),
                     branch_name
                 );
-                // Clean up even if no commits — the worktree is stale
+                // No commit to recover: clean the worktree up IF it is really
+                // stale — one with uncommitted work in it is kept (#1299).
                 let cleaned = Self::cleanup_single_worktree(cwd, wt).await;
                 resolution.details.push(WorktreeResult {
                     worktree: wt.clone(),
@@ -405,8 +465,9 @@ impl WorktreeCollector {
             });
         }
 
-        // Restore stash
-        unstash_if_needed(cwd, was_stashed).await?;
+        // Restore the stash entry this sweep made (by its nonce, never the top
+        // of the shared stack). A failure is carried, not swallowed.
+        resolution.unpopped_stash = unstash_if_needed(cwd, stashed).await;
 
         if resolution.total_merged > 0 || resolution.total_conflicts > 0 {
             info!(
@@ -431,9 +492,9 @@ impl WorktreeCollector {
     /// worktrees are candidates: a user's own `.claude/worktrees/<name>` (e.g. an
     /// interactive session in the same repo) is never touched. An agent
     /// worktree whose branch still holds commits that were not recovered onto
-    /// the current branch is kept as well, since `worktree remove --force` +
-    /// `branch -D` would destroy that work. Returns the number of removed
-    /// worktrees.
+    /// the current branch is kept as well, and so is one with uncommitted work
+    /// in it (`cleanup_single_worktree`, #1299): removing it and deleting its
+    /// branch would destroy that work. Returns the number of removed worktrees.
     pub async fn cleanup_worktrees(cwd: &str) -> Result<usize> {
         let worktrees = Self::list_worktrees(cwd).await?;
 
@@ -519,33 +580,54 @@ impl WorktreeCollector {
     /// A worktree with anything uncommitted in it (tracked changes or untracked
     /// files) is KEPT. "No new commit" does not mean "stale": it is also the
     /// state of a worktree in which another agent is still working and has not
-    /// committed yet (#1299). Removal is therefore never forced, and the check
-    /// fails closed: if git cannot say the worktree is clean, it stays.
+    /// committed yet (#1299). The check fails closed: if git cannot say the
+    /// worktree is clean, it stays. Removal is not forced, so git's own refusal
+    /// of a dirty or locked worktree stands behind the check — with one
+    /// exception: a worktree that holds submodules is refused by git even when
+    /// clean, and is removed with `--force` once the check has passed.
+    ///
+    /// A worktree whose directory is gone (`prunable`) has nothing left to
+    /// protect: it is removed without the check, which could not run in it.
     async fn cleanup_single_worktree(cwd: &str, wt: &WorktreeInfo) -> bool {
         let wt_path = wt.path.to_string_lossy();
 
-        match worktree_is_clean(&wt_path).await {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    "Keeping worktree {}: it has uncommitted changes (another agent may still be working in it)",
-                    wt_path
-                );
-                return false;
+        let gone = wt.is_prunable || !wt.path.exists();
+        let mut force = false;
+        if gone {
+            debug!(
+                "Worktree {} has no directory any more: removing its entry",
+                wt_path
+            );
+        } else {
+            match worktree_is_clean(&wt_path).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "Keeping worktree {}: it has uncommitted changes (another agent may still be working in it)",
+                        wt_path
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    warn!(
+                        "Keeping worktree {}: cannot verify it is clean: {}",
+                        wt_path, e
+                    );
+                    return false;
+                }
             }
-            Err(e) => {
-                warn!(
-                    "Keeping worktree {}: cannot verify it is clean: {}",
-                    wt_path, e
-                );
-                return false;
-            }
+            // `git worktree remove` refuses a worktree with submodules unless
+            // forced, clean or not (man git-worktree). The check above has
+            // passed, so forcing here only bypasses that refusal.
+            force = wt.path.join(".gitmodules").exists();
         }
 
-        // Remove the worktree (no `--force`: git itself refuses a dirty or
-        // locked worktree, a second line of defence behind the check above)
+        let mut args = vec!["worktree", "remove", &*wt_path];
+        if force {
+            args.push("--force");
+        }
         let output = Command::new("git")
-            .args(["worktree", "remove", &*wt_path])
+            .args(&args)
             .current_dir(cwd)
             .output()
             .await;
@@ -654,72 +736,122 @@ async fn worktree_is_clean(path: &str) -> Result<bool> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
-/// The commit `refs/stash` points at, or `None` when the stash is empty.
-async fn stash_tip(cwd: &str) -> Option<String> {
+/// The marker every stash entry this collector makes carries in its message,
+/// followed by a nonce that names one sweep.
+const STASH_MARKER: &str = "runner-worktree-collector";
+
+/// The `stash@{n}` reference of the entry whose message carries `nonce`, if it
+/// is still on the stack. The stack is shared by every worktree of the
+/// repository and other processes push and pop on it: an entry is found by
+/// what only it carries, never by its position.
+async fn stash_entry_with(cwd: &str, nonce: &str) -> Result<Option<String>> {
     let output = Command::new("git")
-        .args(["rev-parse", "-q", "--verify", "refs/stash"])
+        .args(["stash", "list", "--format=%gd %s"])
         .current_dir(cwd)
         .output()
         .await
-        .ok()?;
+        .context("Failed to run git stash list")?;
     if !output.status.success() {
-        return None;
+        anyhow::bail!(
+            "git stash list failed in {}: {}",
+            cwd,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (reference, subject) = line.split_once(' ')?;
+            subject.contains(nonce).then(|| reference.to_string())
+        }))
 }
 
-/// Stash uncommitted changes if any exist.
+/// Stash the uncommitted changes of `cwd` if there are any.
 ///
-/// Returns `true` only when an entry was really created. `git stash push`
-/// leaves untracked files alone and, when nothing else changed, answers
-/// "No local changes to save" with exit code 0: believing that a stash was made
-/// would make the later `stash pop` restore an entry that belongs to someone
-/// else (the stash stack is shared by every worktree of the repository).
-async fn stash_if_needed(cwd: &str) -> Result<bool> {
-    if has_uncommitted_changes(cwd).await? {
-        let before = stash_tip(cwd).await;
-        let output = Command::new("git")
-            .args(["stash", "push", "-m", "runner-worktree-collector"])
-            .current_dir(cwd)
-            .output()
-            .await
-            .context("Failed to git stash")?;
-
-        if output.status.success() {
-            if stash_tip(cwd).await != before {
-                info!("Stashed uncommitted changes before worktree collection");
-                return Ok(true);
-            }
+/// Returns the nonce of the entry that was really created, or `None`. `git
+/// stash push` leaves untracked files alone and, when nothing else changed,
+/// answers "No local changes to save" with exit code 0: believing that a stash
+/// was made would make the later pop restore an entry that belongs to someone
+/// else (#1299). The entry is therefore looked up by its own nonce after the
+/// push, and popped by it later.
+async fn stash_if_needed(cwd: &str) -> Result<Option<String>> {
+    if !has_uncommitted_changes(cwd).await? {
+        return Ok(None);
+    }
+    let nonce = format!("{STASH_MARKER} {}", uuid::Uuid::new_v4());
+    let output = Command::new("git")
+        .args(["stash", "push", "-m", &nonce])
+        .current_dir(cwd)
+        .output()
+        .await
+        .context("Failed to git stash")?;
+    if !output.status.success() {
+        warn!(
+            "`git stash push` failed in {}: {}",
+            cwd,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(None);
+    }
+    match stash_entry_with(cwd, &nonce).await? {
+        Some(_) => {
+            info!("Stashed uncommitted changes before worktree collection ({nonce})");
+            Ok(Some(nonce))
+        }
+        None => {
             debug!("Nothing to stash (only untracked files): no stash entry created");
+            Ok(None)
         }
     }
-    Ok(false)
 }
 
-/// Pop stash if we stashed earlier. A failure is reported, never swallowed: on
-/// a conflict git keeps the entry, and the person must know where their changes
-/// are.
-async fn unstash_if_needed(cwd: &str, was_stashed: bool) -> Result<()> {
-    if was_stashed {
-        match Command::new("git")
-            .args(["stash", "pop"])
-            .current_dir(cwd)
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => warn!(
-                "`git stash pop` failed in {}: {} — the changes stay in the stash entry 'runner-worktree-collector'",
-                cwd,
+/// Pop the stash entry `stash_if_needed` made, found by its nonce. Returns what
+/// went wrong when the changes could not be restored — logged AND handed back,
+/// so the caller carries it (`WorktreeResolution::unpopped_stash`) instead of
+/// the person discovering an emptied working directory. On a conflict git
+/// keeps the entry: the message names it.
+async fn unstash_if_needed(cwd: &str, stashed: Option<String>) -> Option<String> {
+    let nonce = stashed?;
+    let entry = match stash_entry_with(cwd, &nonce).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            let what = format!(
+                "the stash entry '{nonce}' made in {cwd} is no longer on the stack: another process popped or dropped it"
+            );
+            warn!("{what}");
+            return Some(what);
+        }
+        Err(e) => {
+            let what = format!(
+                "could not look the stash entry '{nonce}' up in {cwd}: {e} — the changes stay in it"
+            );
+            warn!("{what}");
+            return Some(what);
+        }
+    };
+    match Command::new("git")
+        .args(["stash", "pop", &entry])
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let what = format!(
+                "`git stash pop {entry}` failed in {cwd}: {} — the changes stay in the stash entry '{nonce}'",
                 String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => warn!(
-                "Could not run `git stash pop` in {}: {} — the changes stay in the stash entry 'runner-worktree-collector'",
-                cwd, e
-            ),
+            );
+            warn!("{what}");
+            Some(what)
+        }
+        Err(e) => {
+            let what = format!(
+                "could not run `git stash pop {entry}` in {cwd}: {e} — the changes stay in the stash entry '{nonce}'"
+            );
+            warn!("{what}");
+            Some(what)
         }
     }
-    Ok(())
 }
 
 // ============================================================================
@@ -732,6 +864,8 @@ pub struct WorktreeCollectionResult {
     pub recovered_commits: Vec<String>,
     pub conflicts: Vec<WorktreeConflict>,
     pub cleaned_up: Vec<String>,
+    /// See [`WorktreeResolution::unpopped_stash`].
+    pub unpopped_stash: Option<String>,
 }
 
 /// Backward-compatible conflict type.
@@ -761,6 +895,7 @@ pub async fn collect_worktree_commits(
         recovered_commits: Vec::new(),
         conflicts: Vec::new(),
         cleaned_up: Vec::new(),
+        unpopped_stash: resolution.unpopped_stash.clone(),
     };
 
     for detail in &resolution.details {
@@ -1007,6 +1142,7 @@ branch refs/heads/feature
                     cleaned_up: false,
                 },
             ],
+            unpopped_stash: None,
         };
 
         // Simulate the conversion done in collect_worktree_commits
@@ -1278,10 +1414,185 @@ branch refs/heads/feature
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git(dir.path(), &["init", "-q", "-b", "main"]);
+        // The code under test runs `git cherry-pick` and `git stash` in this
+        // repository with no `-c user.*`: give the repository an identity, so
+        // the tests do not depend on the machine's global config.
+        git(dir.path(), &["config", "user.email", "t@t"]);
+        git(dir.path(), &["config", "user.name", "t"]);
         std::fs::write(dir.path().join("f.txt"), "base").unwrap();
         git(dir.path(), &["add", "f.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "init"]);
         (dir, git)
+    }
+
+    /// Review of #1309 (R1) — a worktree whose directory is gone (`prunable`)
+    /// has nothing left to protect. The clean check cannot run in a directory
+    /// that does not exist, and failing closed there would keep the entry and
+    /// its branch forever, re-warning at every sweep.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_removes_a_prunable_worktree() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-gone",
+                ".claude/worktrees/agent-gone",
+            ],
+        );
+        std::fs::remove_dir_all(root.join(".claude/worktrees/agent-gone")).unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert_eq!(cleaned, 1, "the prunable worktree was kept");
+        assert!(
+            !git(root, &["worktree", "list", "--porcelain"]).contains("agent-gone"),
+            "the prunable entry is still registered"
+        );
+        assert!(
+            git(root, &["branch", "--list", "agent-gone"]).is_empty(),
+            "the prunable worktree's branch was kept"
+        );
+    }
+
+    /// Review of #1309 (R2) — `git worktree remove` refuses a worktree that
+    /// holds submodules unless forced, clean or not. Without `--force` for that
+    /// case, no agent worktree of a repository with submodules could ever be
+    /// cleaned up again.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_removes_a_clean_worktree_with_submodules() {
+        let (sub, _) = sweep_repo();
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        git(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub.path().to_string_lossy(),
+                "sub",
+            ],
+        );
+        git(root, &["commit", "-q", "-m", "submodule"]);
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-sub",
+                ".claude/worktrees/agent-sub",
+            ],
+        );
+        let wt = root.join(".claude/worktrees/agent-sub");
+        assert!(wt.join(".gitmodules").exists());
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert_eq!(cleaned, 1, "the clean worktree with submodules was kept");
+        assert!(!wt.exists());
+    }
+
+    /// Review of #1309 (R3) — a kept worktree (dirty neighbour) whose commit was
+    /// already recovered must not be read as a conflict at the next sweep: a
+    /// recovered commit is a cherry-pick (new SHA), so ancestry lists it again,
+    /// and an empty pick stopped the recovery of every commit behind it.
+    #[tokio::test]
+    async fn test_resolve_worktrees_recovers_later_commits_of_a_kept_worktree() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-n",
+                ".claude/worktrees/agent-n",
+            ],
+        );
+        let wt = root.join(".claude/worktrees/agent-n");
+        std::fs::write(wt.join("a.txt"), "A").unwrap();
+        git(&wt, &["add", "a.txt"]);
+        git(&wt, &["commit", "-q", "-m", "A"]);
+        // The neighbour keeps working: untracked, uncommitted.
+        std::fs::write(wt.join("wip.txt"), "not yet").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let lock = Arc::new(Mutex::new(()));
+        let first = WorktreeCollector::resolve_worktrees("main", &cwd, lock.clone())
+            .await
+            .unwrap();
+        assert_eq!((first.total_merged, first.total_conflicts), (1, 0));
+        assert!(root.join("a.txt").exists(), "A was not recovered onto main");
+        assert!(wt.exists(), "the dirty neighbour was removed");
+
+        // The neighbour commits again; the earlier commit is already on main.
+        std::fs::write(wt.join("c.txt"), "C").unwrap();
+        git(&wt, &["add", "c.txt"]);
+        git(&wt, &["commit", "-q", "-m", "C"]);
+        let second = WorktreeCollector::resolve_worktrees("main", &cwd, lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            (second.total_merged, second.total_conflicts),
+            (1, 0),
+            "the already-recovered commit was read as a conflict: {:?}",
+            second.details
+        );
+        assert!(
+            root.join("c.txt").exists(),
+            "the later commit was not recovered onto main"
+        );
+    }
+
+    /// Review of #1309 (R4) — the stash stack is shared and other processes
+    /// push on it while a sweep runs: the entry popped must be the one THIS
+    /// sweep made, found by its nonce, never the top of the stack.
+    #[tokio::test]
+    async fn test_unstash_pops_its_own_entry_not_the_top_of_the_stack() {
+        let (dir, git) = sweep_repo();
+        let root = dir.path();
+        std::fs::write(root.join("f.txt"), "ours").unwrap();
+
+        let cwd = root.to_string_lossy().to_string();
+        let ours = stash_if_needed(&cwd)
+            .await
+            .unwrap()
+            .expect("a tracked change must be stashed");
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "base");
+        // Someone else pushes on top while the sweep is recovering commits.
+        std::fs::write(root.join("f.txt"), "theirs").unwrap();
+        git(root, &["stash", "push", "-q", "-m", "not-ours"]);
+
+        let failure = unstash_if_needed(&cwd, Some(ours)).await;
+
+        assert_eq!(failure, None, "{failure:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "ours",
+            "the top of the stack was popped instead of our entry"
+        );
+        let list = git(root, &["stash", "list"]);
+        assert!(
+            list.contains("not-ours"),
+            "someone else's entry is gone: {list}"
+        );
+        assert!(
+            !list.contains(STASH_MARKER),
+            "our entry is still on the stack: {list}"
+        );
     }
 
     /// #1299 — a delegation that ends NORMALLY sweeps every agent worktree of
