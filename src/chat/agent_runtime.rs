@@ -873,7 +873,7 @@ pub struct AgentSessionHandle {
     /// What the host does around a turn (`None`: nothing, the bare provider).
     services: Option<Arc<dyn TurnServices>>,
     /// Messages waiting for the running turn to end (`chat::pending_queue`).
-    pending: Mutex<std::collections::VecDeque<PendingMessage>>,
+    pub(crate) pending: Mutex<std::collections::VecDeque<PendingMessage>>,
     /// The background events already announced to the agent (the end of a task, a
     /// `Monitor` line): what keeps a table sent again from waking the same task twice
     /// (`super::oob_listener::background_wake_lines`).
@@ -1793,6 +1793,50 @@ impl AgentSessionHandle {
             }
         }
         self.send_message(content).await
+    }
+
+    /// A message from a peer agent (#1271). While a turn runs it is queued AS A TEAM MESSAGE
+    /// — the peer's raw text and its sender, the `[team name]` prefix added when it is sent
+    /// — so an interruption of that turn keeps it (`chat::drain::pop_next_after_turn` drops
+    /// hints, not team messages). Its `TeamMessage` event is shown when it is played, as
+    /// on the Claude Code engine. When the session is idle it is shown now and sent as a
+    /// turn of its own, which counts as no message of the person.
+    pub async fn inject_team_message(
+        self: &Arc<Self>,
+        text: &str,
+        from_session_id: Uuid,
+        from_name: &str,
+    ) -> Result<()> {
+        {
+            // Read and set under the queue lock, as `send_message_relayed` does: the message
+            // is either queued behind the running turn or starts its own.
+            let mut queue = self.pending.lock().await;
+            if self.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::team_message(
+                    text.to_string(),
+                    from_session_id,
+                    from_name.to_string(),
+                ));
+                return Ok(());
+            }
+            self.is_streaming.store(true, Ordering::SeqCst);
+        }
+        self.emit(ChatEvent::TeamMessage {
+            from_session_id,
+            from_name: from_name.to_string(),
+            content: text.to_string(),
+        })
+        .await;
+        let sent = format!("[team {}] {}", from_name, text);
+        self.start(
+            PendingMessageKind::TeamMessage {
+                from_session_id,
+                from_name: from_name.to_string(),
+            },
+            text,
+            &sent,
+        )
+        .await
     }
 
     /// Wakes this session for an out-of-turn event the agent has to answer — the end of

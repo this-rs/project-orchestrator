@@ -1834,7 +1834,7 @@ pub(crate) async fn launch_delegation(
 
     // A delegation is a pair: `delegation_started` here, and
     // `delegation_completed` / `delegation_failed` from
-    // `listen_delegation_result`. Without the first one a client only learns
+    // `conclude_delegation` (every end goes through it). Without the first one a client only learns
     // about a sub-agent once it has already answered — the parent→child link
     // could never be animated. `provider` and `model` are deliberately absent:
     // the router's pick is not resolved yet at this point, and guessing them
@@ -1858,35 +1858,42 @@ pub(crate) async fn launch_delegation(
     let graph_for_place = graph.clone();
     tokio::spawn(async move {
         let run = async {
-            // Send the prompt
+            // Send the prompt, then subscribe to the child's events. `None` when either fails:
+            // the delegation then ends before anybody could listen to it, and is closed as
+            // such below. It used to `return` here, which left the execution to its drop —
+            // closed `failed` with the session that delegated never told (#1272).
             // Task text is not a composed message: no block may ride on it.
-            if let Err(e) = cm
+            let rx = match cm
                 .send_message(&sid, &crate::refs::compose::inert(&prompt))
                 .await
             {
-                tracing::error!(
-                    session_id = %sid,
-                    task_id = %ev_task_id,
-                    "Failed to send delegation prompt: {}", e
-                );
-                // `execution` drops here: it is closed `failed`.
-                return;
-            }
-
-            tracing::info!(
-                session_id = %ev_session_id,
-                task_id = %ev_task_id,
-                plan_id = %ev_plan_id,
-                task_title = %task_title_clone,
-                "Delegation started: sub-agent spawned with enriched prompt"
-            );
-
-            // Listen for completion and emit TaskCompleted event
-            let rx = match cm.subscribe(&sid).await {
-                Ok(rx) => rx,
                 Err(e) => {
-                    tracing::warn!("Failed to subscribe to delegated session {}: {}", sid, e);
-                    return;
+                    tracing::error!(
+                        session_id = %sid,
+                        task_id = %ev_task_id,
+                        "Failed to send delegation prompt: {}", e
+                    );
+                    None
+                }
+                Ok(_) => {
+                    tracing::info!(
+                        session_id = %ev_session_id,
+                        task_id = %ev_task_id,
+                        plan_id = %ev_plan_id,
+                        task_title = %task_title_clone,
+                        "Delegation started: sub-agent spawned with enriched prompt"
+                    );
+                    match cm.subscribe(&sid).await {
+                        Ok(rx) => Some(rx),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to subscribe to delegated session {}: {}",
+                                sid,
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
             };
 
@@ -1901,7 +1908,7 @@ pub(crate) async fn launch_delegation(
                     graph: graph_for_close,
                     decision_id: id,
                 });
-            listen_delegation_result(
+            conclude_delegation(
                 rx,
                 ev_task_id,
                 &task_title_clone,
@@ -2139,6 +2146,53 @@ fn delegation_chat_request(
     Ok(request)
 }
 
+/// Brings a delegation to its end: listens to it (`rx`), or — when nobody can listen, `rx`
+/// being `None` because its prompt was refused or its channel could not be subscribed —
+/// closes it at once. Both ends go through `DelegationClosure::finish` (#1272): the
+/// execution is closed, the session that delegated is woken, and clients get the
+/// `delegation_failed` that pairs with the `delegation_started` already emitted. A
+/// delegation closed unheard recovers no commit: `cwd` is only used when it is listened to.
+#[allow(clippy::too_many_arguments)]
+async fn conclude_delegation(
+    rx: Option<tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>>,
+    task_id: Uuid,
+    task_title: &str,
+    event_bus: std::sync::Arc<crate::events::HybridEmitter>,
+    cwd: Option<String>,
+    close: Option<DelegationClose>,
+    execution: DelegationExecution,
+    owner: DelegationOwner,
+    limits: crate::runner::DelegationLimits,
+    halt: Option<Arc<dyn DelegationHalt>>,
+) -> Option<nexus_claude::agent::StopReason> {
+    match rx {
+        Some(rx) => {
+            listen_delegation_result(
+                rx, task_id, task_title, event_bus, cwd, close, execution, owner, limits, halt,
+            )
+            .await
+        }
+        None => {
+            // The child never took its prompt: it produced nothing to recover. The agent
+            // worktrees of the repository are therefore NOT swept (`cwd: None`): that sweep
+            // removes the ones with no new commit, and a sibling still at work may own one.
+            DelegationClosure {
+                task_id,
+                task_title,
+                event_bus,
+                cwd: None,
+                close,
+                owner,
+                limits,
+                halt,
+                close_child: false,
+            }
+            .finish(DelegationEnd::failed(), None, execution)
+            .await
+        }
+    }
+}
+
 /// Listen for a delegated sub-agent's Result event and emit a RunnerEvent-compatible
 /// CrudEvent so the frontend is notified via WebSocket.
 /// Also collects commits from agent worktrees after completion (prevents ghost completions).
@@ -2187,9 +2241,10 @@ async fn listen_delegation_result(
     // delegation ends when the child has nothing left to do, on the LAST `Result` it gave —
     // the spend it states is cumulative, so the later one is also the true total.
     //
-    // Every `break` leaves `execution` to drop: closed `failed` (channel closed with nothing
-    // to close on). Every other end — a `Result` with nothing left behind it, the child's
-    // death, the delay — goes through ONE closure (`DelegationClosure::finish`, PYSR-3b).
+    // Every end — a `Result` with nothing left behind it, the child's death, the delay, a
+    // channel closed with nothing to close on — goes through ONE closure
+    // (`DelegationClosure::finish`, PYSR-3b), which closes the execution AND wakes the parent
+    // (#1272). The loop never falls through: only a `return` leaves it.
     let mut ended_turn: Option<(DelegationEnd, Option<serde_json::Value>)> = None;
     // Whether a NEW turn began since `ended_turn` (#1239). Decided on the ORDER of the events
     // of this one channel — `StreamingStatus { true }` (emitted when a turn starts) comes
@@ -2318,12 +2373,18 @@ async fn listen_delegation_result(
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 // The child left with nothing more to say: close on its last finished turn,
-                // otherwise `failed` (the `execution` drop, below).
+                // otherwise `failed`. Both go through the closure, so the parent is woken
+                // (#1272): a bare `break` dropped the execution, and a drop closes it without
+                // notifying the session that delegated.
                 if let Some((end, cost_detail)) = ended_turn.take() {
                     return closure.finish(end, cost_detail, execution).await;
                 }
                 tracing::warn!(task_id = %task_id, "Delegation channel closed");
-                break;
+                let end = DelegationEnd {
+                    duration_secs: Some(start.elapsed().as_secs_f64()),
+                    ..DelegationEnd::failed()
+                };
+                return closure.finish(end, None, execution).await;
             }
             Err(_) => {
                 // The tick: close on the finished turn once the child has nothing left to do
@@ -2338,7 +2399,6 @@ async fn listen_delegation_result(
             }
         }
     }
-    None
 }
 
 /// How often the listener polls its channel while the child works and says nothing.
@@ -2921,10 +2981,11 @@ impl DelegationEnd {
     }
 }
 
-/// A delegation's AgentExecution, closed exactly once (B36): by `close` with
-/// what its `Result` reported, or — on any other path (prompt not sent, channel
-/// closed, timeout, panic) — `failed` with an `unknown` cost when it drops. No
-/// execution is left `running`.
+/// A delegation's AgentExecution, closed exactly once (B36): by `close`, on every end the
+/// delegation reaches — what its `Result` reported, its delay, its child's death, a channel
+/// closed with no `Result`, a prompt that could not be sent (`conclude_delegation`) — or,
+/// when its own task is cut short (a panic, the runtime shutting down), `failed` with an
+/// `unknown` cost when it drops. No execution is left `running`.
 struct DelegationExecution {
     open: Option<crate::neo4j::agent_execution::AgentExecutionNode>,
     graph: Arc<dyn crate::neo4j::GraphStore>,
@@ -2970,9 +3031,10 @@ impl Drop for DelegationExecution {
         let Some(open) = self.open.take() else {
             return;
         };
-        // No wake here: a drop is the delegation being cut (a cancelled parent, a panic),
-        // and a stop nobody asked to hear about does not spend a turn — the same rule the
-        // background tasks follow (`oob_listener::background_wake_lines`).
+        // No wake here: a drop is the delegation's own task being cut short (a panic, the
+        // runtime shutting down), not an end of the delegation. Every end — a closed channel
+        // and a prompt that could not be sent included — goes through
+        // `DelegationClosure::finish`, which does wake the session that delegated (#1272).
         self.wake.take();
         let closed = DelegationEnd::failed().close(&open);
         let graph = self.graph.clone();
@@ -9643,6 +9705,21 @@ pub(crate) mod tests {
         Uuid,
         String,
     ) {
+        open_a_delegation_on(crate::chat::agent_runtime::fake::FakeProvider::new()).await
+    }
+
+    /// [`open_a_delegation_on_the_fake`], on a fake provider the test set up beforehand (to
+    /// refuse the delegation's prompt, for one).
+    #[allow(clippy::type_complexity)]
+    async fn open_a_delegation_on(
+        fake: crate::chat::agent_runtime::fake::FakeProvider,
+    ) -> (
+        Arc<crate::chat::manager::ChatManager>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        Uuid,
+        String,
+    ) {
         use crate::chat::manager::{test_support, ChatManager};
         use crate::neo4j::GraphStore;
 
@@ -9657,7 +9734,6 @@ pub(crate) mod tests {
         mock.create_chat_session(&parent).await.unwrap();
         let parent_id = parent.id.to_string();
 
-        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let dyn_graph: Arc<dyn GraphStore> = mock.clone();
         let manager = Arc::new(
             ChatManager::new_without_memory(
@@ -10174,6 +10250,255 @@ pub(crate) mod tests {
         assert_eq!(stored.status, AgentExecutionStatus::Failed);
         assert_eq!(stored.cost_basis.as_deref(), Some("unknown"));
         assert!(stored.completed_at.is_some());
+    }
+
+    /// A live session that delegated, listened to on its own channel, and the open execution
+    /// of its delegation — the one whose close wakes it (#1272). Returns the parent's channel,
+    /// the delegated task and the execution.
+    async fn a_parent_and_its_open_delegation() -> (
+        tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        Uuid,
+        super::DelegationExecution,
+    ) {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let ae = open_delegation_node();
+        graph.create_agent_execution(&ae).await.unwrap();
+
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            crate::chat::config::ChatConfig::default(),
+        ));
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+
+        let task_id = Uuid::new_v4();
+        let wake = super::DelegationWake {
+            manager,
+            parent_session_id: parent.id,
+            task_id,
+            task_title: "delegated".to_string(),
+        };
+        (
+            rx,
+            task_id,
+            super::DelegationExecution::new(ae, graph, None, Some(wake)),
+        )
+    }
+
+    /// What the parent is told about `task_id`: the notification it receives, awaited for
+    /// ten seconds at most.
+    async fn what_the_parent_is_told(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        task_id: Uuid,
+    ) -> String {
+        let task = task_id.to_string();
+        let told = async {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::chat::types::ChatEvent::UserMessage { content })
+                    | Ok(crate::chat::types::ChatEvent::SystemHint { content })
+                    | Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. })
+                        if content.contains(&task) =>
+                    {
+                        return content;
+                    }
+                    // The wake holds the parent's manager: dropped unfired, it closes this
+                    // channel, and the parent will never be told.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("the parent was never told: the delegation's wake was dropped")
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), told)
+            .await
+            .expect("the parent was never told that the delegation ended")
+    }
+
+    /// Listens to `channel` as the delegation of `task_id`, with nothing else wired.
+    async fn listen_on(
+        channel: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+        task_id: Uuid,
+        execution: super::DelegationExecution,
+    ) {
+        super::listen_delegation_result(
+            channel,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+    }
+
+    /// #1272 — a channel that closes without any `Result` read (the child gone) ends the
+    /// delegation `failed` AND wakes the session that delegated.
+    /// It used to `break`, and the execution's drop closed it `failed` without telling
+    /// the parent: the parent waited for a notification that never came.
+    #[tokio::test]
+    async fn a_delegation_whose_channel_closes_without_result_wakes_its_parent() {
+        let (mut parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+
+        // A channel that is closed with nothing in it: no `Result` is ever read.
+        let (tx, channel) = tokio::sync::broadcast::channel(16);
+        drop(tx);
+        listen_on(channel, task_id, execution).await;
+
+        // The parent hears of it, and the notification says the delegation failed.
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"failed\""), "{told}");
+    }
+
+    /// #1272 — the same end reached through a `Lagged`, which is how a `Result` goes unread:
+    /// the listener's buffer overflowed, then the channel closed.
+    #[tokio::test]
+    async fn a_delegation_whose_channel_closes_after_a_lag_wakes_its_parent() {
+        let (mut parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+
+        // Four events in a buffer of two, sent before the listener reads: its first read is a
+        // `Lagged`, and the channel is then closed with no `Result` left in it.
+        let (tx, channel) = tokio::sync::broadcast::channel(2);
+        for _ in 0..4 {
+            tx.send(crate::chat::types::ChatEvent::StreamDelta {
+                text: "x".into(),
+                parent_tool_use_id: None,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        listen_on(channel, task_id, execution).await;
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"failed\""), "{told}");
+    }
+
+    /// #1272 — a delegation nobody could listen to (its prompt was refused, its channel
+    /// could not be subscribed) is not left to its drop either: it is closed `failed`, the
+    /// session that delegated is woken, and the `delegation_failed` that pairs with
+    /// `delegation_started` is emitted.
+    #[tokio::test]
+    async fn a_delegation_that_could_not_be_listened_to_wakes_its_parent() {
+        let (mut parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+
+        super::conclude_delegation(
+            None,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"failed\""), "{told}");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed", "{event}");
+    }
+
+    /// #1272, the whole route — a delegation whose prompt the provider refuses is not left
+    /// to its drop: `launch_delegation` closes it through `conclude_delegation`, and the
+    /// session that delegated is woken and told it failed.
+    #[tokio::test]
+    async fn a_delegation_whose_prompt_is_refused_wakes_its_parent() {
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        // The child's session opens with no message: the delegation's prompt is its first
+        // turn, and the only provider refuses it (no retry, no fallback).
+        *fake.state.fail_next_turn.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::Unauthorized);
+
+        let (_manager, fake, mut parent, task_id, _child) = open_a_delegation_on(fake).await;
+
+        let told = what_the_parent_is_told(&mut parent, task_id).await;
+        assert!(told.contains("status=\"failed\""), "{told}");
+        assert!(
+            fake.state.turns_started.lock().unwrap().is_empty(),
+            "the refused prompt never started a turn"
+        );
+    }
+
+    /// #1272 — a delegation closed unheard does not sweep the agent worktrees of the
+    /// repository: its child produced nothing, and the sweep removes every agent worktree
+    /// with no new commit — here, the one a sibling is still working in.
+    #[tokio::test]
+    async fn a_delegation_that_could_not_be_listened_to_leaves_agent_worktrees_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "root"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            ".claude/worktrees/agent-sibling",
+            "-b",
+            "agent-sibling",
+        ]);
+        let sibling = repo.path().join(".claude/worktrees/agent-sibling");
+        assert!(sibling.exists());
+
+        let (_parent, task_id, execution) = a_parent_and_its_open_delegation().await;
+        super::conclude_delegation(
+            None,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            Some(repo.path().to_string_lossy().into_owned()),
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            sibling.exists(),
+            "a delegation that never ran removed a sibling's worktree"
+        );
     }
 
     /// B36 (review 4) — the delegation's delay (the runner's default, PYSR-3) expires
@@ -11222,9 +11547,10 @@ pub(crate) mod tests {
         assert_eq!(request.max_tokens, defaults.max_tokens);
     }
 
-    /// B36 (review 4) — a delegation that never gets to listen (its prompt
-    /// could not be sent) drops its execution: closed `failed`, after the open
-    /// node is written.
+    /// B36 (review 4) — an execution that is DROPPED without `close` (the delegation's own
+    /// task cut short: a panic, the runtime shutting down) is still closed `failed`, after
+    /// the open node is written. A prompt that could not be sent no longer ends here: it
+    /// goes through `conclude_delegation` (#1272).
     #[tokio::test]
     async fn a_delegation_dropped_before_listening_is_closed_failed() {
         use crate::neo4j::agent_execution::AgentExecutionStatus;
