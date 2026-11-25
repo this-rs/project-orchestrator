@@ -149,9 +149,24 @@ RUN cargo build --release
 # the release archives and the CI. Its own stage: it only reruns when Cargo.toml changes.
 FROM rust:1.100-trixie AS nexus-tools-builder
 WORKDIR /src
+# TARGETARCH is set by Buildx for the platform being built (`amd64`, `arm64`).
+ARG TARGETARCH
 COPY Cargo.toml ./
 COPY scripts/build-nexus-tools.sh ./scripts/
-RUN scripts/build-nexus-tools.sh /opt/nexus-tools
+# Obscura links V8 — a ~110 MB static library — and it is what killed `Docker (api-only)` of
+# v0.0.20: 94 minutes, then `build-nexus-tools.sh` exit 101 under `/dev/.buildkit_qemu_emulator`.
+# The release builds linux/amd64 AND linux/arm64 from an x86_64 runner, so the arm64 half runs
+# entirely through QEMU, and that link is where it dies. The emulated architecture therefore
+# ships without Obscura (browser and keyless WebSearch) — the same trade-off OBS-LEGACY (#754)
+# already made for macOS 10.15 — and keeps every other tool (files, shell, web, search).
+# The way back is a native arm64 runner (ubuntu-24.04-arm, free for public repositories) with a
+# manifest merge, which would also cut the 214-minute Docker jobs of v0.0.17; that is a workflow
+# change, not a Dockerfile one (see the PO task opened with this fix).
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      NEXUS_TOOLS_FEATURES=tls,obscura scripts/build-nexus-tools.sh /opt/nexus-tools; \
+    else \
+      NEXUS_TOOLS_FEATURES=tls scripts/build-nexus-tools.sh /opt/nexus-tools; \
+    fi
 
 # =============================================================================
 # Stage 3: Runtime image
