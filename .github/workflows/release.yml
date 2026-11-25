@@ -1307,12 +1307,30 @@ jobs:
           echo "Re-signing $APP_PATH with --timestamp..."
           echo "  Entitlements: $ENTITLEMENTS"
 
+          # Apple's timestamp server is intermittently unavailable ("The timestamp service is
+          # not available"), measured on two consecutive releases: it killed
+          # `Tauri x86_64-apple-darwin` on v0.0.19 and again on v0.0.20, at the exact same step
+          # (Signing resource: mcp_server). A signature WITHOUT a timestamp cannot be notarized,
+          # so the answer is a bounded retry — never `--timestamp=none`.
+          sign() {
+            local target="$1"; shift
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if codesign --force --timestamp --options runtime "$@" "$target"; then
+                return 0
+              fi
+              echo "::warning::codesign attempt $attempt failed on $(basename "$target") — retrying"
+              sleep $((attempt * 10))
+            done
+            echo "::error::codesign failed 5 times on $(basename "$target")"
+            return 1
+          }
+
           # Sign deepest binaries first (inside-out order required by codesign)
           # 1. Sign all nested frameworks and dylibs (no entitlements needed)
           find "$APP_PATH/Contents/Frameworks" -type f -perm +111 2>/dev/null | while read binary; do
             echo "  Signing framework: $(basename "$binary")"
-            codesign --force --timestamp --options runtime \
-              --sign "$APPLE_SIGNING_IDENTITY" "$binary" || true
+            sign "$binary" --sign "$APPLE_SIGNING_IDENTITY" || true
           done
 
           # 2. Sign resource binaries (e.g. mcp_server bundled as Tauri resource)
@@ -1320,23 +1338,17 @@ jobs:
           #    need their own hardened runtime signature.
           find "$APP_PATH/Contents/Resources" -type f -perm +111 2>/dev/null | while read binary; do
             echo "  Signing resource: $(basename "$binary")"
-            codesign --force --timestamp --options runtime \
-              --entitlements "$ENTITLEMENTS" \
-              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+            sign "$binary" --entitlements "$ENTITLEMENTS" --sign "$APPLE_SIGNING_IDENTITY"
           done
 
           # 3. Sign all nested executables (helpers, etc.)
           find "$APP_PATH/Contents/MacOS" -type f -perm +111 | while read binary; do
             echo "  Signing executable: $(basename "$binary")"
-            codesign --force --timestamp --options runtime \
-              --entitlements "$ENTITLEMENTS" \
-              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+            sign "$binary" --entitlements "$ENTITLEMENTS" --sign "$APPLE_SIGNING_IDENTITY"
           done
 
           # 4. Sign the .app bundle itself (must be last)
-          codesign --force --timestamp --options runtime \
-            --entitlements "$ENTITLEMENTS" \
-            --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+          sign "$APP_PATH" --entitlements "$ENTITLEMENTS" --sign "$APPLE_SIGNING_IDENTITY"
 
           # 5. Verify the signature and entitlements
           echo "Verifying signature..."
