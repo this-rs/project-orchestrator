@@ -80,6 +80,20 @@ pub fn successful_exit_code(error: &anyhow::Error) -> Option<i32> {
         .map(|_duplicate| 0)
 }
 
+/// The exit path of a server that could not start.
+///
+/// `Some(code)` when the port is already served by a live orchestrator — a duplicate is NOT a
+/// failure, and its supervisor must not relaunch it — `None` for anything else, which keeps the
+/// failure code. The warning is logged HERE rather than at the call site so that the whole
+/// decision, including the "nothing to do" case, is exercised by a test: `src/main.rs` then holds
+/// one `if let` and no logic that the coverage of the diff can flag as untested.
+pub fn duplicate_exit(outcome: &Result<(), anyhow::Error>) -> Option<i32> {
+    let error = outcome.as_ref().err()?;
+    let code = successful_exit_code(error)?;
+    tracing::warn!("{error}");
+    Some(code)
+}
+
 /// Ask the port who holds it. Never waits more than [`PROBE_TIMEOUT`].
 pub async fn probe(port: u16) -> PortOwner {
     probe_addr(SocketAddr::from(([127, 0, 0, 1], port))).await
@@ -274,6 +288,12 @@ mod tests {
         let unauthorized = b"HTTP/1.0 401 Unauthorized\r\n\r\n{\"version\":\"0.1.0\",\"build\":{}}";
         assert_eq!(classify(unauthorized), PortOwner::Foreign);
 
+        // A 200 whose body is not JSON: the parse-error branch, not the shape check.
+        assert_eq!(
+            classify(b"HTTP/1.0 200 OK\r\n\r\n< html >"),
+            PortOwner::Foreign
+        );
+
         // Garbage.
         assert_eq!(classify(b"not http at all"), PortOwner::Foreign);
     }
@@ -292,6 +312,25 @@ mod tests {
 
         let plain = anyhow::anyhow!("Neo4j is unreachable");
         assert_eq!(successful_exit_code(&plain), None);
+    }
+
+    /// Le chemin de sortie complet, celui que `src/main.rs` appelle : il journalise ET rend le
+    /// code. Non couvert auparavant, la couverture du diff l'a refuse (93,30 %, run 45710339693).
+    #[test]
+    fn the_duplicate_exit_path_answers_the_code_and_nothing_else_does() {
+        let duplicate: Result<(), anyhow::Error> = Err(anyhow::Error::new(
+            PortOwnedByOrchestrator::new(8080, "0.0.20"),
+        ));
+        assert_eq!(duplicate_exit(&duplicate), Some(0));
+
+        let foreign: Result<(), anyhow::Error> = Err(anyhow::anyhow!(
+            "cannot bind 0.0.0.0:8080: Address already in use"
+        ));
+        assert_eq!(duplicate_exit(&foreign), None);
+
+        // A server that stopped cleanly has nothing to say either.
+        let fine: Result<(), anyhow::Error> = Ok(());
+        assert_eq!(duplicate_exit(&fine), None);
     }
 
     #[test]

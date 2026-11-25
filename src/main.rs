@@ -167,13 +167,8 @@ async fn run() -> Result<()> {
             // port it can never take — measured 2026-11-25: 590 attempts in one
             // day, `/tmp/orchestrator.log` at 1.0 GB of the same four lines.
             // Anything else that stops the server keeps the failure code.
-            if let Err(error) = &outcome {
-                if let Some(code) =
-                    project_orchestrator::single_instance::successful_exit_code(error)
-                {
-                    tracing::warn!("{error}");
-                    std::process::exit(code);
-                }
+            if let Some(code) = project_orchestrator::single_instance::duplicate_exit(&outcome) {
+                std::process::exit(code);
             }
             outcome
         }
