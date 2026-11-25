@@ -330,6 +330,37 @@ pub fn quota_exhausted_message(resets_at_ms: u64) -> String {
     )
 }
 
+/// The sentence a missing executable deserves: it names the file, not the provider.
+///
+/// The program comes from the SDK, sometimes with its arguments; only its base name is kept and
+/// nothing else is echoed (a path or a credential must never reach the browser).
+fn missing_program_message(program: &str) -> &'static str {
+    match program_base_name(program) {
+        // The agent engine (DeepSeek, Codex, ACP, the native harness) runs the chat through
+        // `mcp_server`, resolved next to the server binary (MCP_SERVER_PATH, then the sibling,
+        // then the PATH — src/chat/config.rs). It is the engine's own file, not the provider's.
+        Some("mcp_server") => {
+            "The chat engine's `mcp_server` executable is missing: a chat on a provider instance \
+             (DeepSeek, Codex, an ACP agent, the native harness) runs through it. It must sit \
+             next to the orchestrator binary, be named by MCP_SERVER_PATH, or be on the PATH."
+        }
+        Some("claude") => {
+            "The `claude` command-line tool (the built-in Claude Code engine) is not installed \
+             on the server, or absent from its PATH."
+        }
+        _ => "The provider's command-line tool is not installed on the server, or absent from its PATH.",
+    }
+}
+
+/// The base name of the program the SDK reported, without arguments and without its directory.
+fn program_base_name(program: &str) -> Option<&str> {
+    program
+        .split_whitespace()
+        .next()
+        .and_then(|first| std::path::Path::new(first).file_name())
+        .and_then(|name| name.to_str())
+}
+
 /// Maps a provider error met while opening (or resuming) a session.
 ///
 /// `unauthorized` answers 502, not 401: a 401 would log the user out of the
@@ -339,10 +370,15 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
     let mut retry_after_ms: Option<u64> = None;
     let mut resets_at_ms: Option<u64> = None;
     let (status, code, message): (u16, &'static str, String) = match err {
-        ProviderError::CliNotFound { .. } => (
+        // Name the missing executable (`mcp_server` for every provider INSTANCE, `claude` for
+        // the built-in Claude Code) without leaking the path or the arguments. Measured
+        // 25/11/2026: a cleaned `target/release` left the server running from a deleted binary,
+        // and every DeepSeek chat answered "the provider's command-line tool is not installed",
+        // which named the provider while the missing file was the engine's own `mcp_server`.
+        ProviderError::CliNotFound { program } => (
             424,
             err.kind(),
-            "The provider's command-line tool is not installed on the server.".to_string(),
+            missing_program_message(program).to_string(),
         ),
         ProviderError::AuthRequired { login_hint } => {
             action = login_hint.clone();

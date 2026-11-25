@@ -1541,6 +1541,33 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     use api::handlers::ServerState;
     use tokio::sync::RwLock;
 
+    // The agent engine (DeepSeek, Codex, an ACP agent, the native harness — every registered
+    // provider INSTANCE) runs a chat through `mcp_server`, resolved as MCP_SERVER_PATH, then a
+    // sibling of this executable, then the PATH (src/chat/config.rs). When it is absent, every
+    // chat on those engines fails to open with a 424 that names the PROVIDER, while the missing
+    // file is this one. Measured 25/11/2026: a cleaned `target/release` left the server running
+    // from a binary that no longer existed on disk, and every DeepSeek chat answered "the
+    // provider's command-line tool is not installed". Say it here, once, where it can be fixed.
+    {
+        let mcp_server = crate::chat::config::ChatConfig::detect_mcp_server_path_public();
+        let on_path = mcp_server
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                std::env::var_os("PATH")
+                    .is_some_and(|p| std::env::split_paths(&p).any(|dir| dir.join(n).is_file()))
+            })
+            .unwrap_or(false);
+        if !mcp_server.is_file() && !on_path {
+            tracing::warn!(
+                path = %mcp_server.display(),
+                "mcp_server is missing: no chat on a provider instance (DeepSeek, Codex, ACP, \
+                 native) can open. It must sit next to the orchestrator binary, be named by \
+                 MCP_SERVER_PATH, or be on the PATH — build it with `cargo build --release`"
+            );
+        }
+    }
+
     // Hash root account password at startup (if plaintext)
     if let Some(ref mut auth) = config.auth_config {
         auth.ensure_root_password_hashed()?;
