@@ -19829,6 +19829,35 @@ impl ChatManager {
                 warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
                 continue;
             }
+            // Un `Ok` de l'interrupt ne prouve PAS que la session du fournisseur ait lache :
+            // un appel `Agent` en vol la tient encore. MESURE le 24/11/2026 (session
+            // `a574ba1d`) : 60 min d'attente sur `Agent`, l'interrupt a rendu la main, le
+            // message a annonce « the session is free again » — et CHAQUE message suivant a
+            // recu `turn_in_progress` (409). Le message mentait, et la session fantome
+            // gardait un creneau de la table bornee : plus aucune conversation ne pouvait
+            // s'ouvrir. On relit donc l'etat, et une session qui streame encore est FERMEE.
+            let encore_occupee = self
+                .session_activity_map()
+                .await
+                .get(&id)
+                .map(|a| a.streaming)
+                .unwrap_or(false);
+            if encore_occupee {
+                warn!(
+                    session_id = %id,
+                    "the turn was ended but the session is still streaming: closing it to give its slot back"
+                );
+                if let Err(e) = self
+                    .close_session_because(
+                        &id.to_string(),
+                        "tool result lost: the turn was ended but the session stayed streaming",
+                    )
+                    .await
+                {
+                    warn!(session_id = %id, error = %e, "closing the still-streaming session failed");
+                    continue;
+                }
+            }
             // The turn is ended now — only then is the user told. Emitting before the
             // interrupt announced a turn that never ended when the interrupt failed, and the
             // same message went out again on every tick (the failure was not memorised).
@@ -19837,10 +19866,16 @@ impl ChatManager {
                 ChatEvent::Error {
                     message: format!(
                         "The call to `{tool}` never came back: this turn waited {} min for its \
-                         result, which is past every budget that call has, so the turn was ended. \
-                         The session is free again and your next message continues the \
-                         conversation. Only this turn's answer was lost.",
-                        silent_for.as_secs() / 60
+                         result, which is past every budget that call has, so the turn was ended.{}",
+                        silent_for.as_secs() / 60,
+                        if encore_occupee {
+                            " The session had NOT let go after the interrupt, so it was closed \
+                             to give its slot back: your next message opens a fresh session, and \
+                             the conversation is kept."
+                        } else {
+                            " The session is free again and your next message continues the \
+                             conversation. Only this turn's answer was lost."
+                        }
                     ),
                     parent_tool_use_id: None,
                     code: Some("tool_result_lost".to_string()),
@@ -26864,6 +26899,104 @@ mod tests {
         assert!(
             graph.get_chat_session(sid).await.unwrap().is_some(),
             "the session is NOT closed: its next message continues it"
+        );
+    }
+
+    // DEFAUT MESURE le 24/11/2026 (session `a574ba1d`) : un appel `Agent` resté 60 min.
+    // L'interrupt repond OK, mais la session du FOURNISSEUR reste `streaming` — le `Ok` ne
+    // prouve pas qu'elle ait lache. Le watchdog annoncait alors « The session is free again »,
+    // ce qui etait faux : chaque message suivant recevait `turn_in_progress` (409), et la
+    // session fantome gardait un creneau de la table bornee, refusant toute nouvelle
+    // conversation. Il doit RELIRE l'etat, et fermer au lieu de promettre.
+    #[tokio::test]
+    async fn test_a_session_still_streaming_after_the_interrupt_is_never_promised_free() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+        let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.to_string(), dummy);
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+        assert_eq!(ended, vec![sid.to_string()], "the stuck turn is ended");
+
+        let events = graph.chat_events.read().await;
+        let notice = events
+            .get(&sid)
+            .expect("its events")
+            .iter()
+            .find(|e| e.data.contains("tool_result_lost"))
+            .expect("the reason is written in the conversation");
+        assert!(
+            !notice.data.contains("The session is free again"),
+            "never promise a freedom that was not verified: {}",
+            notice.data
+        );
+        drop(events);
+        assert!(
+            manager
+                .session_activity_map()
+                .await
+                .get(&sid)
+                .map(|a| a.streaming)
+                != Some(true),
+            "a session still streaming after its turn was ended must not keep its slot"
+        );
+    }
+
+    /// Un miroir de sous-agent Claude Code est vivant (l'instantané le compte) mais n'a ni
+    /// processus ni entrée dans la table des sessions actives : sa clôture ne peut pas le
+    /// rendre, `close_session_because` rend Err. Le tour est abandonné quand même, et RIEN
+    /// n'est annoncé — ni événement, ni session rendue — sinon le message promettrait une
+    /// liberté que personne n'a vérifiée. Couvre la branche d'échec de la clôture.
+    #[tokio::test]
+    async fn a_live_mirror_whose_close_fails_is_never_announced_as_freed() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let mirror = Uuid::new_v4();
+        manager.mirrors.open_for_test(mirror);
+        graph
+            .store_chat_events(
+                mirror,
+                vec![tool_use_event(
+                    mirror,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+
+        assert!(
+            ended.is_empty(),
+            "la clôture a échoué : la session n'est pas rendue, donc rien n'est annoncé"
+        );
+        let events = graph.chat_events.read().await;
+        assert!(
+            events
+                .get(&mirror)
+                .is_none_or(|e| !e.iter().any(|ev| ev.data.contains("tool_result_lost"))),
+            "aucune promesse ne doit être écrite quand la clôture échoue"
         );
     }
 
