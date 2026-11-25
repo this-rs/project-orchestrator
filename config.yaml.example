@@ -293,6 +293,21 @@ chat:
 #     name: "Admin"
 #     password_hash: "change-me"   # Will be hashed at startup
 #
+#   # ── The account that decides for everyone ───────────────────────
+#   # The server-wide settings — the consent of the chats OUTSIDE any project,
+#   # the global pilot/executor roles, the model policy, the routing — are
+#   # writable by ONE account and by nobody else. Name it here.
+#   #
+#   # This is the only way to have such an account on a server that signs in
+#   # through OIDC: an OIDC account gets a random identifier, so an identity
+#   # derived from an email (which is what `root_account` relies on) can never
+#   # recognise it. Matched on the email, whatever the sign-in method.
+#   #
+#   # WITHOUT IT (and without `root_account`) those settings are refused to
+#   # everyone, the owner included — and the screens say so.
+#   # The address must be allowed by `allowed_email_domain` / `allowed_emails`.
+#   root_email: "admin@example.com"
+#
 #   # ── OIDC auth (generic OpenID Connect) ──────────────────────────
 #   # Works with Google, Microsoft, Okta, Keycloak, Cognito, or any OIDC provider.
 #   #
