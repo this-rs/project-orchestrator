@@ -26961,6 +26961,45 @@ mod tests {
         );
     }
 
+    /// Un miroir de sous-agent Claude Code est vivant (l'instantané le compte) mais n'a ni
+    /// processus ni entrée dans la table des sessions actives : sa clôture ne peut pas le
+    /// rendre, `close_session_because` rend Err. Le tour est abandonné quand même, et RIEN
+    /// n'est annoncé — ni événement, ni session rendue — sinon le message promettrait une
+    /// liberté que personne n'a vérifiée. Couvre la branche d'échec de la clôture.
+    #[tokio::test]
+    async fn a_live_mirror_whose_close_fails_is_never_announced_as_freed() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let mirror = Uuid::new_v4();
+        manager.mirrors.open_for_test(mirror);
+        graph
+            .store_chat_events(
+                mirror,
+                vec![tool_use_event(
+                    mirror,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+
+        assert!(
+            ended.is_empty(),
+            "la clôture a échoué : la session n'est pas rendue, donc rien n'est annoncé"
+        );
+        let events = graph.chat_events.read().await;
+        assert!(
+            events
+                .get(&mirror)
+                .is_none_or(|e| !e.iter().any(|ev| ev.data.contains("tool_result_lost"))),
+            "aucune promesse ne doit être écrite quand la clôture échoue"
+        );
+    }
+
     // issue #1056, correctif B : un relevé qui échoue ne juge pas la session. Lire le compte,
     // puis le dernier événement, peut échouer : la session est laissée tranquille, jamais
     // interrompue sur une lecture qu'on n'a pas pu faire.
