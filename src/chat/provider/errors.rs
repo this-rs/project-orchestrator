@@ -354,11 +354,18 @@ fn missing_program_message(program: &str) -> &'static str {
 
 /// The base name of the program the SDK reported, without arguments and without its directory.
 fn program_base_name(program: &str) -> Option<&str> {
-    program
-        .split_whitespace()
-        .next()
-        .and_then(|first| std::path::Path::new(first).file_name())
+    let program = program.trim();
+    // A path may be quoted (Windows installs under `C:\\Program Files\\...`, whose space would
+    // otherwise cut the first token in half), and it may carry arguments after the executable.
+    let first = match program.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => program.split_whitespace().next().unwrap_or(""),
+    };
+    std::path::Path::new(first)
+        .file_name()
         .and_then(|name| name.to_str())
+        // Windows ships the same file as `mcp_server.exe`: one engine, two spellings.
+        .map(|name| name.strip_suffix(".exe").unwrap_or(name))
 }
 
 /// Maps a provider error met while opening (or resuming) a session.
@@ -686,6 +693,58 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
             ResolveError::ProviderNotChosen { candidates } => Some(candidates.clone()),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod missing_program_tests {
+    use super::{missing_program_message, program_base_name};
+
+    /// Ce que l'écran disait avant : il accusait le fournisseur, alors que le fichier manquant
+    /// est celui du moteur. Un chat DeepSeek ne s'ouvrait pas et le message parlait de DeepSeek.
+    #[test]
+    fn a_missing_mcp_server_says_so_instead_of_blaming_the_provider() {
+        for program in [
+            "mcp_server",
+            "/Users/someone/project/target/release/mcp_server",
+            "mcp_server --transport stdio",
+            // Windows passes such a path QUOTED (it contains spaces); unquoted, no parser can
+            // tell the directory from the arguments, and we do not pretend otherwise.
+            "\"C:\\Program Files\\Project Orchestrator\\mcp_server.exe\" --stdio",
+        ] {
+            let said = missing_program_message(program);
+            assert!(said.contains("`mcp_server`"), "{program} -> {said}");
+            // It may ENUMERATE the engines that run through it (that is the useful part); what
+            // it must never do is repeat the old sentence, which accused the provider.
+            assert!(
+                !said.starts_with("The provider's command-line tool is not installed"),
+                "the sentence must not blame a provider: {said}"
+            );
+        }
+    }
+
+    /// Un chemin ou des arguments ne doivent jamais atteindre le navigateur : seul le nom reste.
+    #[test]
+    fn the_path_and_the_arguments_never_reach_the_message() {
+        let said = missing_program_message("/secret/path/claude --dangerously-skip");
+        assert!(said.contains("`claude`"), "{said}");
+        assert!(!said.contains("/secret/path"), "{said}");
+        assert!(!said.contains("dangerously"), "{said}");
+    }
+
+    #[test]
+    fn an_unknown_program_keeps_the_generic_sentence() {
+        let said = missing_program_message("opencode --serve");
+        assert!(said.starts_with("The provider's command-line tool is not installed"), "{said}");
+        assert!(!said.contains("opencode"), "{said}");
+    }
+
+    #[test]
+    fn the_base_name_drops_the_directory_the_arguments_and_the_windows_extension() {
+        assert_eq!(program_base_name("mcp_server"), Some("mcp_server"));
+        assert_eq!(program_base_name("/a/b/mcp_server --x"), Some("mcp_server"));
+        assert_eq!(program_base_name("mcp_server.exe"), Some("mcp_server"));
+        assert_eq!(program_base_name("   "), None);
     }
 }
 
