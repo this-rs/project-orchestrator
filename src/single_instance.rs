@@ -108,9 +108,18 @@ async fn probe_addr(addr: SocketAddr) -> PortOwner {
     }
 }
 
-/// Decide what a raw HTTP response means. Requires BOTH a successful status and
-/// the two fields `/api/version` always carries, so an unrelated service that
-/// happens to expose a `version` string is not mistaken for an orchestrator.
+/// Decide what a raw HTTP response means.
+///
+/// A successful status is not enough, and neither is the PRESENCE of the two
+/// keys `/api/version` carries: `{"version": null, "build": null}` has both, and
+/// so does any service that happens to expose a `version` and a `build`. Taking
+/// one of those for an orchestrator is the worst possible mistake here — the
+/// duplicate would exit 0 (nothing restarts it) while a stranger holds the port,
+/// so nobody serves. The SHAPE is required instead, as `VersionResponse` and
+/// `VersionBuild` define it (`src/api/handlers.rs`): `version` a non-empty
+/// string, `build` an object carrying at least one of the build markers. Only
+/// one of the two markers is required, not both, so that a peer running an older
+/// or newer build than this binary is still recognised.
 fn classify(response: &[u8]) -> PortOwner {
     let text = String::from_utf8_lossy(response);
     let status_ok = text
@@ -122,17 +131,28 @@ fn classify(response: &[u8]) -> PortOwner {
         return PortOwner::Foreign;
     }
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
-    match serde_json::from_str::<serde_json::Value>(body.trim()) {
-        Ok(value) if value.get("version").is_some() && value.get("build").is_some() => {
-            PortOwner::Orchestrator {
-                version: value
-                    .get("version")
+    let value: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(value) => value,
+        Err(_) => return PortOwner::Foreign,
+    };
+    let version = value.get("version").and_then(|v| v.as_str()).unwrap_or("");
+    let build_is_ours = value
+        .get("build")
+        .and_then(|build| build.as_object())
+        .map(|build| {
+            ["target", "profile"].iter().any(|key| {
+                build
+                    .get(*key)
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            }
-        }
-        _ => PortOwner::Foreign,
+                    .is_some_and(|s| !s.is_empty())
+            })
+        })
+        .unwrap_or(false);
+    if version.is_empty() || !build_is_ours {
+        return PortOwner::Foreign;
+    }
+    PortOwner::Orchestrator {
+        version: version.to_string(),
     }
 }
 
@@ -228,6 +248,27 @@ mod tests {
         // A version string alone is not enough.
         let lookalike = b"HTTP/1.0 200 OK\r\n\r\n{\"version\":\"2.1\"}";
         assert_eq!(classify(lookalike), PortOwner::Foreign);
+
+        // Both keys PRESENT but empty: the presence check this used to do would have taken
+        // this for us, and the duplicate would have exited 0 against a stranger's port.
+        let nulls = b"HTTP/1.0 200 OK\r\n\r\n{\"version\":null,\"build\":null}";
+        assert_eq!(classify(nulls), PortOwner::Foreign);
+        let empty_version =
+            b"HTTP/1.0 200 OK\r\n\r\n{\"version\":\"\",\"build\":{\"profile\":\"release\"}}";
+        assert_eq!(classify(empty_version), PortOwner::Foreign);
+        // A `build` that carries none of our markers is somebody else's build object.
+        let foreign_build =
+            b"HTTP/1.0 200 OK\r\n\r\n{\"version\":\"1.0.0\",\"build\":{\"number\":42}}";
+        assert_eq!(classify(foreign_build), PortOwner::Foreign);
+        // One marker is enough: a peer built by an older or newer binary stays recognisable.
+        let older_peer =
+            b"HTTP/1.0 200 OK\r\n\r\n{\"version\":\"0.0.19\",\"build\":{\"target\":\"x86_64\"}}";
+        assert_eq!(
+            classify(older_peer),
+            PortOwner::Orchestrator {
+                version: "0.0.19".to_string()
+            }
+        );
 
         // Not a success status.
         let unauthorized = b"HTTP/1.0 401 Unauthorized\r\n\r\n{\"version\":\"0.1.0\",\"build\":{}}";
