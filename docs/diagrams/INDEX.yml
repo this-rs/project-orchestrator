@@ -439,6 +439,16 @@ diagrams:
     covers:
       - "backend:src/fd_guard.rs"
       - "backend:src/api/ws_liveness.rs"
+  - name: po-supervision
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-supervision.mmd
+    # Proprietaire unique : la sonde de port et la regle de code de sortie qui decide
+    # si un superviseur relance le serveur a l'infini. Ne couvre volontairement PAS
+    # src/lib.rs ni src/main.rs (deja possedes ailleurs) : seul le fichier neuf est
+    # revendique, le cablage est cite dans les SOURCES LUES du diagramme.
+    covers:
+      - "backend:src/single_instance.rs"
   - name: po-yaml
     owner: theotime
     status: verified

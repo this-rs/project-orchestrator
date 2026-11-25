@@ -1,0 +1,54 @@
+%% name: po-supervision
+%% covers: backend:src/single_instance.rs
+%% verified: 5146fdde1a
+%% ---
+%% PROUVE : ce que le serveur fait d'un port qu'il ne peut pas prendre, et pourquoi le
+%%   code de sortie à lui seul décide si un superviseur le relance à l'infini.
+%%   Relu contre le code de la branche fix/port-held-by-another-po (5146fdde1a).
+%% ---
+%% SOURCES LUES :
+%%   src/single_instance.rs (probe, classify, PortOwnedByOrchestrator, successful_exit_code),
+%%   src/lib.rs (start_server : bind avant toute initialisation, seule la branche d'échec sonde),
+%%   src/main.rs (Commands::Serve : sortie sur le code rendu par successful_exit_code),
+%%   scripts/launchd/land.ffs.orchestrator.plist, scripts/launchd/po-supervise.sh.
+%% ---
+%% MESURE QUI A MOTIVÉ LE NŒUD « exit 0 » : launchd, 25/11/2026 — runs = 590 en une
+%%   journée, une tentative toutes les 5 s, /tmp/orchestrator.log à 1,0 Go des mêmes
+%%   quatre lignes, et zéro erreur dans le log applicatif (l'erreur part sur stderr,
+%%   donc dans le redirect du superviseur).
+%% ---
+%% NON ETABLI :
+%%   qu'un superviseur autre que launchd (systemd Restart=on-failure) arrête aussi sa
+%%   boucle sur le code 0 — c'est le comportement documenté de systemd, pas rejoué ici ;
+%%   que 400 ms suffisent sur une machine saturée (la sonde est bornée, pas mesurée
+%%   au-delà de ce cas de test).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["⚪ autre domaine"]
+    end
+
+    START["⚪ start_server (lib.rs) : le port est bindé AVANT toute initialisation à effet de bord"]
+    BINDOK["⚪ bind accepté : le serveur démarre normalement"]
+    BINDFAIL["⚪ bind refusé : seule cette branche sonde, et elle sonde le port, jamais Neo4j"]
+    PROBE["✅ probe : GET /api/version, borne 400 ms ;<br/>test: a_silent_listener_is_foreign_and_bounded"]
+    CLASSIFY["✅ classify exige un statut 200 ET les champs version + build (un 'version' seul ne suffit pas à confondre un service tiers avec nous) ;<br/>test: classify_wants_a_version_and_a_build"]
+    OWNER["✅ pair = orchestrateur vivant : erreur typée PortOwnedByOrchestrator, message qui nomme la version et le geste à faire ;<br/>test: a_live_orchestrator_is_recognised, the_message_says_what_to_do_and_still_says_cannot_bind"]
+    FOREIGN["✅ pair étranger ou port muet : message 'cannot bind …' et code d'échec inchangés ;<br/>test: start_server_fails_on_a_taken_port_before_any_initialization"]
+    EXIT0["✅ successful_exit_code → 0 : le superviseur ne relance pas ;<br/>test: a_duplicate_exits_successfully_and_everything_else_does_not"]
+    EXIT1["✅ tout le reste garde le code 1 : un vrai échec reste visible ;<br/>test: a_duplicate_exits_successfully_and_everything_else_does_not"]
+    WIRE["✅ le câblage bout en bout : start_server contre un faux orchestrateur rend l'erreur typée, donc le code 0 ;<br/>test: a_duplicate_against_a_live_orchestrator_is_reported_as_such"]
+    SUP["⚪ launchd KeepAlive { SuccessfulExit = false } / systemd Restart=on-failure : relance sur code d'échec, s'arrête sur 0"]
+    LOG["⚪ po-supervise.sh : le redirect stdout/stderr du superviseur n'est tourné par personne ;<br/>rogné au démarrage par 'cat > fichier', jamais 'mv' (le fichier reste ouvert en append)"]
+
+    START --> BINDOK
+    START --> BINDFAIL --> PROBE --> CLASSIFY
+    CLASSIFY --> OWNER --> WIRE --> EXIT0 --> SUP
+    CLASSIFY --> FOREIGN --> EXIT1 --> SUP
+    SUP --> LOG
+    SUP --> START
