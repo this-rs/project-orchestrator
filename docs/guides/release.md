@@ -34,15 +34,28 @@ promise must be added there; a file that stops being produced must be removed fr
 | macOS desktop | `Project Orchestrator_<v>_aarch64.dmg`, `_x64.dmg`, `_x64-legacy.dmg` |
 | macOS updater | `_arm64.app.tar.gz` + `.sig`, `_x86_64.app.tar.gz` + `.sig`, `_x86_64-legacy.app.tar.gz` + `.sig` |
 | Linux desktop | `_amd64.AppImage`, `_amd64.deb`, `_arm64.deb`, `-<v>-1.x86_64.rpm`, `-<v>-1.aarch64.rpm` |
+| Linux / Windows updater | `_amd64.AppImage.tar.gz` + `.sig`, `_x64-setup.nsis.zip` + `.sig` |
 | Windows desktop | `_x64-setup.exe`, `_x64_en-US.msi` |
 | Server, light and full | `orchestrator-[full-]<v>-{linux-x86_64,linux-arm64,macos-arm64,macos-x86_64,macos-x86_64-legacy,windows-x86_64}.{tar.gz,zip}` |
 | Server packages | `project-orchestrator_<v>-1_{amd64,arm64}.deb`, `project-orchestrator-<v>-1.{x86_64,aarch64}.rpm` |
 | Updater feed | `latest.json` with non-empty `darwin-aarch64` and `darwin-x86_64` (`url` **and** `signature`) |
 
-**Known gap, not a blocker:** `latest.json` still has empty `linux-x86_64` and `windows-x86_64`
-entries, because Tauri produces no updater bundle for the AppImage/NSIS targets today. The gate
-prints a warning for those two instead of failing, so the gap is visible without blocking a
-release. Closing it is its own task.
+All four `latest.json` entries are required: `darwin-aarch64`, `darwin-x86_64`, `linux-x86_64`,
+`windows-x86_64`, each with a non-empty `url` **and** `signature`.
+
+### Why `build-tauri` builds the Linux and Windows updater bundles itself
+
+Tauri produces no updater artifact for those two platforms in the current configuration — measured
+on v0.0.20, where the Linux job bundled the AppImage and nothing else, so `latest.json` carried
+empty `linux-x86_64` and `windows-x86_64` entries and neither platform had ever been able to
+self-update. macOS never had that problem because the workflow has always made its own
+`.app.tar.gz` with `tar` and signed it with `cargo tauri signer sign`.
+
+So Linux and Windows now follow the same proven path: the AppImage goes into a `.tar.gz`, the NSIS
+installer into a `.nsis.zip` (named `Product_<v>_x64-setup.nsis.zip`, the `.exe` dropped, as Tauri
+names it), and `cargo tauri signer sign` produces the `.sig`. No bundler behaviour is being guessed
+at, and the only new failure mode is a job that cannot `tar`/`Compress-Archive` a file it just
+built.
 
 ## What happens when something is missing
 
@@ -53,6 +66,11 @@ release. Closing it is its own task.
    `/releases/latest` — so nothing points a user at a file that does not exist.
 3. The `Verdict — whole, or a draft` step **fails the job**. The run is red, and `update-homebrew`
    (which `needs: [release]`) is skipped, so the tap keeps the last good formula.
+
+**A release already published at this tag is never touched by an incomplete attempt.** The delete
+and create steps only run when the new set is complete, or when no release exists yet at that tag
+(in which case the salvaged files go out as a draft). A repair run that builds less than the
+promise therefore cannot take `.dmg` files away from users who already have them.
 
 Repair: re-run the failed jobs, then re-run the `release` job. Note what was measured on
 v0.0.20: re-running a **single** job creates a new *attempt* of the run, and that attempt's graph

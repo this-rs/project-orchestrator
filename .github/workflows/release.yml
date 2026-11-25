@@ -1600,6 +1600,46 @@ jobs:
           echo "Updater bundles after rename:"
           ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
 
+      # --- Linux / Windows: the updater bundle, built and signed here ---
+      # macOS never depended on Tauri for this: "Rebuild updater bundles after re-sign" makes the
+      # .app.tar.gz itself with tar, then signs it with `cargo tauri signer sign`. Tauri does NOT
+      # produce an updater artifact for these two platforms in the current configuration (measured
+      # on v0.0.20, run 45638973782: the Linux job bundled the AppImage and nothing else), so
+      # latest.json carried empty linux-x86_64 and windows-x86_64 entries and neither platform has
+      # ever been able to self-update. Same proven path here, no bundler behaviour to guess at.
+      - name: Build and sign the Linux updater bundle (.AppImage.tar.gz)
+        if: runner.os == 'Linux' && matrix.tauri_target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          APPDIR="target/${{ matrix.tauri_target }}/release/bundle/appimage"
+          APPIMAGE=$(find "$APPDIR" -maxdepth 1 -name '*.AppImage' | head -1)
+          [ -n "$APPIMAGE" ] || { echo "::error::no .AppImage to package for the updater"; exit 1; }
+          NAME=$(basename "$APPIMAGE")
+          # The AppImage updater consumes a tar.gz whose root holds the AppImage.
+          tar czf "$APPDIR/${NAME}.tar.gz" -C "$APPDIR" "$NAME"
+          cargo tauri signer sign "$APPDIR/${NAME}.tar.gz"
+          ls -la "$APPDIR/${NAME}.tar.gz" "$APPDIR/${NAME}.tar.gz.sig"
+
+      - name: Build and sign the Windows updater bundle (.nsis.zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $nsisDir = "target/${{ matrix.tauri_target }}/release/bundle/nsis"
+          $setup = Get-ChildItem -Path $nsisDir -Filter '*setup.exe' | Select-Object -First 1
+          if (-not $setup) { Write-Error "no NSIS setup.exe to package for the updater"; exit 1 }
+          # The NSIS updater consumes a zip holding the installer, named like Tauri names it:
+          # Product_<v>_x64-setup.nsis.zip (the ".exe" is dropped, the gate expects that name).
+          $zip = ($setup.FullName -replace '\.exe$', '') + '.nsis.zip'
+          Compress-Archive -Path $setup.FullName -DestinationPath $zip -Force
+          cargo tauri signer sign $zip
+          Get-ChildItem -Path $nsisDir | Format-Table Name, Length
+
       # The legacy .dmg is named like the standard Intel one (both are "..._x64.dmg"): without a suffix the release job
       # would flatten one over the other. The site finds it by "_x64-legacy.dmg".
       - name: Rename the legacy .dmg
@@ -1739,6 +1779,11 @@ jobs:
           need "Linux aarch64 desktop .rpm"  "Project Orchestrator-${VERSION}-1.aarch64.rpm"
           need "Windows NSIS installer"      "Project Orchestrator_${VERSION}_x64-setup.exe"
           need "Windows MSI installer"       "Project Orchestrator_${VERSION}_x64_en-US.msi"
+          # The updater bundles for those two platforms (built and signed by build-tauri itself).
+          need "Linux updater bundle"        "Project Orchestrator_${VERSION}_amd64.AppImage.tar.gz"
+          need "Linux updater signature"     "Project Orchestrator_${VERSION}_amd64.AppImage.tar.gz.sig"
+          need "Windows updater bundle"      "Project Orchestrator_${VERSION}_x64-setup.nsis.zip"
+          need "Windows updater signature"   "Project Orchestrator_${VERSION}_x64-setup.nsis.zip.sig"
 
           echo "=== The server, light and full, for all six targets ==="
           for a in linux-x86_64 linux-arm64 macos-arm64 macos-x86_64 macos-x86_64-legacy windows-x86_64; do
@@ -1764,14 +1809,13 @@ jobs:
                 missing+=("latest.json $p")
               fi
             done
-            # No updater bundle is produced for these two yet (Tauri only makes one for the
-            # AppImage/NSIS targets when the bundle config asks for it): a warning, not a
-            # blocker, until that gap is closed.
             for p in linux-x86_64 windows-x86_64; do
-              if jq -e --arg p "$p" '.platforms[$p].url != ""' release-files/latest.json >/dev/null; then
+              if jq -e --arg p "$p" '.platforms[$p].url != "" and .platforms[$p].signature != ""' \
+                   release-files/latest.json >/dev/null; then
                 ok "latest.json $p"
               else
-                echo "::warning::latest.json $p is empty — no updater bundle is produced for that platform yet"
+                echo "  MISSING  latest.json $p (empty url or signature)"
+                missing+=("latest.json $p")
               fi
             done
           else
@@ -1965,14 +2009,32 @@ jobs:
           path: release-files/
           retention-days: 3
 
-      - name: Delete existing release (if any)
+      # A healthy release already published at this tag must survive a repair attempt that builds
+      # less than the promise: measured on v0.0.20, where publishing over it in draft would have
+      # hidden the only installers that had made it out. "Salvage" is the run's artifacts.
+      - name: Does a complete release already exist for this tag?
+        id: existing
         if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "a release already exists at $RELEASE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "no release yet at $RELEASE_TAG"
+          fi
+
+      - name: Delete existing release (if any)
+        if: ${{ !inputs.dry_run && (steps.completeness.outputs.complete == 'true' || steps.existing.outputs.exists == 'false') }}
         run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && (steps.completeness.outputs.complete == 'true' || steps.existing.outputs.exists == 'false') }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1996,9 +2058,13 @@ jobs:
             echo "::notice::Release $RELEASE_TAG published complete."
             exit 0
           fi
-          echo "::error::Release $RELEASE_TAG is INCOMPLETE and was published as a DRAFT (it is not 'latest'). Missing:"
+          if [ "${{ steps.existing.outputs.exists }}" = "true" ]; then
+            echo "::error::Release $RELEASE_TAG is INCOMPLETE — the release already published at this tag was LEFT UNTOUCHED (still 'latest'). Missing from this run:"
+          else
+            echo "::error::Release $RELEASE_TAG is INCOMPLETE and was published as a DRAFT (it is not 'latest'). Missing:"
+          fi
           sed 's/^/- /' missing.txt
-          echo "Re-run the failed jobs of this run, then re-run this job."
+          echo "Re-run the failed jobs of this run, then re-run this job. The files that did build are attached to this run as artifacts."
           exit 1
 
   # ==========================================================================
