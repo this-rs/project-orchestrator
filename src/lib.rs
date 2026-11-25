@@ -1557,6 +1557,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     use api::handlers::ServerState;
     use tokio::sync::RwLock;
 
+    // The agent engine (DeepSeek, Codex, an ACP agent, the native harness — every registered
+    // provider INSTANCE) runs a chat through `mcp_server`. When it is absent, every chat on those
+    // engines fails to open with a 424 that names the PROVIDER while the missing file is this one.
+    // The check lives in `chat::config` so it can be covered by a test; see its doc for the
+    // measurement behind it (25/11/2026, a cleaned `target/release`).
+    crate::chat::config::warn_if_mcp_server_missing();
+
     // Hash root account password at startup (if plaintext)
     if let Some(ref mut auth) = config.auth_config {
         auth.ensure_root_password_hashed()?;

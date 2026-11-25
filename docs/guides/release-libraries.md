@@ -3,6 +3,12 @@
 A release must not recompile what did not change. This page describes the two mechanisms that
 enforce it, where their inputs live, and what to do when one of them is missing.
 
+## The release itself
+
+What a release promises, what happens when a piece is missing (a draft and a red run, never a
+silently partial `latest`), the macOS notarization preflight and the native per-architecture
+Docker build: [release.md](release.md).
+
 ## Why
 
 Measured on the v0.0.17 release run: the Docker jobs took **214 min** (api-only) and **122 min**
