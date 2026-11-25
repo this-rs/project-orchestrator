@@ -2244,8 +2244,14 @@ jobs:
           mapfile -t refs < <(for d in *; do printf 'ghcr.io/%s@sha256:%s\n' "${{ github.repository }}" "$d"; done)
           [ ${#refs[@]} -gt 0 ] || { echo "::error::no digest was uploaded by docker-build"; exit 1; }
           echo "digests: ${refs[*]}"
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          docker buildx imagetools create "${tags[@]/#/-t }" "${refs[@]}"
+          # `-t` and its value are TWO argv entries. A substitution like "${tags[@]/#/-t }"
+          # produces one entry holding a space ("-t ghcr.io/...:v0.0.20"), which imagetools
+          # rejects with "invalid reference format" — measured on run 45694289710, where the four
+          # native builds were green and both manifests failed on this line.
+          args=()
+          while IFS= read -r t; do args+=(-t "$t"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          [ ${#args[@]} -gt 0 ] || { echo "::error::metadata produced no tag"; exit 1; }
+          docker buildx imagetools create "${args[@]}" "${refs[@]}"
 
       - name: Inspect the published image
         run: docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}${{ matrix.variant.suffix }}
