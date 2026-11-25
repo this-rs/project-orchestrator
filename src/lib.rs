@@ -870,7 +870,6 @@ impl AuthConfig {
         }
     }
 
-
     /// Check whether a given email is allowed by the configured restrictions.
     ///
     /// An email passes if **any** of these conditions hold:

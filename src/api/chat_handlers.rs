@@ -2810,7 +2810,8 @@ mod tests {
     async fn a_server_that_names_nobody_says_so_instead_of_sending_you_to_an_absent_admin() {
         // Measured on dev.ffs.dev: OIDC only, no root_account — and the screen said « ask
         // the administrator », which was nobody. The refusal must name the missing setting.
-        let app = create_router(mock_server_state_authenticated(None, Some(oidc_only_auth())).await);
+        let app =
+            create_router(mock_server_state_authenticated(None, Some(oidc_only_auth())).await);
         let (status, text) = call_text(
             &app,
             json_as(

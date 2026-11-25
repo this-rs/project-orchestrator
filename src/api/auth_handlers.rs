@@ -2049,7 +2049,10 @@ mod tests {
         assert_eq!(json["has_deciding_account"], true);
         // This route is public: it must not leak the address it names.
         let body = json.to_string().to_lowercase();
-        assert!(!body.contains("owner@"), "public body leaks the account: {body}");
+        assert!(
+            !body.contains("owner@"),
+            "public body leaks the account: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2072,14 +2075,7 @@ mod tests {
         let state = make_server_state(Some(config)).await;
 
         let owner_id = Uuid::new_v4();
-        let token = encode_jwt(
-            owner_id,
-            "Owner@ffs.holdings",
-            "Owner",
-            TEST_SECRET,
-            3600,
-        )
-        .unwrap();
+        let token = encode_jwt(owner_id, "Owner@ffs.holdings", "Owner", TEST_SECRET, 3600).unwrap();
         let app = Router::new()
             .route("/auth/me", get(get_me))
             .layer(from_fn_with_state(state.clone(), require_auth))
@@ -2099,8 +2095,14 @@ mod tests {
         assert_eq!(json["is_root"], true);
 
         // Somebody else, on the same server, is not root.
-        let other = encode_jwt(Uuid::new_v4(), "other@ffs.holdings", "Other", TEST_SECRET, 3600)
-            .unwrap();
+        let other = encode_jwt(
+            Uuid::new_v4(),
+            "other@ffs.holdings",
+            "Other",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
         let app = Router::new()
             .route("/auth/me", get(get_me))
             .layer(from_fn_with_state(state.clone(), require_auth))

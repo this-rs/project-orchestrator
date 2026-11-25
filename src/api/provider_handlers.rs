@@ -72,8 +72,7 @@ pub(crate) fn require_root(state: &OrchestratorState, claims: &Claims) -> Result
         ))
     } else {
         Err(AppError::Forbidden(
-            "root_required: only the root account can change this server-wide setting"
-                .to_string(),
+            "root_required: only the root account can change this server-wide setting".to_string(),
         ))
     }
 }
