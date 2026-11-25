@@ -86,19 +86,33 @@ runs_on() {
 # ---------------------------------------------------------------- sources
 
 from_library_release() {
-  local lib=$1 version=$2 target=$3 dest=$4 repo tag asset tmp
+  local lib=$1 version=$2 target=$3 dest=$4 repo tag asset tmp err attempt
   command -v gh >/dev/null 2>&1 || { log "$lib $version $target: no gh, library release skipped"; return 1; }
   repo=$(repo_slug) || { log "$lib $version $target: no repository, library release skipped"; return 1; }
   tag=$(lib_tag "$lib" "$version"); asset=$(lib_asset "$lib" "$version" "$target")
-  tmp=$(mk_tmp)
-  if GH_TOKEN="${GH_TOKEN:-}" gh release download "$tag" -R "$repo" -p "$asset" -D "$tmp" >/dev/null 2>&1 \
-     && [ -s "$tmp/$asset" ]; then
-    rm -rf "$dest" && mkdir -p "$dest"
-    tar xzf "$tmp/$asset" -C "$dest"
-    log "$lib $version $target <- $repo@$tag (prebuilt asset, no build)"
-    return 0
-  fi
+  tmp=$(mk_tmp); err="$tmp/gh.err"
+  # Three attempts: this is one HTTPS call, and on v0.0.20 (run 45638973782) a single failure
+  # here sent the job down the "build it locally" path, which died 20 minutes later with exit
+  # 128 on a git clone. A transient download must not cost a release.
+  for attempt in 1 2 3; do
+    rm -f "$tmp/$asset"
+    if GH_TOKEN="${GH_TOKEN:-}" gh release download "$tag" -R "$repo" -p "$asset" -D "$tmp" \
+         >/dev/null 2>"$err" && [ -s "$tmp/$asset" ]; then
+      rm -rf "$dest" && mkdir -p "$dest"
+      tar xzf "$tmp/$asset" -C "$dest"
+      log "$lib $version $target <- $repo@$tag (prebuilt asset, no build)"
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      warn "$lib $version $target: download from $tag failed (attempt $attempt/3), retrying"
+      sleep $((attempt * 5))
+    fi
+  done
   log "$lib $version $target: not published on $tag yet"
+  # Keep WHY it failed. Swallowing this is what made the v0.0.20 failure ("not published yet"
+  # about an asset that was published, and had just been downloaded by another job of the same
+  # run) impossible to explain from the log.
+  [ -s "$err" ] && sed 's/^/  gh: /' "$err" >&2
   return 1
 }
 

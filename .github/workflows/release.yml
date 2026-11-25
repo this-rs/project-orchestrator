@@ -816,6 +816,35 @@ jobs:
         shell: bash
         run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # Ask Apple BEFORE compiling. When the account's agreements are not in effect,
+      # notarytool answers 403 to every submission; on v0.0.20 (run 45638973782) that was
+      # discovered after the whole bundle had been built, re-signed and packed into a .dmg,
+      # and the release went out without any macOS installer. Thirty seconds here instead.
+      - name: Notarization preflight (macOS)
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Only an explicit 403 stops here. Everything else (a network drop, a tool that answers
+          # differently than expected, an account with no submission history) is inconclusive and
+          # must NOT block a release: the notarization step itself still refuses anything that is
+          # not `Accepted`, so a false negative here would only cost a build, never a bad app.
+          if out=$(xcrun notarytool history --apple-id "$APPLE_ID" \
+                     --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" 2>&1); then
+            echo "$out" | head -3
+            echo "✅ Apple accepts the notarization credentials"
+            exit 0
+          fi
+          echo "$out"
+          if echo "$out" | grep -q "HTTP status code: 403"; then
+            echo "::error::Apple refuses the notarization credentials with 403 — an agreement is missing or has expired. Accept it at https://developer.apple.com/account (Agreements), then re-run. Nothing was built."
+            exit 1
+          fi
+          echo "::warning::notarization preflight inconclusive (see above) — carrying on; the notarization step is still the gate."
+
       # Inject the git tag version into all version files so the built
       # artifacts (app name, About dialog, --version flag) match the release.
       - name: Inject version from git tag
@@ -1574,6 +1603,46 @@ jobs:
           echo "Updater bundles after rename:"
           ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
 
+      # --- Linux / Windows: the updater bundle, built and signed here ---
+      # macOS never depended on Tauri for this: "Rebuild updater bundles after re-sign" makes the
+      # .app.tar.gz itself with tar, then signs it with `cargo tauri signer sign`. Tauri does NOT
+      # produce an updater artifact for these two platforms in the current configuration (measured
+      # on v0.0.20, run 45638973782: the Linux job bundled the AppImage and nothing else), so
+      # latest.json carried empty linux-x86_64 and windows-x86_64 entries and neither platform has
+      # ever been able to self-update. Same proven path here, no bundler behaviour to guess at.
+      - name: Build and sign the Linux updater bundle (.AppImage.tar.gz)
+        if: runner.os == 'Linux' && matrix.tauri_target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          APPDIR="target/${{ matrix.tauri_target }}/release/bundle/appimage"
+          APPIMAGE=$(find "$APPDIR" -maxdepth 1 -name '*.AppImage' | head -1)
+          [ -n "$APPIMAGE" ] || { echo "::error::no .AppImage to package for the updater"; exit 1; }
+          NAME=$(basename "$APPIMAGE")
+          # The AppImage updater consumes a tar.gz whose root holds the AppImage.
+          tar czf "$APPDIR/${NAME}.tar.gz" -C "$APPDIR" "$NAME"
+          cargo tauri signer sign "$APPDIR/${NAME}.tar.gz"
+          ls -la "$APPDIR/${NAME}.tar.gz" "$APPDIR/${NAME}.tar.gz.sig"
+
+      - name: Build and sign the Windows updater bundle (.nsis.zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $nsisDir = "target/${{ matrix.tauri_target }}/release/bundle/nsis"
+          $setup = Get-ChildItem -Path $nsisDir -Filter '*setup.exe' | Select-Object -First 1
+          if (-not $setup) { Write-Error "no NSIS setup.exe to package for the updater"; exit 1 }
+          # The NSIS updater consumes a zip holding the installer, named like Tauri names it:
+          # Product_<v>_x64-setup.nsis.zip (the ".exe" is dropped, the gate expects that name).
+          $zip = ($setup.FullName -replace '\.exe$', '') + '.nsis.zip'
+          Compress-Archive -Path $setup.FullName -DestinationPath $zip -Force
+          cargo tauri signer sign $zip
+          Get-ChildItem -Path $nsisDir | Format-Table Name, Length
+
       # The legacy .dmg is named like the standard Intel one (both are "..._x64.dmg"): without a suffix the release job
       # would flatten one over the other. The site finds it by "_x64-legacy.dmg".
       - name: Rename the legacy .dmg
@@ -1826,6 +1895,111 @@ jobs:
             echo "::warning::macOS legacy updater bundle missing — latest-legacy.json not generated"
           fi
 
+      # ---------------------------------------------------------------------------------
+      # A release is published WHOLE, or it is published as a DRAFT — never silently partial.
+      #
+      # Measured on v0.0.20 (run 45638973782): all three macOS Tauri jobs failed (Apple
+      # answered 403 to notarization), no `.dmg` reached the release, and this job still
+      # published v0.0.20 as `Latest` with a `latest.json` whose two darwin entries were
+      # empty — so every Mac on 0.0.19 was offered an update it could not download.
+      # `if: always()` is still right (salvage whatever built); publishing it as a normal
+      # release is not. The list below is the promise: add a file here when you promise it.
+      # ---------------------------------------------------------------------------------
+      - name: Check the release is complete
+        id: completeness
+        shell: bash
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          missing=()
+          ok()   { echo "  ok       $1"; }
+          need() {  # $1 = what it is, $2 = glob under release-files/
+            if compgen -G "release-files/$2" >/dev/null; then ok "$1"
+            else echo "  MISSING  $1  (release-files/$2)"; missing+=("$1"); fi
+          }
+
+          echo "=== The macOS desktop installers ==="
+          need "macOS arm64 .dmg"                    "Project Orchestrator_${VERSION}_aarch64.dmg"
+          need "macOS Intel .dmg"                    "Project Orchestrator_${VERSION}_x64.dmg"
+          need "macOS Intel legacy .dmg"             "Project Orchestrator_${VERSION}_x64-legacy.dmg"
+          need "macOS arm64 updater bundle"          "Project Orchestrator_arm64.app.tar.gz"
+          need "macOS arm64 updater signature"       "Project Orchestrator_arm64.app.tar.gz.sig"
+          need "macOS Intel updater bundle"          "Project Orchestrator_x86_64.app.tar.gz"
+          need "macOS Intel updater signature"       "Project Orchestrator_x86_64.app.tar.gz.sig"
+          need "macOS Intel legacy updater bundle"   "Project Orchestrator_x86_64-legacy.app.tar.gz"
+          need "macOS Intel legacy updater signature" "Project Orchestrator_x86_64-legacy.app.tar.gz.sig"
+
+          echo "=== The Linux and Windows desktop installers ==="
+          need "Linux amd64 AppImage"        "Project Orchestrator_${VERSION}_amd64.AppImage"
+          need "Linux amd64 desktop .deb"    "Project Orchestrator_${VERSION}_amd64.deb"
+          need "Linux arm64 desktop .deb"    "Project Orchestrator_${VERSION}_arm64.deb"
+          need "Linux x86_64 desktop .rpm"   "Project Orchestrator-${VERSION}-1.x86_64.rpm"
+          need "Linux aarch64 desktop .rpm"  "Project Orchestrator-${VERSION}-1.aarch64.rpm"
+          need "Windows NSIS installer"      "Project Orchestrator_${VERSION}_x64-setup.exe"
+          need "Windows MSI installer"       "Project Orchestrator_${VERSION}_x64_en-US.msi"
+          # The updater bundles for those two platforms (built and signed by build-tauri itself).
+          need "Linux updater bundle"        "Project Orchestrator_${VERSION}_amd64.AppImage.tar.gz"
+          need "Linux updater signature"     "Project Orchestrator_${VERSION}_amd64.AppImage.tar.gz.sig"
+          need "Windows updater bundle"      "Project Orchestrator_${VERSION}_x64-setup.nsis.zip"
+          need "Windows updater signature"   "Project Orchestrator_${VERSION}_x64-setup.nsis.zip.sig"
+
+          echo "=== The server, light and full, for all six targets ==="
+          for a in linux-x86_64 linux-arm64 macos-arm64 macos-x86_64 macos-x86_64-legacy windows-x86_64; do
+            ext=tar.gz; case "$a" in windows-*) ext=zip ;; esac
+            need "server light $a" "orchestrator-${VERSION}-${a}.${ext}"
+            need "server full  $a" "orchestrator-full-${VERSION}-${a}.${ext}"
+          done
+
+          echo "=== The server packages ==="
+          need "server .deb amd64"   "project-orchestrator_${VERSION}-1_amd64.deb"
+          need "server .deb arm64"   "project-orchestrator_${VERSION}-1_arm64.deb"
+          need "server .rpm x86_64"  "project-orchestrator-${VERSION}-1.x86_64.rpm"
+          need "server .rpm aarch64" "project-orchestrator-${VERSION}-1.aarch64.rpm"
+
+          echo "=== The updater feeds ==="
+          if [ -f release-files/latest.json ]; then
+            for p in darwin-aarch64 darwin-x86_64; do
+              if jq -e --arg p "$p" '.platforms[$p].url != "" and .platforms[$p].signature != ""' \
+                   release-files/latest.json >/dev/null; then
+                ok "latest.json $p"
+              else
+                echo "  MISSING  latest.json $p (empty url or signature)"
+                missing+=("latest.json $p")
+              fi
+            done
+            for p in linux-x86_64 windows-x86_64; do
+              if jq -e --arg p "$p" '.platforms[$p].url != "" and .platforms[$p].signature != ""' \
+                   release-files/latest.json >/dev/null; then
+                ok "latest.json $p"
+              else
+                echo "  MISSING  latest.json $p (empty url or signature)"
+                missing+=("latest.json $p")
+              fi
+            done
+          else
+            echo "  MISSING  latest.json"
+            missing+=("latest.json")
+          fi
+
+          echo
+          printf '%s\n' ${missing[@]+"${missing[@]}"} > missing.txt
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+            echo "✅ release $RELEASE_TAG is COMPLETE — every promised file is there"
+            echo "✅ **Release $RELEASE_TAG is complete** — every promised file is there." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${#missing[@]} promised file(s) missing — $RELEASE_TAG will be published as a DRAFT"
+            {
+              echo "## Release $RELEASE_TAG is INCOMPLETE — ${#missing[@]} file(s) missing"
+              echo
+              echo "Published as a **draft**: it never becomes \`latest\`, and no installer or updater feed points at a file that does not exist."
+              echo "Re-run the failed jobs of this run, then re-run this job."
+              echo
+              sed 's/^/- /' missing.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            sed 's/^/MISSING: /' missing.txt
+          fi
+
       # Delete any existing release for this tag before creating a fresh one.
       # softprops/action-gh-release with generate_release_notes APPENDS notes
       # when updating an existing release — causing duplicate changelogs on re-runs.
@@ -1838,55 +2012,106 @@ jobs:
           path: release-files/
           retention-days: 3
 
-      - name: Delete existing release (if any)
+      # A healthy release already published at this tag must survive a repair attempt that builds
+      # less than the promise: measured on v0.0.20, where publishing over it in draft would have
+      # hidden the only installers that had made it out. "Salvage" is the run's artifacts.
+      - name: Does a complete release already exist for this tag?
+        id: existing
         if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "a release already exists at $RELEASE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "no release yet at $RELEASE_TAG"
+          fi
+
+      - name: Delete existing release (if any)
+        if: ${{ !inputs.dry_run && (steps.completeness.outputs.complete == 'true' || steps.existing.outputs.exists == 'false') }}
         run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && (steps.completeness.outputs.complete == 'true' || steps.existing.outputs.exists == 'false') }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
+          # A draft is never "latest": install.sh, the Homebrew formula, the website and the
+          # in-app updater all read /releases/latest, so an incomplete build stays invisible
+          # to them until the missing jobs are re-run. See "Check the release is complete".
+          draft: ${{ steps.completeness.outputs.complete != 'true' }}
           files: |
             release-files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The run is red when the release is not whole. This is the point: on v0.0.20 the run
+      # published a release with no macOS installer and nothing said so outside a build log.
+      - name: Verdict — whole, or a draft
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          if [ "${{ steps.completeness.outputs.complete }}" = "true" ]; then
+            echo "::notice::Release $RELEASE_TAG published complete."
+            exit 0
+          fi
+          if [ "${{ steps.existing.outputs.exists }}" = "true" ]; then
+            echo "::error::Release $RELEASE_TAG is INCOMPLETE — the release already published at this tag was LEFT UNTOUCHED (still 'latest'). Missing from this run:"
+          else
+            echo "::error::Release $RELEASE_TAG is INCOMPLETE and was published as a DRAFT (it is not 'latest'). Missing:"
+          fi
+          sed 's/^/- /' missing.txt
+          echo "Re-run the failed jobs of this run, then re-run this job. The files that did build are attached to this run as artifacts."
+          exit 1
+
   # ==========================================================================
-  # Docker - Build and push multi-arch images to ghcr.io
+  # Docker - one NATIVE build per architecture, then a manifest list
+  #
+  # Measured on v0.0.20 (run 45638973782): both multi-arch jobs sat 4 h 11 in
+  # `docker/build-push-action` and never left it. The arm64 half runs under QEMU, and what
+  # it compiles (nexus-tools, which links V8) is exactly what emulation punishes — v0.0.17
+  # had already measured 214 min for api-only. Worse, a running job wedges the whole run:
+  # `gh run rerun --failed` answers 403 "the workflow run containing this job is already
+  # running" for as long as it is in flight, so a hung build blocks every other repair.
+  #
+  # So each architecture is built on a runner of that architecture (`ubuntu-22.04-arm`
+  # already builds the Linux arm64 desktop bundle), pushed by digest, and the multi-arch
+  # manifest is assembled in a short separate job. No QEMU anywhere, and `timeout-minutes`
+  # turns a hang into a red job instead of a run that never ends.
   # ==========================================================================
-  docker-publish:
-    name: Docker (${{ matrix.variant }})
-    runs-on: ubuntu-latest
+  docker-build:
+    name: Docker ${{ matrix.variant.name }} (${{ matrix.arch.name }})
+    runs-on: ${{ matrix.arch.runner }}
     needs: [build-frontend, third-party-licenses]
     if: ${{ !inputs.dry_run }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: full
-            include_frontend: "true"
-            suffix: ""
-
-          - variant: api-only
-            include_frontend: "false"
-            suffix: "-api"
-
+        variant:
+          - { name: full,     include_frontend: "true",  suffix: "" }
+          - { name: api-only, include_frontend: "false", suffix: "-api" }
+        arch:
+          - { name: amd64, runner: ubuntu-22.04,     platform: linux/amd64 }
+          - { name: arm64, runner: ubuntu-22.04-arm, platform: linux/arm64 }
     steps:
       - uses: actions/checkout@v7
 
       - name: Download frontend dist
-        if: matrix.include_frontend == 'true'
+        if: matrix.variant.include_frontend == 'true'
         uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist/
 
       - name: Create empty frontend dir
-        if: matrix.include_frontend == 'false'
+        if: matrix.variant.include_frontend == 'false'
         run: mkdir -p frontend/dist
 
       # Into the build context, where the Dockerfile copies it to /app/licenses/ with our LICENSE files.
@@ -1899,8 +2124,93 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Set up QEMU (for multi-arch)
-        uses: docker/setup-qemu-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tags are computed here only so they carry the right labels; the push of this job is
+      # a digest (`push-by-digest`), and the tags are attached by docker-manifest below.
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The action derives image.licenses from the repository's detected license, which GitHub reports
+          # as NOASSERTION (dual license): state ours, as the Dockerfile does.
+          labels: |
+            org.opencontainers.image.licenses=MIT AND BUSL-1.1
+            org.opencontainers.image.vendor=FFS SASU
+          flavor: |
+            suffix=${{ matrix.variant.suffix }}
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ matrix.variant.name == 'full' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.arch.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            FRONTEND_SRC=./frontend
+            INCLUDE_FRONTEND=${{ matrix.variant.include_frontend }}
+            APP_VERSION=${{ env.RELEASE_TAG }}
+          # Two caches per (variant, arch), so one architecture never evicts the other's layers:
+          #   - gha: the fast path within a branch;
+          #   - a cache IMAGE in GHCR: durable and versioned, no 10 GB cap, no 7-day eviction.
+          cache-from: |
+            type=gha,scope=release-docker-${{ matrix.variant.name }}-${{ matrix.arch.name }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant.name }}-${{ matrix.arch.name }}
+          cache-to: |
+            type=gha,mode=max,scope=release-docker-${{ matrix.variant.name }}-${{ matrix.arch.name }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant.name }}-${{ matrix.arch.name }},mode=max,ignore-error=true
+
+      - name: Export the digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          [ -n "$digest" ] || { echo "::error::the build returned no digest"; exit 1; }
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          echo "pushed ${{ matrix.arch.platform }} as $digest"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.variant.name }}-${{ matrix.arch.name }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+  docker-manifest:
+    name: Docker manifest (${{ matrix.variant.name }})
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: ${{ !inputs.dry_run }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { name: full,     suffix: "" }
+          - { name: api-only, suffix: "-api" }
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: docker-digest-${{ matrix.variant.name }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -1914,50 +2224,37 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          # The action derives image.licenses from the repository's detected license, which GitHub reports
-          # as NOASSERTION (dual license): state ours, as the Dockerfile does.
           labels: |
             org.opencontainers.image.licenses=MIT AND BUSL-1.1
             org.opencontainers.image.vendor=FFS SASU
           flavor: |
-            suffix=${{ matrix.suffix }}
+            suffix=${{ matrix.variant.suffix }}
           tags: |
             type=raw,value=${{ env.RELEASE_TAG }}
-            type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
+            type=raw,value=latest,enable=${{ matrix.variant.name == 'full' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            FRONTEND_SRC=./frontend
-            INCLUDE_FRONTEND=${{ matrix.include_frontend }}
-            APP_VERSION=${{ env.RELEASE_TAG }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Two caches, both keyed by variant (the two variants shared one scope and evicted each
-          # other's layers, under a 10 GB cap):
-          #   - gha: the fast path within a branch;
-          #   - a cache IMAGE in GHCR: durable and versioned, with no 10 GB cap and no 7-day
-          #     eviction. This is what makes a release start warm even months later — the Docker
-          #     jobs were the slowest of v0.0.17 (214 min for api-only, 122 min for full).
-          cache-from: |
-            type=gha,scope=release-docker-${{ matrix.variant }}
-            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }}
-          cache-to: |
-            type=gha,mode=max,scope=release-docker-${{ matrix.variant }}
-            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }},mode=max,ignore-error=true
+      # `docker buildx imagetools create` writes the manifest list that points at both digests;
+      # without it the tag would resolve to a single architecture.
+      - name: Create the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          mapfile -t refs < <(for d in *; do printf 'ghcr.io/%s@sha256:%s\n' "${{ github.repository }}" "$d"; done)
+          [ ${#refs[@]} -gt 0 ] || { echo "::error::no digest was uploaded by docker-build"; exit 1; }
+          echo "digests: ${refs[*]}"
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${tags[@]/#/-t }" "${refs[@]}"
+
+      - name: Inspect the published image
+        run: docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}${{ matrix.variant.suffix }}
 
       # GHCR packages default to private, even when the repo is public.
       # Make the package public after the first push so `docker pull` works
       # without authentication. This is idempotent — subsequent runs are no-ops.
       - name: Make GHCR package public
-        if: matrix.variant == 'full'
+        if: matrix.variant.name == 'full'
         run: |
           gh api --method PUT \
             /orgs/${{ github.repository_owner }}/packages/container/project-orchestrator/visibility \
