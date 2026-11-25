@@ -144,6 +144,7 @@ pub mod runtime {
 pub mod runner;
 pub mod setup_claude;
 pub mod sharing;
+pub mod single_instance;
 pub mod skills;
 pub mod storage;
 pub mod transport;
@@ -1527,15 +1528,30 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // refused.
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     boot.start("bind");
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        let error = anyhow::anyhow!(
-            "cannot bind {addr}: {e} — another orchestrator instance is probably \
-             already serving this port (check `lsof -nP -iTCP:{} -sTCP:LISTEN`)",
-            config.server_port
-        );
-        boot.fail("bind", &error);
-        error
-    })?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            // Failing fast is only half the story. A duplicate that dies with a
+            // failure code is relaunched by its supervisor (launchd `KeepAlive
+            // { SuccessfulExit = false }`, systemd `Restart=on-failure`) forever:
+            // 590 attempts in one day on 2026-11-25. Ask the port who holds it,
+            // so a live orchestrator becomes a typed error the binary turns into
+            // a SUCCESSFUL exit, while a foreign process keeps the failure code.
+            // The probe is bounded (400 ms) and only runs on this path.
+            let error = match single_instance::probe(config.server_port).await {
+                single_instance::PortOwner::Orchestrator { version } => anyhow::Error::new(
+                    single_instance::PortOwnedByOrchestrator::new(config.server_port, version),
+                ),
+                _ => anyhow::anyhow!(
+                    "cannot bind {addr}: {e} — another orchestrator instance is probably \
+                     already serving this port (check `lsof -nP -iTCP:{} -sTCP:LISTEN`)",
+                    config.server_port
+                ),
+            };
+            boot.fail("bind", &error);
+            return Err(error);
+        }
+    };
     boot.done("bind");
 
     use api::handlers::ServerState;
@@ -3913,6 +3929,34 @@ chat:
             "error should name the port: {err}"
         );
         drop(holder);
+    }
+
+    /// The other half of the bind guard. A port held by a LIVE orchestrator must
+    /// come back as a typed error, so `main` can turn it into a SUCCESSFUL exit
+    /// and its supervisor stops relaunching it — a plain failure code is what
+    /// produced 590 relaunches in one day.
+    #[tokio::test]
+    async fn a_duplicate_against_a_live_orchestrator_is_reported_as_such() {
+        let (port, server) = crate::single_instance::spawn_fake_orchestrator("7.7.7").await;
+
+        let mut config =
+            Config::from_yaml_and_env(Some(Path::new("/nonexistent/po-single-owner.yaml")))
+                .unwrap();
+        config.setup_completed = true;
+        config.server_port = port;
+        config.neo4j_uri = "bolt://127.0.0.1:1".to_string();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), start_server(config))
+            .await
+            .expect("a taken port must fail fast, not wait on initialization");
+        let error = outcome.expect_err("a taken port must be an error");
+        let typed = error
+            .downcast_ref::<crate::single_instance::PortOwnedByOrchestrator>()
+            .expect("a live orchestrator must be reported as such, not as a plain bind failure");
+        assert_eq!(typed.port, port);
+        assert_eq!(typed.version, "7.7.7");
+
+        server.abort();
     }
 
     /// A config file that exists but cannot be parsed must be reported, not

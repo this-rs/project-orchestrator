@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Project Orchestrator — macOS supervision (reference copy; the installed file
+     lives in ~/Library/LaunchAgents/land.ffs.orchestrator.plist).
+
+     Two things this job must get right, both learned the hard way:
+
+     1. A DUPLICATE MUST NOT BE RELAUNCHED. `KeepAlive { SuccessfulExit = false }`
+        restarts the server on any failure code, so a second instance started
+        while a live one holds the port was relaunched forever: 590 attempts on
+        2026-11-25, one every 5 s. The server now asks the port who holds it and
+        exits with status 0 when a live orchestrator answers (see
+        `src/single_instance.rs`), which stops this loop. A real failure still
+        exits non-zero and is still restarted.
+
+     2. THE REDIRECT LOG IS TRIMMED. launchd never rotates
+        /tmp/orchestrator.log, and a crash loop writes a full boot per attempt
+        (1.0 GB measured). ProgramArguments therefore goes through
+        scripts/launchd/po-supervise.sh, which trims it and then execs the
+        server.
+
+     Management:
+       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/land.ffs.orchestrator.plist
+       launchctl kickstart -k gui/$UID/land.ffs.orchestrator   # forced restart (the ONLY way)
+       launchctl bootout gui/$UID/land.ffs.orchestrator        # uninstall
+     Never start the binary by hand: a hand-started server owns the port and the
+     supervised one can never take it. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>land.ffs.orchestrator</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/triviere/.openclaw/workspace/skills/project-orchestrator/scripts/launchd/po-supervise.sh</string>
+        <string>/Users/triviere/.openclaw/workspace/skills/project-orchestrator/target/release/orchestrator</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>--config</string>
+        <string>./config.yaml</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/triviere/.openclaw/workspace/skills/project-orchestrator</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/orchestrator.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/orchestrator.log</string>
+</dict>
+</plist>
