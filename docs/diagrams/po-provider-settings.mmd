@@ -1,6 +1,6 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs backend:src/api/quota_handlers.rs
-%% verified: 2f2176e6
+%% verified: 56a9659c
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
@@ -9,6 +9,8 @@
 %% SOURCES LUES :
 %%   src/api/quota_handlers.rs — list_quotas, get_quota, put_quota, delete_quota, validate_manual (QUOTA) ;
 %%                                   le REGISTRE lui-meme (chat/provider/quota.rs) est dans po-chat-provider
+%%   src/lib.rs — AuthConfig::root_email, deciding_email, is_deciding_account (la règle du compte qui décide pour tous)
+%%   src/api/auth_handlers.rs — get_auth_providers (has_deciding_account), get_me (is_root)
 %%   src/api/provider_handlers.rs — create/update/delete/test_provider, provider_status, provider_models,
 %%                                   list/allow/revoke consent, roles, aliases, policy, send_journal, require_human (partagé)
 %%   src/api/routing_handlers.rs  — get/put_routing, get/put/delete_project_routing (fichier possédé par po-cognitive-routing ; ses routes sont montrées ici)
@@ -69,7 +71,7 @@ flowchart TD
 
     subgraph consent["Consentement par projet"]
         CONSENT["✅ PUT /api/projects/{slug}/llm-consent[s][/id] : l'origine montrée doit être l'actuelle (409 origin_mismatch) ; enregistre qui, quand, quelle origine ET quelle référence ; DELETE retire<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes, changing_the_credential_reference_after_consent_stops_the_sending"]
-        NOPROJ["✅ M1/B3 — GET/PUT /api/chat/llm-consents, PUT/DELETE /api/chat/llm-consents/{provider_id} : le consentement des chats HORS de tout projet (portée no_project) ;<br/>mêmes règles que celui d'un projet (put_consent / delete_consent partagés) MAIS écriture par le compte ROOT seulement (require_scope_writer → require_root, 403 root_required : la portée décide pour les chats de TOUS les utilisateurs ; revue de #722) ; PUT /api/chat/roles (pilote global) idem ;<br/> instance connue, claude-code refusé 400, origine montrée = actuelle sinon 409 origin_mismatch,<br/>lié à l'origine ET à la référence d'identifiant) ; un projet n'en hérite jamais ; allowed_here(portée) sert le default_provider du listing<br/>test : the_consent_for_chats_outside_a_project_follows_the_same_rules, only_root_allows_or_withdraws_a_provider_for_the_chats_outside_a_project,<br/>roles_aliases_and_policy_round_trip_and_are_validated (403 hors root), providers_answers_the_no_project_consent_without_a_project, agent_token_cannot_mutate_human_only_routes (middleware) ;<br/>sans projet demandé, le listing évalue allowed_for_project dans la portée no_project"]
+        NOPROJ["✅ M1/B3 — GET/PUT /api/chat/llm-consents, PUT/DELETE /api/chat/llm-consents/{provider_id} : le consentement des chats HORS de tout projet (portée no_project) ;<br/>mêmes règles que celui d'un projet (put_consent / delete_consent partagés) MAIS écriture par le compte qui DÉCIDE POUR TOUS seulement (require_scope_writer → require_root → AuthConfig::is_deciding_account : `auth.root_email`, comparé à l'EMAIL — seul moyen de reconnaître un compte OIDC, dont l'UUID est aléatoire — sinon le `root_account` de configuration (UUID v5 ou email) ; la portée décide pour les chats de TOUS les utilisateurs ; revue de #722) ; AUCUN compte nommé ⇒ 403 deciding_account_missing qui nomme la clé à poser (avant : 403 root_required pour tout le monde, y compris le propriétaire, sur un serveur en OIDC seul — mesuré 24/11/2026) ; GET /auth/providers expose has_deciding_account (public, sans nommer l'email) ; PUT /api/chat/roles (pilote global) idem ;<br/> instance connue, claude-code refusé 400, origine montrée = actuelle sinon 409 origin_mismatch,<br/>lié à l'origine ET à la référence d'identifiant) ; un projet n'en hérite jamais ; allowed_here(portée) sert le default_provider du listing<br/>test : the_consent_for_chats_outside_a_project_follows_the_same_rules, only_root_allows_or_withdraws_a_provider_for_the_chats_outside_a_project, the_named_oidc_account_allows_an_endpoint_for_the_chats_outside_any_project, a_server_that_names_nobody_says_so_instead_of_sending_you_to_an_absent_admin, get_me_is_root_for_the_oidc_account_named_by_root_email, providers_say_no_deciding_account_when_the_server_names_none,<br/>roles_aliases_and_policy_round_trip_and_are_validated (403 hors root), providers_answers_the_no_project_consent_without_a_project, agent_token_cannot_mutate_human_only_routes (middleware) ;<br/>sans projet demandé, le listing évalue allowed_for_project dans la portée no_project"]
         CONSENT --> NOPROJ
     end
 
