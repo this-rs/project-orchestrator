@@ -300,7 +300,15 @@ pub async fn password_login(
         }
     }
 
-    // 2. Look up user in Neo4j by email + provider "password"
+    // 2. The address `auth.root_email` names never authenticates with a password: that
+    // account decides for every user by its EMAIL, so a password account bearing that
+    // address would inherit the decision (see the same guard in `register`). The
+    // configured `root_account` is a password account and returned above, untouched.
+    if auth_config.is_named_by_root_email(&req.email) {
+        return Err(invalid_credentials());
+    }
+
+    // 3. Look up user in Neo4j by email + provider "password"
     let user = state
         .orchestrator
         .neo4j()
@@ -362,6 +370,19 @@ pub async fn register(
 
     // 2. Validate input fields
     validate_registration(&req, auth_config)?;
+
+    // 2b. Never the address of the account that decides for everyone. That account is
+    // recognised on its EMAIL (`is_deciding_account`: an OIDC account carries a random
+    // identifier), and step 3 only refuses a duplicate of a PASSWORD account — so without
+    // this guard, registering the address named by `auth.root_email` (an OIDC account, hence
+    // invisible to step 3) would hand every server-wide setting to whoever registered it.
+    if auth_config.is_deciding_account(Uuid::nil(), &req.email) {
+        return Err(AppError::Conflict(
+            "This address belongs to the account that decides for everyone on this server: \
+             it signs in with the method configured here, not by registering"
+                .to_string(),
+        ));
+    }
 
     // 3. Check email uniqueness for password provider
     let existing = state
@@ -2021,6 +2042,87 @@ mod tests {
         let json = get_providers_json(app).await;
 
         assert_eq!(json["allow_registration"], true);
+    }
+
+    // ================================================================
+    // The deciding address is not claimable with a password (24/11/2026)
+    //
+    // `register` only refuses a duplicate of a PASSWORD account; the address named by
+    // `auth.root_email` belongs to an OIDC account, invisible to that check — and
+    // `is_deciding_account` matches on the EMAIL. Without these two guards, whoever
+    // registered that address first would decide for every user of the server.
+    // ================================================================
+
+    #[tokio::test]
+    async fn registration_cannot_take_the_address_of_the_deciding_account() {
+        let mut config = auth_config_with_registration();
+        config.root_email = Some("owner@ffs.holdings".to_string());
+        let app = test_auth_app(Some(config)).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            // Case is not a hiding place: the comparison is the one `is_deciding_account` does.
+            .body(register_body(
+                "Owner@FFS.holdings",
+                "securepass123",
+                "Owner",
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Any other address still registers: the guard is not a registration switch.
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body(
+                "someone@ffs.holdings",
+                "securepass123",
+                "Someone",
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_password_account_cannot_impersonate_the_oidc_deciding_account() {
+        let mut config = auth_config_with_root();
+        // The OIDC-designated account is NOT the configured password root.
+        config.root_email = Some("owner@ffs.holdings".to_string());
+        let (app, state) = test_auth_app_with_state(Some(config)).await;
+
+        // An account already bearing that address (created before the guard, or by hand).
+        let password_hash = bcrypt::hash("userpass456", 4).unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .create_password_user("owner@ffs.holdings", "Owner", &password_hash)
+            .await
+            .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("owner@ffs.holdings", "userpass456"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // The configured password root keeps signing in with its password.
+        let app = test_auth_app(Some(auth_config_with_root())).await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("admin@ffs.holdings", "rootpass123"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ================================================================

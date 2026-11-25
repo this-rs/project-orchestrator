@@ -870,6 +870,20 @@ impl AuthConfig {
         }
     }
 
+    /// Whether this address is the one `auth.root_email` names — the deciding account of a
+    /// server that signs in without a password of its own.
+    ///
+    /// Separate from [`Self::is_deciding_account`] because the two password paths must tell
+    /// this address apart from the configured `root_account`, which IS a password account
+    /// and must keep signing in: the address named here never does (see `register` and
+    /// `password_login`).
+    pub fn is_named_by_root_email(&self, email: &str) -> bool {
+        self.root_email
+            .as_deref()
+            .filter(|named| !named.trim().is_empty())
+            .is_some_and(|named| normalize_email(named) == normalize_email(email))
+    }
+
     /// Check whether a given email is allowed by the configured restrictions.
     ///
     /// An email passes if **any** of these conditions hold:
