@@ -361,11 +361,16 @@ fn program_base_name(program: &str) -> Option<&str> {
         Some(rest) => rest.split('"').next().unwrap_or(rest),
         None => program.split_whitespace().next().unwrap_or(""),
     };
-    std::path::Path::new(first)
-        .file_name()
-        .and_then(|name| name.to_str())
-        // Windows ships the same file as `mcp_server.exe`: one engine, two spellings.
-        .map(|name| name.strip_suffix(".exe").unwrap_or(name))
+    // BOTH separators, whatever the host: `std::path::Path` only knows the separator of the
+    // machine that runs this code, so a Windows path parsed on a Linux server kept its whole
+    // directory in the "file name" — measured by this module's own test, which answered the
+    // generic sentence instead of naming `mcp_server`.
+    let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if name.is_empty() {
+        return None;
+    }
+    // Windows ships the same file as `mcp_server.exe`: one engine, two spellings.
+    Some(name.strip_suffix(".exe").unwrap_or(name))
 }
 
 /// Maps a provider error met while opening (or resuming) a session.
@@ -735,7 +740,10 @@ mod missing_program_tests {
     #[test]
     fn an_unknown_program_keeps_the_generic_sentence() {
         let said = missing_program_message("opencode --serve");
-        assert!(said.starts_with("The provider's command-line tool is not installed"), "{said}");
+        assert!(
+            said.starts_with("The provider's command-line tool is not installed"),
+            "{said}"
+        );
         assert!(!said.contains("opencode"), "{said}");
     }
 
