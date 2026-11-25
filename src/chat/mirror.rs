@@ -315,6 +315,17 @@ impl MirrorRegistry {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Test seam: declares `id` open here, as the parent's tap would have. A test needs it
+    /// to reach a LIVE session that has no process and no entry in the active-session table
+    /// (a mirror) — the only one whose close cannot render it.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(&self, id: Uuid) {
+        let (tx, _rx) = broadcast::channel(4);
+        let mut state = self.lock();
+        state.open.insert(id, (0, tx));
+        state.known.insert(id, 0);
+    }
+
     /// A live receiver of the open mirror `session_id`.
     pub fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<ChatEvent>> {
         let id = Uuid::parse_str(session_id).ok()?;

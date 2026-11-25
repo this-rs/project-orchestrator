@@ -175,6 +175,7 @@ mod tests {
             google_client_id: Some("123456.apps.googleusercontent.com".to_string()),
             google_client_secret: Some("secret123".to_string()),
             google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
+            root_email: None,
         }
     }
 

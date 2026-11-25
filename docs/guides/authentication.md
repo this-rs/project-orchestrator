@@ -193,6 +193,18 @@ auth:
 | `name` | Yes | -- | Root account display name |
 | `password_hash` | Yes | -- | Bcrypt hash (`$2b$12$...`) or plaintext (auto-hashed at startup) |
 
+#### The account that decides for everyone (`root_email`)
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `root_email` | No | `None` | E-mail of the account that decides for everyone: the settings that apply to all users (the consent for the chats outside any project, the global provider roles, the model policy, the routing) are writable by it and by nobody else. Matched on the e-mail, case-insensitively, so an **OIDC account can be it** — an OIDC user gets a random identifier, which the deterministic identifier of `root_account` can never match. When both are set, both decide. |
+
+Without `root_email` (and without `root_account`) **nobody decides**: those settings answer `403 deciding_account_missing` to everyone, the owner included, and `GET /auth/providers` reports `has_deciding_account: false`. This is the state that a server signing in through OIDC alone falls into when the key is not set (measured 24/11/2026: the consent for the chats outside any project was refused to the owner himself).
+
+The address named here is never claimable: `POST /auth/register` refuses it (`409`), and it never authenticates with a password (`401`) even if a password account carries it — an account recognised by its e-mail would otherwise inherit the decision. The configured `root_account`, which IS a password account, keeps signing in normally.
+
+Name an address that `allowed_email_domain` / `allowed_emails` lets sign in: the server logs a warning at startup when it does not, so the setting does not fail silently.
+
 #### Generic OIDC (`oidc`)
 
 | Field | Required | Default | Description |
@@ -896,6 +908,7 @@ In no-auth mode, the middleware injects anonymous claims (`anonymous@local`, nil
 - **Email domain restriction:** Your email does not match the `allowed_email_domain` or `allowed_emails` whitelist
 - **Registration disabled:** `POST /auth/register` returns 403 if `allow_registration` is `false`
 - **Password auth not configured:** `POST /auth/login` returns 403 if no `root_account` is defined and no password users exist
+- **No deciding account:** a server-wide setting (the consent for the chats outside any project, the global provider roles, the model policy) returns `403 deciding_account_missing` when neither `root_email` nor `root_account` is configured — nobody can write it, the owner included. Set `auth.root_email`, then restart
 - **Error message check:** The response body contains a JSON `message` field with the specific reason
 
 ### "Invalid email or password"

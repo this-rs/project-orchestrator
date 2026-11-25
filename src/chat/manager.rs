@@ -10605,7 +10605,33 @@ impl ChatManager {
                                 }
 
                                 // Convert to ChatEvent(s) and emit + persist structured events
-                                let events = Self::message_to_events(msg);
+                                let mut events = Self::message_to_events(msg);
+                                // A turn the historical engine ended to POSE A QUESTION completed:
+                                // the CLI labels it `error_during_execution` because we denied the
+                                // call (§15.6), and read as a failure it closes the question it has
+                                // just opened — measured 24/11/2026 on the orchestrator (session
+                                // 76faba47, events 39613-39618), the card was unanswerable 8 ms
+                                // after it appeared. The turn's own events say whether it asked:
+                                // no new state to keep in step with the two control branches.
+                                if streaming_events
+                                    .lock()
+                                    .await
+                                    .iter()
+                                    .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
+                                {
+                                    for event in events.iter_mut() {
+                                        if let ChatEvent::Result {
+                                            stop_reason,
+                                            is_error,
+                                            ..
+                                        } = event
+                                        {
+                                            if !*is_error && stop_reason.is_none() {
+                                                *stop_reason = Some("completed".to_string());
+                                            }
+                                        }
+                                    }
+                                }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
                                     if let Some(call) = super::session_grants::observed_call(
@@ -19814,6 +19840,35 @@ impl ChatManager {
                 warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
                 continue;
             }
+            // Un `Ok` de l'interrupt ne prouve PAS que la session du fournisseur ait lache :
+            // un appel `Agent` en vol la tient encore. MESURE le 24/11/2026 (session
+            // `a574ba1d`) : 60 min d'attente sur `Agent`, l'interrupt a rendu la main, le
+            // message a annonce « the session is free again » — et CHAQUE message suivant a
+            // recu `turn_in_progress` (409). Le message mentait, et la session fantome
+            // gardait un creneau de la table bornee : plus aucune conversation ne pouvait
+            // s'ouvrir. On relit donc l'etat, et une session qui streame encore est FERMEE.
+            let encore_occupee = self
+                .session_activity_map()
+                .await
+                .get(&id)
+                .map(|a| a.streaming)
+                .unwrap_or(false);
+            if encore_occupee {
+                warn!(
+                    session_id = %id,
+                    "the turn was ended but the session is still streaming: closing it to give its slot back"
+                );
+                if let Err(e) = self
+                    .close_session_because(
+                        &id.to_string(),
+                        "tool result lost: the turn was ended but the session stayed streaming",
+                    )
+                    .await
+                {
+                    warn!(session_id = %id, error = %e, "closing the still-streaming session failed");
+                    continue;
+                }
+            }
             // The turn is ended now — only then is the user told. Emitting before the
             // interrupt announced a turn that never ended when the interrupt failed, and the
             // same message went out again on every tick (the failure was not memorised).
@@ -19822,10 +19877,16 @@ impl ChatManager {
                 ChatEvent::Error {
                     message: format!(
                         "The call to `{tool}` never came back: this turn waited {} min for its \
-                         result, which is past every budget that call has, so the turn was ended. \
-                         The session is free again and your next message continues the \
-                         conversation. Only this turn's answer was lost.",
-                        silent_for.as_secs() / 60
+                         result, which is past every budget that call has, so the turn was ended.{}",
+                        silent_for.as_secs() / 60,
+                        if encore_occupee {
+                            " The session had NOT let go after the interrupt, so it was closed \
+                             to give its slot back: your next message opens a fresh session, and \
+                             the conversation is kept."
+                        } else {
+                            " The session is free again and your next message continues the \
+                             conversation. Only this turn's answer was lost."
+                        }
                     ),
                     parent_tool_use_id: None,
                     code: Some("tool_result_lost".to_string()),

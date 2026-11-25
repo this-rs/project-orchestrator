@@ -617,6 +617,45 @@ pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
     )
 }
 
+/// Says once, at startup, whether the engine binary is there — and where to look if not.
+///
+/// The startup path cannot be unit-tested, so the sentence lives here and is called by one line
+/// of `lib.rs`. It matters because the missing file is the ENGINE's, not the provider's:
+/// measured 25/11/2026, a cleaned `target/release` left the server running from a binary that no
+/// longer existed on disk, and every DeepSeek chat answered "the provider's command-line tool is
+/// not installed" — naming the provider for a file named `mcp_server`.
+pub fn warn_if_mcp_server_missing() {
+    let detected = ChatConfig::detect_mcp_server_path_public();
+    warn_if_program_is_missing(&detected, std::env::var_os("PATH").as_deref());
+}
+
+/// The check itself, with its two inputs given, so a test can pin all three outcomes.
+///
+/// Returns whether it warned. `path_env` is the `PATH` to search (the file is also accepted next
+/// to the server binary, which is how every release channel ships it).
+pub(crate) fn warn_if_program_is_missing(
+    program: &std::path::Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    let on_path = program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            path_env.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(name).is_file()))
+        })
+        .unwrap_or(false);
+    if program.is_file() || on_path {
+        return false;
+    }
+    tracing::warn!(
+        path = %program.display(),
+        "mcp_server is missing: no chat on a provider instance (DeepSeek, Codex, ACP, native) \
+         can open. It must sit next to the orchestrator binary, be named by MCP_SERVER_PATH, or \
+         be on the PATH — build it with `cargo build --release`"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1112,5 +1151,46 @@ mod tests {
         std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
         std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
         std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+    }
+
+    /// Le démarrage dit une fois que le binaire du moteur manque — et se taît quand il est là.
+    /// Les trois issues sont épinglées ici parce que le bloc d'origine vivait dans `lib.rs`,
+    /// que rien ne couvre : la couverture du diff l'a mesuré (0/13, run 45681906189).
+    #[test]
+    fn a_present_mcp_server_says_nothing_and_a_missing_one_says_so() {
+        use std::ffi::OsStr;
+        let dir = std::env::temp_dir().join(format!("po-mcp-presence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("mcp_server");
+        std::fs::write(&present, b"not really a binary").unwrap();
+        let absent = dir.join("elsewhere").join("mcp_server");
+
+        // Là, à côté du binaire : rien à dire.
+        assert!(!warn_if_program_is_missing(&present, None));
+        // Absent d'ici mais trouvé sur le PATH donné : rien à dire non plus.
+        assert!(!warn_if_program_is_missing(&absent, Some(dir.as_os_str())));
+        // Absent partout : il parle, et le retour dit qu'il a parlé.
+        assert!(warn_if_program_is_missing(&absent, None));
+        // Un PATH vide n'est pas un PATH qui contient le fichier.
+        assert!(warn_if_program_is_missing(&absent, Some(OsStr::new(""))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L'enveloppe du démarrage lit `MCP_SERVER_PATH` : pointée sur un fichier réel, elle se tait.
+    #[test]
+    fn the_startup_wrapper_follows_mcp_server_path() {
+        let dir = std::env::temp_dir().join(format!("po-mcp-wrapper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("mcp_server");
+        std::fs::write(&present, b"not really a binary").unwrap();
+        let previous = std::env::var_os("MCP_SERVER_PATH");
+        std::env::set_var("MCP_SERVER_PATH", &present);
+        warn_if_mcp_server_missing();
+        match previous {
+            Some(v) => std::env::set_var("MCP_SERVER_PATH", v),
+            None => std::env::remove_var("MCP_SERVER_PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

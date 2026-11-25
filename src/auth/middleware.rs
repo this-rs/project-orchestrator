@@ -561,6 +561,7 @@ mod tests {
             google_client_id: Some("test".to_string()),
             google_client_secret: Some("test".to_string()),
             google_redirect_uri: Some("http://localhost/callback".to_string()),
+            root_email: None,
         }
     }
 
