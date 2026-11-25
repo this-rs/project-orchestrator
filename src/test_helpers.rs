@@ -361,6 +361,7 @@ pub fn test_auth_config() -> AuthConfig {
         google_client_id: Some("test-client-id".to_string()),
         google_client_secret: Some("test-client-secret".to_string()),
         google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
+        root_email: None,
     }
 }
 

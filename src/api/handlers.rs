@@ -12699,6 +12699,7 @@ pub(crate) mod tests {
             google_client_id: None,
             google_client_secret: None,
             google_redirect_uri: None,
+            root_email: None,
         };
         let state = make_origin_test_state(6600, None, Some(auth_config));
         let origins = state.allowed_origins();
