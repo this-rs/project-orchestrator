@@ -3364,8 +3364,6 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -5053,7 +5051,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?rev=844a71cdcea685c913943a64811e922404fb2e64#844a71cdcea685c913943a64811e922404fb2e64"
+source = "git+https://github.com/this-rs/nexus.git?rev=b211a2e0b12b0f2ed3d2c1ce0beeccfbf51016a2#b211a2e0b12b0f2ed3d2c1ce0beeccfbf51016a2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5081,7 +5079,7 @@ dependencies = [
 [[package]]
 name = "nexus-tools"
 version = "0.5.1"
-source = "git+https://github.com/this-rs/nexus.git?rev=844a71cdcea685c913943a64811e922404fb2e64#844a71cdcea685c913943a64811e922404fb2e64"
+source = "git+https://github.com/this-rs/nexus.git?rev=b211a2e0b12b0f2ed3d2c1ce0beeccfbf51016a2#b211a2e0b12b0f2ed3d2c1ce0beeccfbf51016a2"
 dependencies = [
  "async-trait",
  "axum 0.7.9",

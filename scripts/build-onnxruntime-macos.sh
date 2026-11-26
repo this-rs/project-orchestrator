@@ -35,8 +35,24 @@ export MACOSX_DEPLOYMENT_TARGET="$floor"
 
 src="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/onnxruntime-src-${version}"
 rm -rf "$src"
-git clone --quiet --depth 1 --branch "v${version}" --recurse-submodules --shallow-submodules \
-  https://github.com/microsoft/onnxruntime "$src"
+# GIT_TERMINAL_PROMPT=0: without a terminal, git answers a 403 (rate limit) or an unreadable
+# URL with "fatal: could not read Username for 'https://github.com'" and exit 128 — that message
+# was the only trace of the real cause on v0.0.20 (run 45638973782). A public repository never
+# needs credentials, so failing without prompting and retrying is both honest and usually enough.
+for attempt in 1 2 3; do
+  if GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 --branch "v${version}" \
+       --recurse-submodules --shallow-submodules \
+       https://github.com/microsoft/onnxruntime "$src"; then
+    break
+  fi
+  rm -rf "$src"
+  [ "$attempt" -lt 3 ] || {
+    echo "build-onnxruntime-macos: cannot clone microsoft/onnxruntime v${version} after 3 attempts" >&2
+    exit 1
+  }
+  echo "build-onnxruntime-macos: clone attempt $attempt/3 failed, retrying in $((attempt * 20))s" >&2
+  sleep $((attempt * 20))
+done
 
 echo "build-onnxruntime-macos: ONNX Runtime ${version}, x86_64, macOS ${floor}, $(sysctl -n hw.ncpu) cores, ml-ops ${ORT_DISABLE_ML_OPS:-1} (0 = keep the ai.onnx.ml kernels)"
 started=$(date +%s)

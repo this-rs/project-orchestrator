@@ -49,11 +49,11 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Knowledge Fabric** — Bio-inspired neural network connecting notes, decisions, and code via synapses
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 12 more languages
 - **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
-- **MCP Integration** — 22 mega-tools available for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration** — 33 mega-tools available for Claude Code, OpenAI Agents, and Cursor
 - **Autonomous Runner** — Execute plans automatically with parallel wave dispatch and agent personas
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
-- **Authentication** — Google OAuth2, OIDC, and Password login (JWT required once an `auth` section is configured; with no `auth` section the API is open/anonymous)
-- **Chat WebSocket** — Real-time conversational AI via Claude integration with smart context injection
+- **Authentication** — Google OAuth2, OIDC, and Password login (JWT required once an `auth` section is configured; with no `auth` section the API is open/anonymous). The settings that apply to every user — which endpoint a chat outside any project may reach, the global provider roles, the model policy — are writable by the account that decides for everyone: `auth.root_email`, matched on the e-mail so an OIDC account can be it (see [Authentication](docs/guides/authentication.md))
+- **Chat WebSocket** — Real-time conversational AI with smart context injection, on the engine you choose: Claude Code by default, or Codex, an ACP agent, or any OpenAI-compatible endpoint you register (cost, routing and consent per project)
 - **Event System** — Live CRUD notifications via WebSocket + streaming activation events
 - **NATS Integration** — Inter-process event sync for multi-instance deployments
 - **Skill Federation** — Export, publish, and import neural skills across projects and instances
@@ -238,7 +238,7 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 # - sync_project: Parse and index your code
 # - create_plan: Start a development plan
 # - create_workspace: Group related projects
-# - And 15 more mega-tools...
+# - And 29 more mega-tools...
 ```
 
 That's it! Your AI agents now have shared context.
@@ -594,6 +594,10 @@ code(action: "get_node_importance", project_slug: "my-project",
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| **v0.0.20** | 2026-11-25 | The account that decides for everyone on a server that signs in without a password (`auth.root_email`, matched on the e-mail so an OIDC account can be it; `GET /auth/providers` says whether the server names one), a turn that ends on a question is `completed` and the question card no longer closes on an acknowledgement of receipt, a still-streaming session is never announced as freed, a live mirror whose close fails is not announced either, the delegation's end wakes the parent even on a closed channel, Docker builds nexus-tools without the browser on the emulated architecture |
+| **v0.0.19** | 2026-11-12 | The router pays the cache cost of a model switch, the quota view carries FAMILY holds and not only the account's exhaustion |
+| **v0.0.18** | 2026-11-09 | The durable self (its identity written, the model becomes a dated fact), a contradicted belief is revised with its reason, the shared admission gate for providers (quota reserve before sending, typed refusal, overload circuit breaker per instance and key), a typed causal path between two nodes (`/api/graph/path`, `/api/graph/schema`), typed protocol transitions the harness evaluates, offline replay of the routing decisions |
+| **v0.0.17** | 2026-10-08 | Routing mode (primary, mixed or full) with its learning stage, global and per project; task signature and hard-constraint candidates; non-blocking refresh of the model catalogue |
 | **v0.0.16** | 2026-10-02 | Cross-workspace attention API for the Today cockpit, plan-task retry route, per-workspace topology derived from the code, secrets handed to agents without leaking (vault), entity neighborhood endpoint and richer code entities (file path, docstring, signature), XLSX/PPTX extraction and work-profile projects (optional `root_path`), self-update split into version/deployment/service, security hardening (signed tombstones, WS ticket/cookie auth, Cypher/Meilisearch injection fixes, MCP token purge), in-repo living diagrams and bug registry |
 | **v0.0.15** | 2026-07-04 | Remote MCP over Streamable HTTP with an OAuth 2.1 authorization server (opt-in), resume existing sessions via REST/MCP, live Claude model catalog from the Anthropic Models API, session-lifecycle navigation ritual seeded on project creation, note-embedding backfill admin action, semantic anchoring fallback, Witness schema for epistemic discipline |
 | **v0.0.14** | 2026-06-02 | Configurable cap on wave concurrency, Claude Code Dynamic Workflow progress events surfaced in the chat |

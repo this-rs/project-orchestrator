@@ -47,18 +47,29 @@ pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Resul
 }
 
 /// A server-wide routing decision that applies to OTHER people's chats (the global pilot
-/// role, the consent for the chats outside any project): the root account only. Any other
-/// signed-in person gets 403 — they could otherwise send everyone's content to an endpoint
-/// of their choosing. Without authentication there is one user and no third party anyway.
+/// role, the consent for the chats outside any project): the account that decides for
+/// everyone only (`auth.root_email`, else `auth.root_account` — see
+/// `AuthConfig::is_deciding_account`). Any other signed-in person gets 403 — they could
+/// otherwise send everyone's content to an endpoint of their choosing. Without
+/// authentication there is one user and no third party anyway.
 pub(crate) fn require_root(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
     require_human(state, claims)?;
-    if state.auth_config.is_none() {
+    let Some(auth) = state.auth_config.as_ref() else {
         return Ok(());
-    }
-    let is_root = uuid::Uuid::parse_str(&claims.sub)
-        .is_ok_and(|id| super::auth_handlers::is_root_user(state.auth_config.as_ref(), id));
-    if is_root {
+    };
+    let user_id = uuid::Uuid::parse_str(&claims.sub).unwrap_or(uuid::Uuid::nil());
+    if auth.is_deciding_account(user_id, claims.email.as_str()) {
         Ok(())
+    } else if auth.deciding_email().is_none() {
+        // Nobody is named: the refusal must not read as "ask your administrator", there
+        // is none. It names the setting that would create one (measured 24/11/2026 on an
+        // OIDC-only server: this 403 was a dead end for the owner himself).
+        Err(AppError::Forbidden(
+            "deciding_account_missing: this server names no account that decides for \
+             everyone. Set `auth.root_email` to that account in config.yaml, then restart \
+             the server; nothing was changed"
+                .to_string(),
+        ))
     } else {
         Err(AppError::Forbidden(
             "root_required: only the root account can change this server-wide setting".to_string(),

@@ -40,7 +40,8 @@ an identifier or a secret.
 | 409 | `security_gate_closed` | Creating a third-party instance needs authentication on. |
 | 409 | `origin_mismatch` | The origin you consented to is no longer the instance's. |
 | 403 | `provider settings can only be changed by a signed-in user` | An agent token tried a human-only route. |
-| 403 | `root_required` | A signed-in person other than the root account tried a server-wide routing setting: the global pilot role (`PUT /api/chat/roles`) or the consent for the chats outside any project (`PUT`/`DELETE /api/chat/llm-consents[/{provider_id}]`). |
+| 403 | `root_required` | A signed-in person other than the account that decides for everyone tried a server-wide routing setting: the global pilot role (`PUT /api/chat/roles`) or the consent for the chats outside any project (`PUT`/`DELETE /api/chat/llm-consents[/{provider_id}]`). That account is `auth.root_email` (matched on the email, so an OIDC account can be it) or the configured `root_account`; `GET /auth/providers` says whether the server names one (`has_deciding_account`). |
+| 403 | `deciding_account_missing` | The same server-wide settings, on a server that names NO deciding account (`auth.root_email`, or `auth.root_account`): nobody can write them, the owner included. Set `auth.root_email` to the account that decides in `config.yaml`, then restart the server. |
 | 403 | `tool_not_in_profile` | The route is behind a tool the restricted profile withholds. |
 | 403 | `envelope_*` | A delegated session left its envelope (`unbound_token`, `parent_not_found`, `depth_exceeded`, `too_many_children`, `cwd_outside_parent`, `add_dir_outside_parent`, `project_mismatch`, `workspace_mismatch`, `not_a_child`). |
 | 400 | `credential_ref ...` | A malformed reference, a pasted secret, or an undeclared `env:` variable. |

@@ -306,7 +306,7 @@ const FUNCTIONS: &[(&str, &str)] = &[
     ("cancel_task", "cancel_task arrête une tâche d'arrière-plan"),
     (
         "ask_user_question",
-        "une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant",
+        "une question du modèle s'affiche (ask_user_question), la carte reste répondable tant qu'elle attend (waiting_on_person + question_open, ce que lit le frontend) et la réponse de l'utilisateur lui revient au tour suivant",
     ),
     (
         "subagents",
@@ -2251,9 +2251,21 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         cc_tool_use("t-ask", "AskUserQuestion", question_input()),
         permission_request("req-ask", "AskUserQuestion", question_input(), "t-ask"),
         await_in("req-ask"),
-        cc_tool_result("t-ask", "the user was asked", false),
-        text("asked"),
-        result_ok("asked"),
+        // §15.6 : la façade clôt la question par un refus PUIS interrompt le tour pour le
+        // terminer ; le CLI répond alors par un `tool_result` en ERREUR et un `result`
+        // `error_during_execution` / `is_error: false` — mesuré le 24/11/2026 sur
+        // l'orchestrateur (session 76faba47, événements 39616 et 39618). Ce tour doit rester
+        // `completed` : rapporté `interrupted`, l'hôte ferme la question qu'il vient de
+        // recevoir et la carte meurt avant que la personne puisse cliquer.
+        await_in("\"subtype\":\"interrupt\""),
+        cc_tool_result(
+            "t-ask",
+            "The user doesn't want to proceed with this tool use. The tool use was rejected \
+             (eg. if it was a file edit, the new_string was NOT written to the file). STOP what \
+             you are doing and wait for the user to tell you how to proceed.",
+            true,
+        ),
+        result("error_during_execution", "", false),
     ]);
     t.extend(answer(&k.k("ANSWER"), "answered ask"));
     // TURN-AGENT: a sub-agent (the CLI's Task): its messages carry the parent tool_use id,
@@ -4039,6 +4051,32 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         closing.contains("\"behavior\":\"deny\"") && closing.contains("posed to the user");
     w.settle(ends, &manager).await;
     let ends = w.turn_ends();
+    // LA CARTE DOIT ÊTRE RÉPONDABLE. C'est exactement ce que lit le portail du frontend
+    // (`questionAwaitsPerson`) : `waiting_on_person` + `question_open`, au-delà de la fenêtre
+    // de stabilisation. Sans un tour rapporté `completed`, l'hôte lit « interrompu » et ferme
+    // la question qu'il vient de recevoir — mesuré le 24/11/2026 sur l'orchestrateur
+    // (session 76faba47) : carte morte 8 ms après son apparition, réponse retapée à la main.
+    let (answerable, last_verdict) = {
+        let now =
+            crate::chat::segment_tap::now_ms() + crate::chat::segment_state::SETTLE_MS + 1_000;
+        let id = Uuid::parse_str(&sid).unwrap();
+        let mut wanted = None;
+        let mut last = None;
+        for _ in 0..200 {
+            let snap = manager.live_session_snapshot_at(now).await;
+            last = snap.states.get(&id).cloned();
+            if let Some(v) = &last {
+                if v.state == crate::chat::segment_state::SessionState::WaitingOnPerson
+                    && v.reason.rule == crate::chat::segment_state::Rule::QuestionOpen
+                {
+                    wanted = Some(v.clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        (wanted, last)
+    };
     // What the frontend sends for the answer (`input_response`): an inert user turn.
     manager
         .send_message(
@@ -4054,10 +4092,14 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         shown
             && closed_by_denial
             && answer_read
+            && answerable.is_some()
             && w.said(WAIT, "answered ask").await,
         Cause::Harness,
         format!(
-            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, réponse lue au tour suivant={answer_read}"
+            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, \
+             réponse lue au tour suivant={answer_read}, carte encore répondable (waiting_on_person / \
+             question_open)={} — dernier verdict : {last_verdict:?}",
+            answerable.is_some()
         ),
     );
     w.settle(ends, &manager).await;
@@ -6109,6 +6151,107 @@ fn transcript_down_then_up(turn: &str) -> Vec<Value> {
 /// The `down`/`up` pair goes to the session's own event stream
 /// (`ChatEvent::ProviderOutage`, persisted and broadcast), the very channel the
 /// agent engine announces its own outages on.
+/// The historical engine's question turn is COMPLETED, and the card stays answerable.
+///
+/// Measured 24/11/2026 (orchestrator session 76faba47, events 39613-39618): to pose a
+/// question the engine denies the control request, and the CLI closes the turn
+/// `result{error_during_execution, is_error: false}` — its label for a tool call we
+/// rejected, not for a failed turn. The historical path never filled `stop_reason`, so the
+/// state model read that raw subtype as a failure and closed the question it had just been
+/// given. Its `result` now says `completed`, which is what the native engine says for the
+/// same turn (A45).
+///
+/// This test is also the one that MEASURES those lines: the parity scenario that drives the
+/// same path is skipped by the coverage job (`--skip the_same_scenario…`).
+#[tokio::test]
+async fn the_historical_engine_completes_the_turn_it_ends_on_a_question() {
+    use crate::chat::segment_state::{Rule, SessionState, SETTLE_MS};
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let k = Keys("ASKQ");
+    let question = question_input();
+    let cli = FakeClaude::new();
+    cli.transcript(
+        0,
+        &[
+            await_in(&k.k("TURN-ASK")),
+            cc_tool_use("t-ask", "AskUserQuestion", question.clone()),
+            permission_request("req-ask", "AskUserQuestion", question, "t-ask"),
+            await_in("req-ask"),
+            // The CLI answers the denied call with an ERROR result, then closes the turn
+            // as an interruption (measured shape).
+            cc_tool_result(
+                "t-ask",
+                "The user doesn't want to proceed with this tool use.",
+                true,
+            ),
+            result("error_during_execution", "", false),
+            await_in(&k.k("ANSWER")),
+            text("answered"),
+            result_ok("answered"),
+        ],
+    );
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = k.k("TURN-ASK");
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+    let w = Watch::start(
+        stage.graph.clone(),
+        &sid,
+        manager.subscribe(&sid).await.unwrap(),
+    );
+    assert!(
+        w.wait(WAIT, |e| matches!(e, ChatEvent::AskUserQuestion { .. }))
+            .await,
+        "the question reaches the host"
+    );
+    // The turn it ends is COMPLETED on the thread — neither interrupted nor failed.
+    assert!(
+        w.wait(WAIT, |e| matches!(
+            e,
+            ChatEvent::Result { stop_reason: Some(r), .. } if r == "completed"
+        ))
+        .await,
+        "the turn that posed the question is completed: {:#?}",
+        w.all().await
+    );
+    // And the card is answerable: the exact couple the frontend gate reads.
+    let now = crate::chat::segment_tap::now_ms() + SETTLE_MS + 1_000;
+    let id = Uuid::parse_str(&sid).unwrap();
+    let mut verdict = None;
+    for _ in 0..100 {
+        verdict = manager
+            .live_session_snapshot_at(now)
+            .await
+            .states
+            .get(&id)
+            .cloned();
+        if verdict.as_ref().is_some_and(|v| {
+            v.state == SessionState::WaitingOnPerson && v.reason.rule == Rule::QuestionOpen
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let verdict = verdict.expect("the session has a segment state");
+    assert_eq!(
+        (verdict.state, verdict.reason.rule),
+        (SessionState::WaitingOnPerson, Rule::QuestionOpen),
+        "the card stays answerable while the question waits"
+    );
+}
+
 #[tokio::test]
 async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
     let stage = Stage::new().await;

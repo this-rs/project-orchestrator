@@ -330,6 +330,49 @@ pub fn quota_exhausted_message(resets_at_ms: u64) -> String {
     )
 }
 
+/// The sentence a missing executable deserves: it names the file, not the provider.
+///
+/// The program comes from the SDK, sometimes with its arguments; only its base name is kept and
+/// nothing else is echoed (a path or a credential must never reach the browser).
+fn missing_program_message(program: &str) -> &'static str {
+    match program_base_name(program) {
+        // The agent engine (DeepSeek, Codex, ACP, the native harness) runs the chat through
+        // `mcp_server`, resolved next to the server binary (MCP_SERVER_PATH, then the sibling,
+        // then the PATH — src/chat/config.rs). It is the engine's own file, not the provider's.
+        Some("mcp_server") => {
+            "The chat engine's `mcp_server` executable is missing: a chat on a provider instance \
+             (DeepSeek, Codex, an ACP agent, the native harness) runs through it. It must sit \
+             next to the orchestrator binary, be named by MCP_SERVER_PATH, or be on the PATH."
+        }
+        Some("claude") => {
+            "The `claude` command-line tool (the built-in Claude Code engine) is not installed \
+             on the server, or absent from its PATH."
+        }
+        _ => "The provider's command-line tool is not installed on the server, or absent from its PATH.",
+    }
+}
+
+/// The base name of the program the SDK reported, without arguments and without its directory.
+fn program_base_name(program: &str) -> Option<&str> {
+    let program = program.trim();
+    // A path may be quoted (Windows installs under `C:\\Program Files\\...`, whose space would
+    // otherwise cut the first token in half), and it may carry arguments after the executable.
+    let first = match program.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => program.split_whitespace().next().unwrap_or(""),
+    };
+    // BOTH separators, whatever the host: `std::path::Path` only knows the separator of the
+    // machine that runs this code, so a Windows path parsed on a Linux server kept its whole
+    // directory in the "file name" — measured by this module's own test, which answered the
+    // generic sentence instead of naming `mcp_server`.
+    let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if name.is_empty() {
+        return None;
+    }
+    // Windows ships the same file as `mcp_server.exe`: one engine, two spellings.
+    Some(name.strip_suffix(".exe").unwrap_or(name))
+}
+
 /// Maps a provider error met while opening (or resuming) a session.
 ///
 /// `unauthorized` answers 502, not 401: a 401 would log the user out of the
@@ -339,10 +382,15 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
     let mut retry_after_ms: Option<u64> = None;
     let mut resets_at_ms: Option<u64> = None;
     let (status, code, message): (u16, &'static str, String) = match err {
-        ProviderError::CliNotFound { .. } => (
+        // Name the missing executable (`mcp_server` for every provider INSTANCE, `claude` for
+        // the built-in Claude Code) without leaking the path or the arguments. Measured
+        // 25/11/2026: a cleaned `target/release` left the server running from a deleted binary,
+        // and every DeepSeek chat answered "the provider's command-line tool is not installed",
+        // which named the provider while the missing file was the engine's own `mcp_server`.
+        ProviderError::CliNotFound { program } => (
             424,
             err.kind(),
-            "The provider's command-line tool is not installed on the server.".to_string(),
+            missing_program_message(program).to_string(),
         ),
         ProviderError::AuthRequired { login_hint } => {
             action = login_hint.clone();
@@ -650,6 +698,61 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
             ResolveError::ProviderNotChosen { candidates } => Some(candidates.clone()),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod missing_program_tests {
+    use super::{missing_program_message, program_base_name};
+
+    /// Ce que l'écran disait avant : il accusait le fournisseur, alors que le fichier manquant
+    /// est celui du moteur. Un chat DeepSeek ne s'ouvrait pas et le message parlait de DeepSeek.
+    #[test]
+    fn a_missing_mcp_server_says_so_instead_of_blaming_the_provider() {
+        for program in [
+            "mcp_server",
+            "/Users/someone/project/target/release/mcp_server",
+            "mcp_server --transport stdio",
+            // Windows passes such a path QUOTED (it contains spaces); unquoted, no parser can
+            // tell the directory from the arguments, and we do not pretend otherwise.
+            "\"C:\\Program Files\\Project Orchestrator\\mcp_server.exe\" --stdio",
+        ] {
+            let said = missing_program_message(program);
+            assert!(said.contains("`mcp_server`"), "{program} -> {said}");
+            // It may ENUMERATE the engines that run through it (that is the useful part); what
+            // it must never do is repeat the old sentence, which accused the provider.
+            assert!(
+                !said.starts_with("The provider's command-line tool is not installed"),
+                "the sentence must not blame a provider: {said}"
+            );
+        }
+    }
+
+    /// Un chemin ou des arguments ne doivent jamais atteindre le navigateur : seul le nom reste.
+    #[test]
+    fn the_path_and_the_arguments_never_reach_the_message() {
+        let said = missing_program_message("/secret/path/claude --dangerously-skip");
+        assert!(said.contains("`claude`"), "{said}");
+        assert!(!said.contains("/secret/path"), "{said}");
+        assert!(!said.contains("dangerously"), "{said}");
+    }
+
+    #[test]
+    fn an_unknown_program_keeps_the_generic_sentence() {
+        let said = missing_program_message("opencode --serve");
+        assert!(
+            said.starts_with("The provider's command-line tool is not installed"),
+            "{said}"
+        );
+        assert!(!said.contains("opencode"), "{said}");
+    }
+
+    #[test]
+    fn the_base_name_drops_the_directory_the_arguments_and_the_windows_extension() {
+        assert_eq!(program_base_name("mcp_server"), Some("mcp_server"));
+        assert_eq!(program_base_name("/a/b/mcp_server --x"), Some("mcp_server"));
+        assert_eq!(program_base_name("mcp_server.exe"), Some("mcp_server"));
+        assert_eq!(program_base_name("   "), None);
     }
 }
 
