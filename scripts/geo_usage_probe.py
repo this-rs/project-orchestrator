@@ -30,7 +30,11 @@ import json, glob, os, sys, collections, tempfile
 TRANSCRIPTS = os.environ.get(
     "PO_TRANSCRIPTS",
     os.path.expanduser("~/Library/Application Support/project-orchestrator/chat-neutral-*"))
-R_CACHE_WRITE, R_CACHE_READ, R_OUTPUT = 1.25, 0.10, 5.00   # [S] barème, validé à 0,2 %
+# [S] Barème NON validé. L'ajustement tombe à 0,2 % sur ses propres données : c'est
+# du surapprentissage, pas une preuve. En leave-one-out l'erreur empirique de
+# prédiction est de 12,7 % — une erreur de prédiction ponctuelle, PAS un intervalle
+# de confiance. Préférer toujours les prix DÉCLARÉS par le provider (--prices).
+R_CACHE_WRITE, R_CACHE_READ, R_OUTPUT = 1.25, 0.10, 5.00
 CHARS_PER_TOKEN = 3.6                                       # [S] ordre de grandeur
 SEP = "\n\n---\n\n"                                         # frontière enrichissement PO / texte
 
