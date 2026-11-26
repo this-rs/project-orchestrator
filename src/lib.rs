@@ -147,6 +147,7 @@ pub mod sharing;
 pub mod single_instance;
 pub mod skills;
 pub mod storage;
+pub mod tool_digest;
 pub mod transport;
 pub mod update;
 pub(crate) mod utils;

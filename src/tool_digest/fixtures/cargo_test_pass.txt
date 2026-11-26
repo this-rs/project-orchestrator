@@ -1,0 +1,16 @@
+   Compiling tinycrate v0.1.0 (/private/tmp/geo-fixtures/tinycrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (/tmp/geo-fixtures/target/debug/deps/tinycrate-e1ef980880a66612)
+
+running 2 tests
+test tests::adds_zero ... ok
+test tests::adds_two_numbers ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests tinycrate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

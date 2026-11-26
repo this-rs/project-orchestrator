@@ -125,6 +125,10 @@ diagrams:
       - "backend:src/chat/provider/{transcripts,hooks}.rs"
       - "backend:src/api/team_handlers.rs"
       - "backend:src/chat/activation_registry.rs"
+      # Arbitrage GEO (26/11) : le digest de resultat d'outil est la meme
+      # preoccupation que `spill.rs` (externaliser une sortie d'outil trop
+      # volumineuse) : il appartient au runtime d'agent, pas a un diagramme neuf.
+      - "backend:src/tool_digest/**"
   - name: po-provider-settings
     owner: theotime
     status: verified
