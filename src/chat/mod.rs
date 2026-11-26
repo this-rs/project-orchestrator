@@ -5,7 +5,6 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-pub mod renewal;
 pub mod attachment;
 pub mod attention;
 pub mod cli_auth;
@@ -17,6 +16,7 @@ pub mod content_policy;
 pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
+pub mod renewal;
 
 pub mod activation_registry;
 #[cfg(test)]

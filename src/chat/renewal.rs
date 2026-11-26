@@ -39,7 +39,10 @@ pub enum RenewalRefused {
     /// A write may or may not have landed: the state is unknown.
     UncertainWrite,
     /// The caller asked for an epoch that is not the next one.
-    EpochMismatch { expected: CognitiveEpoch, asked: CognitiveEpoch },
+    EpochMismatch {
+        expected: CognitiveEpoch,
+        asked: CognitiveEpoch,
+    },
 }
 
 impl std::fmt::Display for RenewalRefused {
@@ -138,7 +141,12 @@ pub fn reconstruct(
             .map(|d| format!("decision: {} — {}", d.what, d.why)),
     );
     candidates.extend(checkpoint.evidence.iter().map(|e| format!("evidence: {e}")));
-    candidates.extend(checkpoint.open_hypotheses.iter().map(|h| format!("hypothesis: {h}")));
+    candidates.extend(
+        checkpoint
+            .open_hypotheses
+            .iter()
+            .map(|h| format!("hypothesis: {h}")),
+    );
 
     let mut kept = Vec::new();
     let mut omitted = Vec::new();
@@ -240,14 +248,21 @@ mod tests {
 
         let tight = reconstruct(&c, 20, |s| s.len() / 4);
         assert!(!tight.omitted.is_empty(), "un budget serre doit omettre");
-        assert_eq!(tight.kept.len() + tight.omitted.len(), 5, "rien ne disparait sans etre nomme");
+        assert_eq!(
+            tight.kept.len() + tight.omitted.len(),
+            5,
+            "rien ne disparait sans etre nomme"
+        );
     }
 
     #[test]
     fn the_objective_is_kept_before_anything_else() {
         let c = checkpoint();
         let tight = reconstruct(&c, 12, |s| s.len() / 4);
-        assert_eq!(tight.kept.first().map(String::as_str), Some(c.objective.as_str()));
+        assert_eq!(
+            tight.kept.first().map(String::as_str),
+            Some(c.objective.as_str())
+        );
     }
 
     #[test]
