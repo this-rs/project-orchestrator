@@ -129,6 +129,7 @@ diagrams:
       # preoccupation que `spill.rs` (externaliser une sortie d'outil trop
       # volumineuse) : il appartient au runtime d'agent, pas a un diagramme neuf.
       - "backend:src/tool_digest/**"
+      - "backend:src/validate/**"
   - name: po-provider-settings
     owner: theotime
     status: verified

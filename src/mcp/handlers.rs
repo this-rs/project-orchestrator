@@ -6780,7 +6780,7 @@ impl ToolHandler {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(120_000)
                     .max(1) as u64;
-                let action = crate::validate::Action::from_str(&action)?;
+                let action = crate::validate::Action::parse_action(&action)?;
                 let validator = self.validator.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     validator.run(action, &cwd, &command_args, timeout_ms)
