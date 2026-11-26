@@ -293,11 +293,21 @@ mod tests {
     #[test]
     fn every_refusal_is_named_and_the_ledger_reports_its_emptiness() {
         assert_eq!(
-            RenewalRefused::EpochMismatch { expected: CognitiveEpoch(2), asked: CognitiveEpoch(1) }.to_string(),
+            RenewalRefused::EpochMismatch {
+                expected: CognitiveEpoch(2),
+                asked: CognitiveEpoch(1)
+            }
+            .to_string(),
             "epoch 1 asked while 2 is next"
         );
-        assert_eq!(RenewalRefused::ToolInFlight.to_string(), "a tool call is in flight");
-        assert_eq!(RenewalRefused::UncertainWrite.to_string(), "a write has an unknown outcome");
+        assert_eq!(
+            RenewalRefused::ToolInFlight.to_string(),
+            "a tool call is in flight"
+        );
+        assert_eq!(
+            RenewalRefused::UncertainWrite.to_string(),
+            "a write has an unknown outcome"
+        );
 
         let mut ledger = IdempotencyLedger::default();
         assert!(ledger.is_empty());
