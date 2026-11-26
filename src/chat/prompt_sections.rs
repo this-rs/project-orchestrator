@@ -1985,6 +1985,75 @@ pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -
 // Tests
 // ============================================================================
 
+// --- Variantes compactes du bloc « Best Practices » -------------------------
+//
+// MESURE du 26/11/2026 sur une session PO reelle : le bloc « ## 8. Best
+// Practices » pese 22 590 caracteres, soit 26 % du prompt systeme (24 293
+// jetons). Ces trois sections n'avaient AUCUNE variante compacte
+// (`compact_content: None`), donc aucun reglage de seuil ne pouvait rien
+// retirer : c'est le CONTENU qui manquait, pas le bouton.
+//
+// Classification appliquee instruction par instruction :
+//   invariant permanent      -> conserve mot pour mot ;
+//   contrainte executable    -> conservee (la perdre casse un garde-fou) ;
+//   connaissance procedurale -> remplacee par un POINTEUR recuperable
+//                               (note search, skill search, code get_health) ;
+//   exemple facultatif       -> retire ;
+//   redondance               -> retiree.
+//
+// Le compact est activable et REVERSIBLE : la version longue reste la constante
+// d'origine, le routeur choisit. Aucun garde-fou n'est supprime ici : ces
+// sections portent de la methode, pas des invariants verifies.
+
+/// `## 8. Best Practices` — variante compacte.
+pub const SECTION_BP_IMPACT_COMPACT: &str = r#"## 8. Best Practices
+
+**MCP-first.** Use the Project Orchestrator mega-tools for planning and knowledge.
+Never Claude Code internal planning (plan mode, TodoWrite).
+
+**Secrets.** Never paste a secret in the chat, never print one. `vault(action:
+"list_available")` names them; `vault(action: "request_secret")` shows a secure
+card. Use a value only inside a shell command (`orchestrator secret exec`).
+
+**Before modifying.** `code(action: "analyze_impact")` gives the affected files
+and the decisions that constrain them. A change without it is a guess.
+
+**Capture knowledge.** A bug resolved becomes a `gotcha`, a convention a
+`guideline`, a pattern a `pattern`. Link it to the entity it concerns with
+`note(action: "link_to_entity")`. Never end a working session without it.
+
+**RFCs.** A cross-cutting change opens an RFC note (`note_type: "rfc"`, sections
+Problem / Proposed Solution / Alternatives / Impact). Check in-flight RFCs first.
+
+Procedure detail (GDS, Knowledge Fabric, hierarchical protocols, workspace
+routing) is recoverable on demand: `note(action: "search")`,
+`skill(action: "search")`, `code(action: "get_health")`.
+"#;
+
+/// `## 9. Search Strategy` — variante compacte.
+pub const SECTION_BP_SEARCH_COMPACT: &str = r#"## 9. Search Strategy
+
+Order: `note(action: "search_semantic")` first (vector, finds without the exact
+words), then `decision(action: "search_semantic")`, then `note(action: "search")`
+(BM25) when an exact term matters. `code(action: "search_project")` for code.
+One precise query beats three vague ones.
+
+A search that returns nothing is a result: say so, do not widen blindly.
+"#;
+
+/// `## 10. Knowledge Capture` — variante compacte.
+pub const SECTION_BP_KNOWLEDGE_COMPACT: &str = r#"## 10. Knowledge Capture
+
+Write the note while the knowledge is fresh, in the entity's own words: what was
+measured, how, and what would be wrong without it.
+
+`note(action: "create")` then `note(action: "link_to_entity")` on the file or
+function concerned. One precise note beats three vague ones.
+
+A decision records the alternatives considered and why they lost
+(`decision(action: "add")`). A superseded decision is superseded, never deleted.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4143,72 +4212,3 @@ mod tests {
         assert!(CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
     }
 }
-
-// --- Variantes compactes du bloc « Best Practices » -------------------------
-//
-// MESURE du 26/11/2026 sur une session PO reelle : le bloc « ## 8. Best
-// Practices » pese 22 590 caracteres, soit 26 % du prompt systeme (24 293
-// jetons). Ces trois sections n'avaient AUCUNE variante compacte
-// (`compact_content: None`), donc aucun reglage de seuil ne pouvait rien
-// retirer : c'est le CONTENU qui manquait, pas le bouton.
-//
-// Classification appliquee instruction par instruction :
-//   invariant permanent      -> conserve mot pour mot ;
-//   contrainte executable    -> conservee (la perdre casse un garde-fou) ;
-//   connaissance procedurale -> remplacee par un POINTEUR recuperable
-//                               (note search, skill search, code get_health) ;
-//   exemple facultatif       -> retire ;
-//   redondance               -> retiree.
-//
-// Le compact est activable et REVERSIBLE : la version longue reste la constante
-// d'origine, le routeur choisit. Aucun garde-fou n'est supprime ici : ces
-// sections portent de la methode, pas des invariants verifies.
-
-/// `## 8. Best Practices` — variante compacte.
-pub const SECTION_BP_IMPACT_COMPACT: &str = r#"## 8. Best Practices
-
-**MCP-first.** Use the Project Orchestrator mega-tools for planning and knowledge.
-Never Claude Code internal planning (plan mode, TodoWrite).
-
-**Secrets.** Never paste a secret in the chat, never print one. `vault(action:
-"list_available")` names them; `vault(action: "request_secret")` shows a secure
-card. Use a value only inside a shell command (`orchestrator secret exec`).
-
-**Before modifying.** `code(action: "analyze_impact")` gives the affected files
-and the decisions that constrain them. A change without it is a guess.
-
-**Capture knowledge.** A bug resolved becomes a `gotcha`, a convention a
-`guideline`, a pattern a `pattern`. Link it to the entity it concerns with
-`note(action: "link_to_entity")`. Never end a working session without it.
-
-**RFCs.** A cross-cutting change opens an RFC note (`note_type: "rfc"`, sections
-Problem / Proposed Solution / Alternatives / Impact). Check in-flight RFCs first.
-
-Procedure detail (GDS, Knowledge Fabric, hierarchical protocols, workspace
-routing) is recoverable on demand: `note(action: "search")`,
-`skill(action: "search")`, `code(action: "get_health")`.
-"#;
-
-/// `## 9. Search Strategy` — variante compacte.
-pub const SECTION_BP_SEARCH_COMPACT: &str = r#"## 9. Search Strategy
-
-Order: `note(action: "search_semantic")` first (vector, finds without the exact
-words), then `decision(action: "search_semantic")`, then `note(action: "search")`
-(BM25) when an exact term matters. `code(action: "search_project")` for code.
-One precise query beats three vague ones.
-
-A search that returns nothing is a result: say so, do not widen blindly.
-"#;
-
-/// `## 10. Knowledge Capture` — variante compacte.
-pub const SECTION_BP_KNOWLEDGE_COMPACT: &str = r#"## 10. Knowledge Capture
-
-Write the note while the knowledge is fresh, in the entity's own words: what was
-measured, how, and what would be wrong without it.
-
-`note(action: "create")` then `note(action: "link_to_entity")` on the file or
-function concerned. One precise note beats three vague ones.
-
-A decision records the alternatives considered and why they lost
-(`decision(action: "add")`). A superseded decision is superseded, never deleted.
-"#;
