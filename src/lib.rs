@@ -151,6 +151,7 @@ pub mod tool_digest;
 pub mod transport;
 pub mod update;
 pub(crate) mod utils;
+pub mod validate;
 pub mod vault;
 pub mod yaml;
 

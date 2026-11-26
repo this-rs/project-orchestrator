@@ -38,6 +38,19 @@ impl Ref {
     fn compute(bytes: &[u8]) -> Ref {
         Ref(hex::encode(Sha256::digest(bytes)))
     }
+
+    /// Parse a hex address back into a [`Ref`]. Accepts exactly 64 hex digits
+    /// (case-insensitive), normalized to lowercase. This is how a caller turns
+    /// the address a digest printed into something [`ArtifactStore::read_portion`]
+    /// accepts, without re-running the command that produced it.
+    pub fn from_hex(s: &str) -> Result<Ref, StoreError> {
+        let t = s.trim();
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(Ref(t.to_ascii_lowercase()))
+        } else {
+            Err(StoreError::InvalidRef(s.to_string()))
+        }
+    }
 }
 
 impl std::fmt::Display for Ref {
@@ -58,6 +71,9 @@ pub enum StoreError {
     /// A filesystem error while writing to or reading from the store directory.
     #[error("artifact store I/O error: {0}")]
     Io(String),
+    /// A hex address that does not parse back into a [`Ref`] (not 64 hex chars).
+    #[error("invalid artifact ref '{0}': expected 64 hex characters")]
+    InvalidRef(String),
 }
 
 /// Content-addressed, immutable artifact store rooted at one directory.

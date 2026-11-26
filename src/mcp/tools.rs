@@ -47,6 +47,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         trajectory_tool(),
         lifecycle_hook_tool(),
         mcp_federation_tool(),
+        validate_tool(),
     ]
 }
 
@@ -1637,6 +1638,30 @@ fn mcp_federation_tool() -> ToolDefinition {
     }
 }
 
+fn validate_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "validate".to_string(),
+        description: "Run a bounded validation command and return a short deterministic digest instead of the raw output. The full output is preserved in an immutable artifact addressed by its sha256; the `read` action fetches an exact slice without re-running the command.".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["test", "check", "git_status", "read"],
+                    "description": "Operation to perform"
+                },
+                "cwd": {"type": "string", "description": "Working directory (test/check/git_status). Refused unless authorized."},
+                "command_args": {"type": "array", "items": {"type": "string"}, "description": "Extra arguments appended to the cargo command (test/check), e.g. a test filter"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (test/check/git_status, default 120000)"},
+                "artefact": {"type": "string", "description": "Artifact sha256 ref to read (read)"},
+                "from_line": {"type": "integer", "description": "First line, 0-based inclusive (read, default 0)"},
+                "to_line": {"type": "integer", "description": "Last line, 0-based exclusive (read, default from_line+80)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1648,8 +1673,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            33,
-            "Expected 33 mega-tools, got {}",
+            34,
+            "Expected 34 mega-tools, got {}",
             tools.len()
         );
     }

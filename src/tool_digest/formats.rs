@@ -347,17 +347,16 @@ fn looks_like_git_status_short(lines: &[&str]) -> bool {
         .map(|l| l.trim_end())
         .filter(|l| !l.trim().is_empty())
         .collect();
-    !non_empty.is_empty()
-        && non_empty
-            .iter()
-            .all(|l| is_porcelain_status_line(l.trim_start()))
+    !non_empty.is_empty() && non_empty.iter().all(|l| is_porcelain_status_line(l))
 }
 
 fn parse_git_status_short(text: &str) -> Parsed {
     let mut summary = Vec::new();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for raw in split_lines(text) {
-        let l = raw.trim_start();
+        // Porcelain v1 lines are `XY PATH`: the leading space (an unchanged
+        // index column) is significant and must not be trimmed.
+        let l = raw.trim_end();
         if l.is_empty() || !is_porcelain_status_line(l) {
             continue;
         }
