@@ -1604,6 +1604,7 @@ impl ToolRefGroupId {
                 "vault",
                 "milestone",
                 "day_plan",
+                "validate",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],

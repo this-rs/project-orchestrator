@@ -1455,16 +1455,6 @@ pub struct ToolGroup {
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
-    // ── Validation ──────────────────────────────────────────────────
-    ToolGroup {
-        name: "validation",
-        description: "Run and digest cargo/git commands without flooding the context",
-        keywords: &["validate", "valider", "test", "check", "build", "git status", "compile", "digest"],
-        tools: &[ToolRef {
-            name: "validate",
-            description: "Run cargo test / cargo check / git status and return a bounded digest with a content-addressed artifact (test/check/git_status/read)",
-        }],
-    },
     // ── Project ─────────────────────────────────────────────────────
     ToolGroup {
         name: "project_management",
@@ -1792,6 +1782,17 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
         ],
     },
+    // ── Validation ──────────────────────────────────────────────────
+    ToolGroup {
+        name: "validation",
+        description: "Run and digest cargo/git commands without flooding the context",
+        keywords: &["validate", "valider", "test", "check", "build", "git status", "compile", "digest"],
+        tools: &[ToolRef {
+            name: "validate",
+            description: "Run cargo test / cargo check / git status and return a bounded digest with a content-addressed artifact (test/check/git_status/read)",
+        }],
+    },
+
 ];
 
 /// Total number of unique tools across all groups.
@@ -3109,7 +3110,7 @@ mod tests {
     fn test_tool_groups_cover_all_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 33,
+            count, 34,
             "TOOL_GROUPS must cover exactly 34 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
