@@ -123,22 +123,36 @@ pub struct Reconstructed {
 
 /// Rebuilds a working context from a checkpoint under a token budget.
 ///
-/// Order is by decreasing necessity: objective, then constraints, then
-/// decisions, then evidence, then open hypotheses. Nothing is dropped without
-/// being listed in [`Reconstructed::omitted`].
+/// The **objective** and the **constraints** are mandatory: they are always
+/// kept, whatever the budget, because a fresh session that no longer knows
+/// what it is working toward nor under which rules it runs has lost the logical
+/// session itself. The budget governs only the optional memory — decisions,
+/// pending operations, evidence, open hypotheses — ordered by decreasing
+/// necessity. Nothing optional is dropped without being listed in
+/// [`Reconstructed::omitted`]; the mandatory items are never listed there.
 pub fn reconstruct(
     checkpoint: &CognitiveCheckpoint,
     budget_tokens: usize,
     cost_of: impl Fn(&str) -> usize,
 ) -> Reconstructed {
+    // Mandatory context: never gated by the budget, never omitted.
+    let mut kept: Vec<String> = Vec::new();
+    kept.push(checkpoint.objective.clone());
+    kept.extend(checkpoint.constraints.iter().cloned());
+
+    // Optional context, gated by the budget and named when dropped.
     let mut candidates: Vec<String> = Vec::new();
-    candidates.push(checkpoint.objective.clone());
-    candidates.extend(checkpoint.constraints.iter().cloned());
     candidates.extend(
         checkpoint
             .decisions
             .iter()
             .map(|d| format!("decision: {} — {}", d.what, d.why)),
+    );
+    candidates.extend(
+        checkpoint
+            .pending_operations
+            .iter()
+            .map(|op| format!("pending: {op}")),
     );
     candidates.extend(checkpoint.evidence.iter().map(|e| format!("evidence: {e}")));
     candidates.extend(
@@ -148,7 +162,6 @@ pub fn reconstruct(
             .map(|h| format!("hypothesis: {h}")),
     );
 
-    let mut kept = Vec::new();
     let mut omitted = Vec::new();
     let mut used = 0usize;
     for item in candidates {
@@ -176,23 +189,63 @@ pub struct RenewalAudit {
     pub omitted_items: usize,
 }
 
-/// Operations already performed, so a fresh session does not redo them.
+/// Operations the session has started, so a resumed session neither redoes a
+/// finished one nor replays one whose outcome is unknown.
 ///
 /// Keys are caller-chosen and stable (for example `commit:<sha>` or
-/// `deploy:<env>:<version>`); the ledger is the memory that makes a resumed
-/// turn idempotent.
+/// `deploy:<env>:<version>`). Three states:
+/// - **done**: the operation finished and its result is recorded;
+/// - **uncertain**: it started but the outcome is unknown (the write may or may
+///   not have landed) — it must be *reconciled*, never automatically replayed;
+/// - anything else: never started.
+///
+/// A ledger that only remembers `done` is not enough: an external operation can
+/// succeed before its state is persisted, and a naive "redo everything not
+/// done" would then execute it twice. The uncertain set makes that window
+/// explicit and forces a reconciliation before resuming.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyLedger {
     done: std::collections::BTreeSet<String>,
+    uncertain: std::collections::BTreeSet<String>,
 }
 
 impl IdempotencyLedger {
+    /// Record a finished operation.
     pub fn record(&mut self, key: impl Into<String>) {
-        self.done.insert(key.into());
+        let key = key.into();
+        self.done.insert(key.clone());
+        self.uncertain.remove(&key);
+    }
+
+    /// Record that an operation started but its outcome is unknown.
+    pub fn mark_uncertain(&mut self, key: impl Into<String>) {
+        let key = key.into();
+        if !self.done.contains(&key) {
+            self.uncertain.insert(key);
+        }
+    }
+
+    /// Reconcile an uncertain operation: it either did land (`succeeded`) and
+    /// moves to done, or did not, and is removed so it may be retried.
+    pub fn reconcile(&mut self, key: &str, succeeded: bool) {
+        self.uncertain.remove(key);
+        if succeeded {
+            self.done.insert(key.to_string());
+        }
     }
 
     pub fn already_done(&self, key: &str) -> bool {
         self.done.contains(key)
+    }
+
+    pub fn is_uncertain(&self, key: &str) -> bool {
+        self.uncertain.contains(key)
+    }
+
+    /// Operations whose outcome is unknown and must be reconciled before a
+    /// resumed session may treat them as not-done.
+    pub fn uncertain_keys(&self) -> Vec<&str> {
+        self.uncertain.iter().map(String::as_str).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -200,7 +253,7 @@ impl IdempotencyLedger {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.done.is_empty()
+        self.done.is_empty() && self.uncertain.is_empty()
     }
 }
 
@@ -313,5 +366,62 @@ mod tests {
         assert!(ledger.is_empty());
         ledger.record("x");
         assert!(!ledger.is_empty());
+    }
+
+    #[test]
+    fn the_objective_and_constraints_survive_any_budget() {
+        let c = checkpoint();
+        let r = reconstruct(&c, 0, |s| s.len() / 4);
+        assert!(r.kept.iter().any(|k| k == &c.objective), "objectif omis");
+        assert!(
+            r.kept.iter().any(|k| k == &c.constraints[0]),
+            "contrainte omise"
+        );
+        assert!(
+            !r.omitted
+                .iter()
+                .any(|k| k == &c.objective || k == &c.constraints[0]),
+            "un item obligatoire figure dans les omis"
+        );
+    }
+
+    #[test]
+    fn pending_operations_are_carried_and_named() {
+        let mut c = checkpoint();
+        c.pending_operations = vec!["deploy:prod:1".into()];
+        let r = reconstruct(&c, 10_000, |s| s.len() / 4);
+        assert!(r.kept.iter().any(|k| k == "pending: deploy:prod:1"));
+    }
+
+    #[test]
+    fn an_uncertain_operation_is_reconciled_not_replayed() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("deploy:prod:1");
+        assert!(ledger.is_uncertain("deploy:prod:1"));
+        assert!(!ledger.already_done("deploy:prod:1"));
+        assert_eq!(ledger.uncertain_keys(), vec!["deploy:prod:1"]);
+
+        ledger.reconcile("deploy:prod:1", true);
+        assert!(ledger.already_done("deploy:prod:1"));
+        assert!(!ledger.is_uncertain("deploy:prod:1"));
+        assert!(ledger.uncertain_keys().is_empty());
+    }
+
+    #[test]
+    fn a_failed_uncertain_operation_can_be_retried() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("write:file:x");
+        ledger.reconcile("write:file:x", false);
+        assert!(!ledger.already_done("write:file:x"));
+        assert!(!ledger.is_uncertain("write:file:x"));
+    }
+
+    #[test]
+    fn recording_clears_the_uncertain_state() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("commit:abc");
+        ledger.record("commit:abc");
+        assert!(ledger.already_done("commit:abc"));
+        assert!(!ledger.is_uncertain("commit:abc"));
     }
 }
