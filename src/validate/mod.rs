@@ -52,7 +52,7 @@ impl Action {
     }
 
     /// Parse a published action name.
-    pub fn from_str(s: &str) -> Result<Action, ValidateError> {
+    pub fn parse_action(s: &str) -> Result<Action, ValidateError> {
         match s {
             "test" => Ok(Action::Test),
             "check" => Ok(Action::Check),
