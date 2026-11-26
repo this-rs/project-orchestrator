@@ -16,6 +16,7 @@ pub mod content_policy;
 pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
+pub mod renewal;
 
 pub mod activation_registry;
 #[cfg(test)]
