@@ -844,6 +844,16 @@ Manage the provider instances: the harness/engine a chat session runs on.
 
 `allow_trust` (a machine that runs without asking) and a pinned `host_key` need a person's agreement: on a session that does not run in trust they answer `provider_trust_needs_a_human` / `provider_host_key_needs_a_human` — ask the user, in Settings → Providers.
 
+## validate
+Run a command, keep the full output in a content-addressed artifact, return a bounded digest.
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| test | — | Run `cargo test`, return a digest |
+| check | — | Run `cargo check`, return a digest |
+| git_status | — | Run `git status --short`, return a digest |
+| read | `artefact` (req), `from_line`, `to_line` | Read an exact slice of an artifact without re-running |
+
 ## vault
 Use the user's secrets vault without ever seeing a value.
 
@@ -1445,6 +1455,16 @@ pub struct ToolGroup {
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
+    // ── Validation ──────────────────────────────────────────────────
+    ToolGroup {
+        name: "validation",
+        description: "Run and digest cargo/git commands without flooding the context",
+        keywords: &["validate", "valider", "test", "check", "build", "git status", "compile", "digest"],
+        tools: &[ToolRef {
+            name: "validate",
+            description: "Run cargo test / cargo check / git status and return a bounded digest with a content-addressed artifact (test/check/git_status/read)",
+        }],
+    },
     // ── Project ─────────────────────────────────────────────────────
     ToolGroup {
         name: "project_management",
@@ -3090,7 +3110,7 @@ mod tests {
         let count = tool_catalog_tool_count();
         assert_eq!(
             count, 33,
-            "TOOL_GROUPS must cover exactly 33 unique mega-tools (got {}). \
+            "TOOL_GROUPS must cover exactly 34 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3160,7 +3180,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 17, "Expected 17 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 18, "Expected 18 tool groups");
     }
 
     #[test]
