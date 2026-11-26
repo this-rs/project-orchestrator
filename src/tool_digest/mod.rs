@@ -188,6 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn git_status_short_porcelain_counts_modified_and_untracked() {
+        // Porcelain v1: a leading space is the unchanged index column (X), `M`
+        // the modified working-tree column (Y) — it must not be trimmed.
+        let d = digest_str(" M tracked.txt\n?? new.txt\n");
+        assert_eq!(d.kind, Kind::Git);
+        assert_eq!(d.counts["modified"], 1);
+        assert_eq!(d.counts["untracked"], 1);
+        assert_eq!(d.summary, vec![" M tracked.txt", "?? new.txt"]);
+    }
+
+    #[test]
     fn git_status_counts_each_change() {
         let d = digest_str(include_str!("fixtures/git_status.txt"));
         assert_eq!(d.kind, Kind::Git);
