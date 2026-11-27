@@ -15,7 +15,7 @@
 //! prevented. The caller owns the transaction.
 
 use anyhow::Result;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 
 use crate::neo4j::traits::GraphStore;
 
