@@ -605,4 +605,67 @@ mod tests {
             "a sink that drops the replay_complete frame aborts catch-up"
         );
     }
+
+    async fn set_streaming(manager: &ChatManager, sid: &str, text: &str, push_event: bool) {
+        let sessions = manager.active_sessions.read().await;
+        let session = sessions.get(sid).expect("session live");
+        session
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *session.streaming_text.lock().await = text.to_string();
+        if push_event {
+            session
+                .streaming_events
+                .lock()
+                .await
+                .push(ChatEvent::StreamDelta {
+                    text: "d".to_string(),
+                    parent_tool_use_id: None,
+                    turn_id: None,
+                    offset: None,
+                });
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_aborts_on_the_first_streaming_event() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        set_streaming(&manager, &sid, "", true).await;
+
+        let mut sink = DisconnectSink;
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn catch_up_aborts_on_partial_text() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        set_streaming(&manager, &sid, "partial", false).await;
+
+        let mut sink = DisconnectSink;
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn catch_up_aborts_on_streaming_status() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        set_streaming(&manager, &sid, "partial", true).await;
+
+        let mut sink = DisconnectAfter(2); // event + partial_text pass, status fails
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(result.is_err());
+    }
 }
