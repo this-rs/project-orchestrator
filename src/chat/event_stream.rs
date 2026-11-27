@@ -499,4 +499,30 @@ mod tests {
             "replay_complete is still sent"
         );
     }
+
+    /// A session absent from the active map but reachable cross-instance falls
+    /// back to the NATS subscription (no local broadcast → NATS chat events).
+    #[tokio::test]
+    async fn catch_up_falls_back_to_nats_for_a_remote_session() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let broker = TestBroker::start().await;
+        let nats = NatsEmitter::new(broker.client().await, "events");
+
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+
+        let mut sink = VecSink(Vec::new());
+        let caught = catch_up(&manager, Some(&nats), &sid, 0, &mut sink)
+            .await
+            .expect("catch_up succeeds");
+        assert!(caught.event_rx.is_none(), "dormant: no local broadcast");
+        assert!(
+            caught.nats_chat_sub.is_some(),
+            "falls back to a NATS subscription"
+        );
+    }
 }
