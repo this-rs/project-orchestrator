@@ -706,4 +706,21 @@ mod tests {
             Ok((other, _)) => panic!("expected the resume path, got {other:?}"),
         }
     }
+
+    /// A team message injected into an active session reaches its turn spawn
+    /// (inject_team_message mints a turn id for the spawned response).
+    #[tokio::test]
+    async fn inject_team_message_reaches_an_active_session() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let to = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &to).await;
+        let from = Uuid::new_v4();
+
+        manager
+            .inject_team_message(from, "alice", &to, "hello")
+            .await
+            .expect("the team message is delivered");
+    }
 }

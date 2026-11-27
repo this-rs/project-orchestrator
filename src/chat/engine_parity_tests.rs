@@ -6281,11 +6281,18 @@ async fn the_legacy_engine_holds_a_queued_message_through_nats() {
         .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
         .session_id;
 
+    // A turn id is carried so the held message reuses it (held.id = turn_id).
+    let held = stage
+        .other
+        .request_send_message(
+            &sid,
+            "after",
+            "queued_user_message",
+            Some(uuid::Uuid::new_v4()),
+        )
+        .await;
     assert!(
-        stage
-            .rpc(&sid, "after", "queued_user_message")
-            .await
-            .unwrap_or(false),
+        held.map(|r| r.success).unwrap_or(false),
         "a remote queued message is held on the streaming legacy session"
     );
     stage.other.publish_interrupt(&sid);
