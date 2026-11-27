@@ -159,7 +159,7 @@ pub async fn create_session(
                 .await
                 .map_err(AppError::Internal)?;
         } else if chat_manager
-            .try_remote_send(&sid, &request.message, "user_message")
+            .try_remote_send(&sid, &request.message, "user_message", None)
             .await
             .unwrap_or(false)
         {
@@ -1378,7 +1378,9 @@ pub async fn send_session_message(
         .route_user_message(&sid, &content, claims.as_ref())
         .await
     {
-        Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
+        Ok((route, turn_id)) => Ok(Json(
+            serde_json::json!({ "routed": route, "turn_id": turn_id }),
+        )),
         Err(MessageDeliveryError::Resume(e)) => Err(mirror_or_internal(e)),
         Err(MessageDeliveryError::SendAndResume { resume, .. }) => Err(mirror_or_internal(resume)),
         Err(MessageDeliveryError::MirrorReadOnly) => Err(AppError::Provider(Box::new(

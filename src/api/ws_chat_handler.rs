@@ -441,7 +441,7 @@ async fn handle_ws_chat_loop(
 
                                     // A message proxied to a remote instance: make sure we
                                     // have a NATS subscription to receive the stream.
-                                    if matches!(result, Ok(DeliveryRoute::Remote)) && nats_chat_sub.is_none() {
+                                    if matches!(result, Ok((DeliveryRoute::Remote, _))) && nats_chat_sub.is_none() {
                                         if let Some(ref nats) = state.nats_emitter {
                                             if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
                                                 debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
@@ -451,7 +451,7 @@ async fn handle_ws_chat_loop(
                                     }
 
                                     match result {
-                                        Ok(DeliveryRoute::ResumedAfterSendFailure) => {
+                                        Ok((DeliveryRoute::ResumedAfterSendFailure, _)) => {
                                             // Resume succeeded — subscribe to the new broadcast channel
                                             // (the old one is dead since the CLI was replaced)
                                             match chat_manager.subscribe(&session_id).await {
@@ -468,7 +468,7 @@ async fn handle_ws_chat_loop(
                                                 }
                                             }
                                         }
-                                        Ok(_) => {
+                                        Ok((_, _)) => {
                                             // If we did a local send/resume and don't have broadcast, subscribe now
                                             if event_rx.is_none() {
                                                 match chat_manager.subscribe(&session_id).await {
@@ -658,7 +658,7 @@ async fn handle_ws_chat_loop(
                                     let send_result = if chat_manager.is_session_active(&session_id).await {
                                         chat_manager.send_message(&session_id, &content).await
                                     } else if chat_manager
-                                        .try_remote_send(&session_id, &content, "input_response")
+                                        .try_remote_send(&session_id, &content, "input_response", None)
                                         .await
                                         .unwrap_or(false)
                                     {

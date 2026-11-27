@@ -7023,7 +7023,7 @@ mod parity {
         let mut answered = None;
         for _ in 0..20 {
             answered = other
-                .request_send_message(&r.sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .request_send_message(&r.sid, r#"{"enabled":false}"#, "set_auto_continue", None)
                 .await;
             if answered.is_some() {
                 break;
@@ -7072,7 +7072,7 @@ mod parity {
         let mut answered = None;
         for _ in 0..5 {
             answered = other
-                .request_send_message(&r.sid, "from afar", "user_message")
+                .request_send_message(&r.sid, "from afar", "user_message", None)
                 .await;
             if answered.is_some() {
                 break;
@@ -7104,7 +7104,7 @@ mod parity {
 
         // A message held from there waits here.
         let held = other
-            .request_send_message(&r.sid, "after", "queued_user_message")
+            .request_send_message(&r.sid, "after", "queued_user_message", None)
             .await
             .unwrap();
         assert!(held.success, "{:?}", held.error);
@@ -8048,7 +8048,7 @@ mod legacy_nats_permission {
         let mut listening = false;
         for _ in 0..20 {
             if other
-                .request_send_message(&sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .request_send_message(&sid, r#"{"enabled":false}"#, "set_auto_continue", None)
                 .await
                 .is_some()
             {

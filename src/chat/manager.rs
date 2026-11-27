@@ -5704,7 +5704,11 @@ impl ChatManager {
                             // through to the ordinary send below.
                             let mut queue = pending_messages.lock().await;
                             if is_streaming.load(Ordering::SeqCst) {
-                                queue.push_back(PendingMessage::held_user(message.clone()));
+                                let mut held = PendingMessage::held_user(message.clone());
+                                if let Some(tid) = request.turn_id {
+                                    held.id = tid;
+                                }
+                                queue.push_back(held);
                                 let event = ChatEvent::PendingQueue {
                                     messages: super::pending_queue::snapshot(&queue),
                                 };
@@ -5765,9 +5769,9 @@ impl ChatManager {
                                         .await;
                                 }
 
-                                // Persist user_message event
+                                // Persist user_message event, stamped with the origin's turn id.
                                 let user_event = crate::neo4j::models::ChatEventRecord {
-                                    id: Uuid::new_v4(),
+                                    id: request.turn_id.unwrap_or_else(Uuid::new_v4),
                                     session_id: uuid,
                                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
                                     event_type: "user_message".to_string(),
@@ -11260,6 +11264,7 @@ impl ChatManager {
         session_id: &str,
         message: &str,
         message_type: &str,
+        turn_id: Option<Uuid>,
     ) -> Result<bool> {
         #[cfg(test)]
         remote_send_hook::wait(session_id).await;
@@ -11277,7 +11282,7 @@ impl ChatManager {
         );
 
         match nats
-            .request_send_message(session_id, message, message_type)
+            .request_send_message(session_id, message, message_type, turn_id)
             .await
         {
             Some(response) if response.success => {
@@ -11305,8 +11310,23 @@ impl ChatManager {
         }
     }
 
-    /// Send a follow-up message to an existing session
+    /// Send a follow-up message to an existing session.
+    ///
+    /// Mints a fresh turn id. Callers that already hold a stable turn id use
+    /// [`Self::send_message_with_turn_id`].
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
+        self.send_message_with_turn_id(session_id, message, Uuid::new_v4())
+            .await
+    }
+
+    /// [`Self::send_message`] with the turn id the caller minted: that id is the one
+    /// persisted on the `user_message` event, so a client can correlate and resume on it.
+    pub async fn send_message_with_turn_id(
+        &self,
+        session_id: &str,
+        message: &str,
+        turn_id: Uuid,
+    ) -> Result<()> {
         // Mode `full`: the turn may belong to another provider. A move sends the message
         // to the new session, so this one starts no turn.
         if self.move_provider_before_turn(session_id, message).await {
@@ -11439,10 +11459,10 @@ impl ChatManager {
             }
         }
 
-        // Persist the user_message event
+        // Persist the user_message event, stamped with the caller's turn id.
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             let user_event = ChatEventRecord {
-                id: Uuid::new_v4(),
+                id: turn_id,
                 session_id: uuid,
                 seq: next_seq.fetch_add(1, Ordering::SeqCst),
                 event_type: "user_message".to_string(),
@@ -11696,6 +11716,7 @@ impl ChatManager {
                     from,
                     &mut opened_on,
                     Some(&team),
+                    Uuid::new_v4(),
                 )
                 .await
                 .map_err(|e| {
@@ -11827,6 +11848,18 @@ impl ChatManager {
     /// Returns `true` when the message was held, `false` when the session was
     /// idle and the message was simply sent.
     pub async fn queue_user_message(&self, session_id: &str, message: &str) -> Result<bool> {
+        self.queue_user_message_with_turn_id(session_id, message, Uuid::new_v4())
+            .await
+    }
+
+    /// [`Self::queue_user_message`] with the turn id the caller minted: reused as
+    /// `PendingMessage.id`, the id persisted when the held message is drained.
+    pub async fn queue_user_message_with_turn_id(
+        &self,
+        session_id: &str,
+        message: &str,
+        turn_id: Uuid,
+    ) -> Result<bool> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return handle.queue_message(message).await;
         }
@@ -11844,7 +11877,11 @@ impl ChatManager {
             // that has already finished.
             let mut queue = session.pending_messages.lock().await;
             if session.is_streaming.load(Ordering::SeqCst) {
-                queue.push_back(PendingMessage::held_user(message.to_string()));
+                // Reuse PendingMessage.id as the turn id: the returned id is the one
+                // later persisted when the held message is drained.
+                let mut held = PendingMessage::held_user(message.to_string());
+                held.id = turn_id;
+                queue.push_back(held);
                 let messages = super::pending_queue::snapshot(&queue);
                 drop(queue);
                 info!(
@@ -11855,7 +11892,8 @@ impl ChatManager {
                 return Ok(true);
             }
         }
-        self.send_message(session_id, message).await?;
+        self.send_message_with_turn_id(session_id, message, turn_id)
+            .await?;
         Ok(false)
     }
 
@@ -11938,7 +11976,8 @@ impl ChatManager {
         }
         // Not here: the session may run on another instance.
         let payload = serde_json::to_string(op)?;
-        self.try_remote_send(session_id, &payload, "queue_op").await
+        self.try_remote_send(session_id, &payload, "queue_op", None)
+            .await
     }
 
     /// `route_user_message` for a message that must WAIT for the running turn:
@@ -11951,15 +11990,22 @@ impl ChatManager {
         session_id: &str,
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
-    ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+    ) -> std::result::Result<(DeliveryRoute, Uuid), MessageDeliveryError> {
+        // Same stable id across the queued, remote and resume routes (see
+        // `route_user_message`): `queue_user_message` reuses it as
+        // `PendingMessage.id`, the id persisted when the held message is drained.
+        let turn_id = Uuid::new_v4();
         if self.refuse_if_mirror(session_id).await.is_err() {
             return Err(MessageDeliveryError::MirrorReadOnly);
         }
         // Read before anything awaits: see `resume_point`.
         let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
-            match self.queue_user_message(session_id, content).await {
-                Ok(_) => return Ok(DeliveryRoute::Local),
+            match self
+                .queue_user_message_with_turn_id(session_id, content, turn_id)
+                .await
+            {
+                Ok(_) => return Ok((DeliveryRoute::Local, turn_id)),
                 Err(send_err) => {
                     warn!(
                         session_id = %session_id,
@@ -11967,10 +12013,12 @@ impl ChatManager {
                         "queue_user_message failed, attempting resume_session as fallback"
                     );
                     return match self
-                        .resume_session_from(session_id, content, claims, from)
+                        .resume_session_from_with_turn_id(
+                            session_id, content, claims, from, turn_id,
+                        )
                         .await
                     {
-                        Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
+                        Ok(()) => Ok((DeliveryRoute::ResumedAfterSendFailure, turn_id)),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
                             resume,
@@ -11980,15 +12028,15 @@ impl ChatManager {
             }
         }
         if self
-            .try_remote_send(session_id, content, "queued_user_message")
+            .try_remote_send(session_id, content, "queued_user_message", Some(turn_id))
             .await
             .unwrap_or(false)
         {
-            return Ok(DeliveryRoute::Remote);
+            return Ok((DeliveryRoute::Remote, turn_id));
         }
-        self.resume_session_from(session_id, content, claims, from)
+        self.resume_session_from_with_turn_id(session_id, content, claims, from, turn_id)
             .await
-            .map(|()| DeliveryRoute::Resumed)
+            .map(|()| (DeliveryRoute::Resumed, turn_id))
             .map_err(MessageDeliveryError::Resume)
     }
 
@@ -12424,7 +12472,7 @@ impl ChatManager {
             return Err(PermissionDeliveryError::SessionDead(session_id.to_string()));
         };
         match nats
-            .request_send_message(session_id, &payload, "control_response")
+            .request_send_message(session_id, &payload, "control_response", None)
             .await
         {
             Some(answer) if answer.success => Ok(DeliveryRoute::Remote),
@@ -12528,7 +12576,11 @@ impl ChatManager {
         session_id: &str,
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
-    ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+    ) -> std::result::Result<(DeliveryRoute, Uuid), MessageDeliveryError> {
+        // One turn = one stable id, minted here and persisted with the
+        // `user_message` event whichever route delivers it. A retry of the same
+        // send reuses the id the caller holds: it never mints a second turn.
+        let turn_id = Uuid::new_v4();
         // A read-only mirror of a Claude Code sub-agent takes no message (P18c).
         if self.refuse_if_mirror(session_id).await.is_err() {
             return Err(MessageDeliveryError::MirrorReadOnly);
@@ -12540,8 +12592,11 @@ impl ChatManager {
         // Read before anything awaits: see `resume_point`.
         let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
-            match self.send_message(session_id, content).await {
-                Ok(()) => return Ok(DeliveryRoute::Local),
+            match self
+                .send_message_with_turn_id(session_id, content, turn_id)
+                .await
+            {
+                Ok(()) => return Ok((DeliveryRoute::Local, turn_id)),
                 Err(send_err) => {
                     warn!(
                         session_id = %session_id,
@@ -12549,10 +12604,12 @@ impl ChatManager {
                         "send_message failed, attempting resume_session as fallback"
                     );
                     return match self
-                        .resume_session_from(session_id, content, claims, from)
+                        .resume_session_from_with_turn_id(
+                            session_id, content, claims, from, turn_id,
+                        )
                         .await
                     {
-                        Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
+                        Ok(()) => Ok((DeliveryRoute::ResumedAfterSendFailure, turn_id)),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
                             resume,
@@ -12562,15 +12619,15 @@ impl ChatManager {
             }
         }
         if self
-            .try_remote_send(session_id, content, "user_message")
+            .try_remote_send(session_id, content, "user_message", Some(turn_id))
             .await
             .unwrap_or(false)
         {
-            return Ok(DeliveryRoute::Remote);
+            return Ok((DeliveryRoute::Remote, turn_id));
         }
-        self.resume_session_from(session_id, content, claims, from)
+        self.resume_session_from_with_turn_id(session_id, content, claims, from, turn_id)
             .await
-            .map(|()| DeliveryRoute::Resumed)
+            .map(|()| (DeliveryRoute::Resumed, turn_id))
             .map_err(MessageDeliveryError::Resume)
     }
 
@@ -13600,9 +13657,36 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         from: ResumeFrom,
     ) -> Result<()> {
+        self.resume_session_from_with_turn_id(
+            session_id,
+            message,
+            user_claims,
+            from,
+            Uuid::new_v4(),
+        )
+        .await
+    }
+
+    /// [`Self::resume_session_from`] with the turn id the caller minted.
+    pub async fn resume_session_from_with_turn_id(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        from: ResumeFrom,
+        turn_id: Uuid,
+    ) -> Result<()> {
         let mut opened_on: Option<String> = None;
         let result = self
-            .resume_session_on(session_id, message, user_claims, from, &mut opened_on, None)
+            .resume_session_on(
+                session_id,
+                message,
+                user_claims,
+                from,
+                &mut opened_on,
+                None,
+                turn_id,
+            )
             .await;
         // A failure once the session is read names ITS provider (B6).
         result.map_err(|e| match opened_on {
@@ -13613,6 +13697,7 @@ impl ChatManager {
 
     /// [`Self::resume_session_from`]; `opened_on` receives the session's provider as soon
     /// as the session is read.
+    #[allow(clippy::too_many_arguments)]
     async fn resume_session_on(
         &self,
         session_id: &str,
@@ -13621,6 +13706,7 @@ impl ChatManager {
         from: ResumeFrom,
         opened_on: &mut Option<String>,
         team: Option<&TeamInbound>,
+        turn_id: Uuid,
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
         let seen = from.0;
@@ -13666,8 +13752,16 @@ impl ChatManager {
                 .await;
         }
 
-        self.reopen_legacy_session_for(&session_node, message, user_claims, None, true, team)
-            .await
+        self.reopen_legacy_session_for(
+            &session_node,
+            message,
+            user_claims,
+            None,
+            true,
+            team,
+            turn_id,
+        )
+        .await
     }
 
     /// Reopens a session on the legacy Claude Code CLI (the historical engine): spawns the
@@ -13681,7 +13775,7 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<()> {
-        self.reopen_legacy_session_with(node, message, user_claims, relay, true)
+        self.reopen_legacy_session_with(node, message, user_claims, relay, true, Uuid::new_v4())
             .await
     }
 
@@ -13695,13 +13789,23 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         relay: Option<&super::relay::RelayedFrom>,
         fresh_if_refused: bool,
+        turn_id: Uuid,
     ) -> Result<()> {
-        self.reopen_legacy_session_for(node, message, user_claims, relay, fresh_if_refused, None)
-            .await
+        self.reopen_legacy_session_for(
+            node,
+            message,
+            user_claims,
+            relay,
+            fresh_if_refused,
+            None,
+            turn_id,
+        )
+        .await
     }
 
     /// [`Self::reopen_legacy_session_with`]; `team` makes the stored and broadcast inbound
     /// event the peer's typed `team_message` instead of a user message.
+    #[allow(clippy::too_many_arguments)]
     async fn reopen_legacy_session_for(
         &self,
         node: &ChatSessionNode,
@@ -13710,6 +13814,7 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         fresh_if_refused: bool,
         team: Option<&TeamInbound>,
+        turn_id: Uuid,
     ) -> Result<()> {
         let sid = node.id.to_string();
         let session_id: &str = sid.as_str();
@@ -14209,7 +14314,7 @@ impl ChatManager {
         // The inbound event: a person's message, or a peer's (typed, with its sender).
         let (inbound, inbound_type) = inbound_event(message, team);
         let user_event = ChatEventRecord {
-            id: Uuid::new_v4(),
+            id: turn_id,
             session_id: uuid,
             seq: next_seq.fetch_add(1, Ordering::SeqCst),
             event_type: inbound_type.to_string(),
@@ -30427,7 +30532,7 @@ mod tests {
                 first
             },);
         resumed_first.unwrap();
-        assert_eq!(routed.unwrap(), DeliveryRoute::Resumed);
+        assert_eq!(routed.unwrap().0, DeliveryRoute::Resumed);
         let resumed = fake.state.opened_specs.lock().unwrap().clone();
         assert_eq!(resumed.len(), 1, "the session is resumed once");
         assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
@@ -35323,7 +35428,7 @@ mod tests {
         // No NATS configured → should return false (fallback needed)
         assert!(manager.nats.is_none());
         let result = manager
-            .try_remote_send("any-session-id", "hello", "user_message")
+            .try_remote_send("any-session-id", "hello", "user_message", None)
             .await;
         assert!(result.is_ok());
         assert!(!result.unwrap(), "Should return false without NATS");
@@ -35337,7 +35442,7 @@ mod tests {
 
         for msg_type in &["user_message", "permission_response", "input_response"] {
             let result = manager
-                .try_remote_send("session-123", "test", msg_type)
+                .try_remote_send("session-123", "test", msg_type, None)
                 .await
                 .unwrap();
             assert!(!result, "Should return false for {} without NATS", msg_type);
@@ -35507,7 +35612,7 @@ mod tests {
 
         // try_remote_send without NATS → false
         let remote = manager
-            .try_remote_send("some-session", "hello", "user_message")
+            .try_remote_send("some-session", "hello", "user_message", None)
             .await
             .unwrap();
         assert!(!remote);

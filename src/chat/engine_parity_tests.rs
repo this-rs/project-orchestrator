@@ -1415,7 +1415,11 @@ impl Stage {
     async fn rpc(&self, sid: &str, message: &str, kind: &str) -> Option<bool> {
         let attempts = if kind == "control_response" { 1 } else { 10 };
         for _ in 0..attempts {
-            if let Some(answer) = self.other.request_send_message(sid, message, kind).await {
+            if let Some(answer) = self
+                .other
+                .request_send_message(sid, message, kind, None)
+                .await
+            {
                 return Some(answer.success);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
