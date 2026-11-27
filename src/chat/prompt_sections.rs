@@ -155,6 +155,20 @@ impl ActivationCondition {
         }
     }
 
+    /// Section is always included, with a compact variant used for levels in
+    /// [compact_min, compact_max].
+    pub const fn always_with_compact(compact_min: u8, compact_max: u8) -> Self {
+        Self {
+            scaffolding_min: None,
+            scaffolding_max: None,
+            requires_active_plan: false,
+            requires_active_protocol: false,
+            min_task_count: None,
+            always: true,
+            compact_scaffolding_range: Some((compact_min, compact_max)),
+        }
+    }
+
     /// Section is included for scaffolding levels in [min, max] (inclusive).
     pub const fn scaffolding_range(min: u8, max: u8) -> Self {
         Self {
@@ -1184,21 +1198,21 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             id: PromptSectionId::BestPracticesImpact,
             content: SECTION_BP_IMPACT,
             priority: 8,
-            condition: ActivationCondition::always(),
+            condition: ActivationCondition::always_with_compact(1, 4),
             compact_content: Some(SECTION_BP_IMPACT_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesSearch,
             content: SECTION_BP_SEARCH,
             priority: 9,
-            condition: ActivationCondition::scaffolding_range(0, 3),
+            condition: ActivationCondition::scaffolding_range_with_compact(0, 3, 1, 3),
             compact_content: Some(SECTION_BP_SEARCH_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesKnowledge,
             content: SECTION_BP_KNOWLEDGE,
             priority: 10,
-            condition: ActivationCondition::always(),
+            condition: ActivationCondition::always_with_compact(1, 4),
             compact_content: Some(SECTION_BP_KNOWLEDGE_COMPACT),
         },
         BasePromptSection {
@@ -4048,6 +4062,33 @@ mod tests {
         assert_eq!(
             personas.content, SECTION_BP_PERSONAS_COMPACT,
             "L1 should use compact BestPracticesPersonas content"
+        );
+
+        let impact = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesImpact)
+            .expect("BestPracticesImpact should be present at L1");
+        assert_eq!(
+            impact.content, SECTION_BP_IMPACT_COMPACT,
+            "L1 should use compact BestPracticesImpact content"
+        );
+
+        let search = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesSearch)
+            .expect("BestPracticesSearch should be present at L1");
+        assert_eq!(
+            search.content, SECTION_BP_SEARCH_COMPACT,
+            "L1 should use compact BestPracticesSearch content"
+        );
+
+        let knowledge = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesKnowledge)
+            .expect("BestPracticesKnowledge should be present at L1");
+        assert_eq!(
+            knowledge.content, SECTION_BP_KNOWLEDGE_COMPACT,
+            "L1 should use compact BestPracticesKnowledge content"
         );
     }
 
