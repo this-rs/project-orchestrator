@@ -198,16 +198,17 @@ pub struct RenewalOutcome {
 pub async fn renew(
     store: &RenewalStore<'_>,
     id: &LogicalSessionId,
-    current: &CognitiveCheckpoint,
-    ledger: &IdempotencyLedger,
+    current: &RenewalState,
     budget_tokens: usize,
     cost_of: impl Fn(&str) -> usize,
     tool_in_flight: bool,
     uncertain_write: bool,
 ) -> Result<RenewalOutcome> {
     safe_point(tool_in_flight, uncertain_write).map_err(|e| anyhow!("renewal refused: {e}"))?;
-    let from_epoch = current.epoch;
-    let next = current.next_version(CognitiveEpoch(from_epoch.0 + 1));
+    let from_epoch = current.checkpoint.epoch;
+    let next = current
+        .checkpoint
+        .next_version(CognitiveEpoch(from_epoch.0 + 1));
     // Validate the reconstruction BEFORE publishing: a reconstruction that does
     // not fit the budget must not leave a new epoch behind.
     let reconstructed = reconstruct(&next, budget_tokens, cost_of)
@@ -217,7 +218,7 @@ pub async fn renew(
             id,
             &RenewalState {
                 checkpoint: next.clone(),
-                ledger: ledger.clone(),
+                ledger: current.ledger.clone(),
             },
         )
         .await?;
@@ -438,12 +439,11 @@ mod tests {
     async fn a_renewal_persists_then_reconstructs() {
         let graph = MockGraphStore::new();
         let store = RenewalStore::new(&graph);
-        let current = checkpoint(3, 2, "reduce context cost");
+        let current = state(3, 2, "reduce context cost");
         let out = renew(
             &store,
             &id(),
             &current,
-            &IdempotencyLedger::default(),
             10_000,
             |s| s.len() / 4,
             false,
@@ -458,7 +458,7 @@ mod tests {
             .reconstructed
             .kept
             .iter()
-            .any(|k| k == &current.objective));
+            .any(|k| k == &current.checkpoint.objective));
         let loaded = store.load_state(&id()).await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint.version, 4);
         assert_eq!(loaded.checkpoint.epoch, CognitiveEpoch(3));
@@ -471,8 +471,7 @@ mod tests {
         let err = renew(
             &store,
             &id(),
-            &checkpoint(1, 1, "o"),
-            &IdempotencyLedger::default(),
+            &state(1, 1, "o"),
             100,
             |s| s.len() / 4,
             true,
@@ -492,8 +491,7 @@ mod tests {
         let err = renew(
             &store,
             &id(),
-            &checkpoint(1, 1, "o"),
-            &IdempotencyLedger::default(),
+            &state(1, 1, "o"),
             100,
             |s| s.len() / 4,
             false,
@@ -509,20 +507,11 @@ mod tests {
     async fn a_reconstruction_failure_persists_nothing() {
         let graph = MockGraphStore::new();
         let store = RenewalStore::new(&graph);
-        let current = checkpoint(1, 1, "reduce context cost");
+        let current = state(1, 1, "reduce context cost");
         // budget far too small for the mandatory objective -> reconstruction fails
-        let err = renew(
-            &store,
-            &id(),
-            &current,
-            &IdempotencyLedger::default(),
-            1,
-            |_| 100,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let err = renew(&store, &id(), &current, 1, |_| 100, false, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("reconstruction"), "{}", err);
         // no new epoch left behind: the store is untouched
         assert!(store.load_state(&id()).await.unwrap().is_none());
