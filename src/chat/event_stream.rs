@@ -278,3 +278,186 @@ pub(crate) async fn catch_up<S: FrameSink>(
         snapshot_fingerprints,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::manager::test_support;
+    use crate::chat::manager::DeliveryRoute;
+    use crate::test_helpers::mock_app_state;
+    use uuid::Uuid;
+
+    struct VecSink(Vec<Value>);
+    #[async_trait::async_trait]
+    impl FrameSink for VecSink {
+        async fn send_frame(&mut self, frame: Value) -> bool {
+            self.0.push(frame);
+            true
+        }
+    }
+
+    struct DisconnectSink;
+    #[async_trait::async_trait]
+    impl FrameSink for DisconnectSink {
+        async fn send_frame(&mut self, _frame: Value) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn replayed_frame_wraps_a_malformed_payload_instead_of_dropping_it() {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            seq: 7,
+            event_type: "user_message".to_string(),
+            data: "not-json".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let frame = replayed_frame(&record).expect("a malformed record still yields a frame");
+        assert_eq!(frame["data"], "not-json");
+        assert_eq!(frame["seq"], 7);
+        assert_eq!(frame["replaying"], true);
+    }
+
+    #[tokio::test]
+    async fn catch_up_subscribes_locally_and_sends_replay_complete() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &sid).await;
+
+        let mut sink = VecSink(Vec::new());
+        let caught = catch_up(&manager, None, &sid, 0, &mut sink)
+            .await
+            .expect("catch_up succeeds");
+        assert!(
+            caught.event_rx.is_some(),
+            "a local session subscribes to the broadcast"
+        );
+        assert!(
+            sink.0
+                .iter()
+                .any(|f| f.get("type").and_then(|t| t.as_str()) == Some("replay_complete")),
+            "replay_complete is always sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_aborts_when_the_sink_gives_up() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &sid).await;
+
+        let mut sink = DisconnectSink;
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(result.is_err(), "a sink that returns false aborts catch-up");
+    }
+
+    /// The id returned by `route_user_message` is the id persisted on the
+    /// `user_message` event (the correlation the awaitable send relies on).
+    #[tokio::test]
+    async fn route_user_message_returns_the_persisted_turn_id() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+
+        let (route, turn_id) = manager
+            .route_user_message(&sid, "hello", None)
+            .await
+            .expect("route succeeds");
+        assert!(matches!(route, DeliveryRoute::Local));
+
+        let events = manager
+            .get_events_since(&sid, 0)
+            .await
+            .expect("events are readable");
+        let user_msg = events
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .expect("the user_message is persisted");
+        assert_eq!(
+            user_msg.id, turn_id,
+            "turn_id must equal the persisted user_message id"
+        );
+    }
+
+    /// A streaming session rehydrates its accumulated text as a partial_text
+    /// snapshot and announces streaming_status (the mid-turn join path).
+    #[tokio::test]
+    async fn catch_up_sends_the_streaming_snapshot() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+
+        {
+            let sessions = manager.active_sessions.read().await;
+            let session = sessions.get(&sid).expect("session live");
+            session
+                .is_streaming
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *session.streaming_text.lock().await = "partial".to_string();
+        }
+
+        let mut sink = VecSink(Vec::new());
+        let _caught = catch_up(&manager, None, &sid, 0, &mut sink)
+            .await
+            .expect("catch_up succeeds");
+        assert!(
+            sink.0
+                .iter()
+                .any(|f| f.get("type").and_then(|t| t.as_str()) == Some("partial_text")),
+            "the accumulated text is sent as partial_text"
+        );
+        assert!(
+            sink.0
+                .iter()
+                .any(|f| f.get("type").and_then(|t| t.as_str()) == Some("streaming_status")),
+            "streaming_status is sent"
+        );
+    }
+
+    /// A message queued while streaming reuses the PendingMessage.id as its
+    /// turn id: the returned id is the one later persisted when drained.
+    #[tokio::test]
+    async fn route_queued_user_message_reuses_pending_message_id() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+
+        {
+            let sessions = manager.active_sessions.read().await;
+            let session = sessions.get(&sid).expect("session live");
+            session
+                .is_streaming
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let (route, turn_id) = manager
+            .route_queued_user_message(&sid, "later", None)
+            .await
+            .expect("queue succeeds");
+        assert!(matches!(route, DeliveryRoute::Local));
+
+        let sessions = manager.active_sessions.read().await;
+        let session = sessions.get(&sid).expect("session live");
+        let queue = session.pending_messages.lock().await;
+        let held = queue
+            .iter()
+            .find(|m| matches!(m.kind, crate::chat::types::PendingMessageKind::User))
+            .expect("the message is held while streaming");
+        assert_eq!(
+            held.id, turn_id,
+            "PendingMessage.id must equal the returned turn_id"
+        );
+    }
+}
