@@ -310,7 +310,7 @@ pub async fn list_messages(
                 map.insert("seq".to_string(), serde_json::json!(e.seq));
                 map.insert(
                     "created_at".to_string(),
-                    serde_json::json!(super::ws_chat_handler::wire_seconds(e.created_at)),
+                    serde_json::json!(crate::chat::event_stream::wire_seconds(e.created_at)),
                 );
             }
             obj

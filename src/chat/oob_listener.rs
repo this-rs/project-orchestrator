@@ -1697,7 +1697,7 @@ mod tests {
         })
         .await
         .expect("a tool_timing between turns");
-        let sent = crate::api::ws_chat_handler::wire_seconds(sent_at);
+        let sent = crate::chat::event_stream::wire_seconds(sent_at);
         assert!(
             ended_at < sent + 0.2,
             "the end is when the result arrived ({ended_at}), not after the persistence (sent {sent})"

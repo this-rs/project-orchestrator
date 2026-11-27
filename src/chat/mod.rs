@@ -41,6 +41,7 @@ pub mod envelope;
 /// T9: offline transverse evaluation (labeled fixtures, three arms, leak gate).
 #[cfg(test)]
 mod eval_transverse;
+pub mod event_stream;
 pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod lasting_rules;

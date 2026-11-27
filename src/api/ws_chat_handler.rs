@@ -213,6 +213,24 @@ async fn handle_ws_chat_preauthed(
     handle_ws_chat_loop(socket, state, session_id, last_event, claims, beat).await;
 }
 
+/// Adapts the WebSocket's bounded sink to the shared [`FrameSink`] trait, so
+/// the catch-up core in `chat::event_stream` is written once for every
+/// transport.
+struct WsFrameSink<'a, S>(&'a mut super::ws_liveness::BoundedSink<S>);
+
+#[async_trait::async_trait]
+impl<S> crate::chat::event_stream::FrameSink for WsFrameSink<'_, S>
+where
+    S: futures::Sink<Message, Error = axum::Error> + Unpin + Send,
+{
+    async fn send_frame(&mut self, frame: serde_json::Value) -> bool {
+        self.0
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .is_ok()
+    }
+}
+
 /// Main chat event loop for an authenticated WebSocket connection.
 async fn handle_ws_chat_loop(
     socket: WebSocket,
@@ -224,8 +242,6 @@ async fn handle_ws_chat_loop(
 ) {
     let (ws_sender_raw, mut ws_receiver) = socket.split();
     let mut ws_sender = super::ws_liveness::BoundedSink::new(ws_sender_raw);
-
-    let loop_start = tokio::time::Instant::now();
 
     info!(
         session_id = %session_id,
@@ -252,323 +268,35 @@ async fn handle_ws_chat_loop(
     };
 
     // ========================================================================
-    // Phase 1: Replay persisted events since last_event
+    // Catch-up: replay persisted events, subscribe before the streaming
+    // snapshot, then send snapshot + pending queue + replay_complete.
+    // The shared core lives in `chat::event_stream` (RFC cdd8c6ee) so no
+    // transport duplicates the replay/subscribe/dedup sequence.
     // ========================================================================
-    // OPTIMIZATION: Skip the Neo4j query entirely when last_event is very large
-    // (e.g. Number.MAX_SAFE_INTEGER from the frontend). This means the client
-    // doesn't want any historical replay — it will load history via REST and
-    // only needs the live streaming snapshot (Phase 1.5). Skipping saves one
-    // Neo4j round-trip (~50-200ms) that would always return 0 events anyway.
-    const SKIP_REPLAY_THRESHOLD: i64 = 1_000_000_000_000;
-
-    if last_event < SKIP_REPLAY_THRESHOLD {
-        let events = chat_manager
-            .get_events_since(&session_id, last_event)
-            .await
-            .unwrap_or_default();
-
-        // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
-        // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
-        // Kept for future use if NATS events get seq headers.
-        let mut _max_replayed_seq: i64 = last_event;
-
-        if !events.is_empty() {
-            // New format: replay ChatEventRecord from Neo4j
-            debug!(
-                session_id = %session_id,
-                count = events.len(),
-                "Replaying persisted ChatEventRecord"
-            );
-            for event in events {
-                // Track highest seq for diagnostics / future dedup watermark
-                if event.seq > _max_replayed_seq {
-                    _max_replayed_seq = event.seq;
-                }
-
-                // Normalize to flat format matching Phase 1.5 / live events.
-                // ChatEventRecord.data is a serde-serialized ChatEvent which already
-                // contains the "type" tag. We parse it, inject seq + replaying +
-                // created_at, and send it flat — so the frontend always receives the
-                // same JSON shape regardless of whether the event comes from replay,
-                // snapshot, or live.
-                // A `tool_result_spill` record holds the full text of a spilled
-                // tool result, server-side only: it is never replayed as a client
-                // frame (which would be typeless and leak the full text).
-                if let Some(msg) = replayed_frame(&event) {
-                    if ws_sender
-                        .send(Message::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        debug!("Client disconnected during replay");
-                        return;
-                    }
-                }
-            }
-        } else if last_event == 0 {
-            // Fallback: Load from Nexus SDK for pre-migration sessions
-            debug!(
-                session_id = %session_id,
-                "No ChatEventRecord found, falling back to Nexus message history"
-            );
-            match chat_manager
-                .get_session_messages(&session_id, None, None)
-                .await
-            {
-                Ok(loaded) => {
-                    debug!(
-                        session_id = %session_id,
-                        count = loaded.events.len(),
-                        "Replaying message history (fallback)"
-                    );
-                    for event in &loaded.events {
-                        if let Some(msg) = replayed_frame(event) {
-                            if ws_sender
-                                .send(Message::Text(msg.to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                debug!("Client disconnected during fallback replay");
-                                return;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "Failed to load message history for replay"
-                    );
-                }
-            }
-        }
-    } else {
-        debug!(
-            session_id = %session_id,
+    let mut event_rx;
+    let mut nats_chat_sub;
+    let mut snapshot_fingerprints;
+    {
+        let mut sink = WsFrameSink(&mut ws_sender);
+        match crate::chat::event_stream::catch_up(
+            chat_manager,
+            state.nats_emitter.as_deref(),
+            &session_id,
             last_event,
-            "Skipping Phase 1 replay (last_event >= threshold, client loads history via REST)"
-        );
-    }
-
-    debug!(
-        session_id = %session_id,
-        elapsed_ms = loop_start.elapsed().as_millis() as u64,
-        "⏱ Phase 1 completed"
-    );
-
-    // ========================================================================
-    // Phase 1.5a: Subscribe to broadcast + NATS BEFORE taking snapshot
-    // ========================================================================
-    // IMPORTANT: We subscribe BEFORE taking the streaming snapshot to avoid a
-    // race condition. If we took the snapshot first and subscribed later, any
-    // stream_delta tokens emitted between snapshot and subscribe would be lost
-    // (the client would see a gap in the streamed text).
-    //
-    // By subscribing first, the broadcast::Receiver starts buffering events
-    // immediately. The snapshot (Phase 1.5b) captures text accumulated before
-    // the subscribe. Events emitted after subscribe are queued in the receiver.
-    // Together they provide gap-free coverage.
-    let mut event_rx = match chat_manager.subscribe(&session_id).await {
-        Ok(rx) => Some(rx),
-        Err(_) => {
-            debug!(
-                session_id = %session_id,
-                "Session not active, no broadcast subscription yet — client can send messages to activate"
-            );
-            None
-        }
-    };
-
-    // Subscribe to NATS chat events for cross-instance delivery (if NATS configured).
-    // IMPORTANT: Only subscribe to NATS if there is NO local broadcast subscription.
-    // When this instance owns the session (event_rx is Some), the ChatManager already
-    // pushes events to the local broadcast channel — subscribing to NATS too would
-    // cause every event to be received twice (local + NATS round-trip), producing
-    // duplicated/interleaved text in the frontend.
-    // NATS is only needed for remote instances that don't have the local broadcast.
-    let mut nats_chat_sub: Option<crate::events::Subscriber> = if event_rx.is_some() {
-        debug!(
-            session_id = %session_id,
-            "Local broadcast active — skipping NATS chat subscription (same instance)"
-        );
-        None
-    } else if let Some(ref nats) = state.nats_emitter {
-        match nats.subscribe_chat_events(&session_id).await {
-            Ok(sub) => {
-                debug!(session_id = %session_id, "Subscribed to NATS chat events (remote instance)");
-                Some(sub)
+            &mut sink,
+        )
+        .await
+        {
+            Ok(caught_up) => {
+                event_rx = caught_up.event_rx;
+                nats_chat_sub = caught_up.nats_chat_sub;
+                snapshot_fingerprints = caught_up.snapshot_fingerprints;
             }
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // ========================================================================
-    // Phase 1.5b: Send streaming snapshot if a stream is in progress
-    // ========================================================================
-    // Taken AFTER subscribe (Phase 1.5a) so no events are lost between
-    // snapshot and subscription. The receiver buffers live events while we
-    // send the snapshot to the client.
-    let (mut is_currently_streaming, mut partial_text, mut streaming_events) =
-        chat_manager.get_streaming_snapshot(&session_id).await;
-
-    // If local snapshot is empty, try remote snapshot via NATS request/reply.
-    // This handles the cross-instance case where another server owns the streaming session.
-    if !is_currently_streaming {
-        if let Some(ref nats) = state.nats_emitter {
-            if let Some(snapshot) = nats.request_streaming_snapshot(&session_id).await {
-                is_currently_streaming = snapshot.is_streaming;
-                partial_text = snapshot.partial_text;
-                streaming_events = snapshot.events;
-            }
-        }
-    }
-
-    info!(
-        session_id = %session_id,
-        is_currently_streaming,
-        partial_text_len = partial_text.len(),
-        streaming_events_count = streaming_events.len(),
-        elapsed_ms = loop_start.elapsed().as_millis() as u64,
-        "⏱ Phase 1.5b: streaming snapshot"
-    );
-
-    if is_currently_streaming {
-        // Send accumulated structured events (tool_use, tool_result, assistant_text, etc.)
-        // These are the non-StreamDelta events that occurred during the current stream.
-        if !streaming_events.is_empty() {
-            debug!(
-                session_id = %session_id,
-                count = streaming_events.len(),
-                "Sending streaming_events snapshot for mid-stream join"
-            );
-            for event in &streaming_events {
-                match serde_json::to_value(event) {
-                    Ok(mut val) => {
-                        if let Some(obj) = val.as_object_mut() {
-                            obj.insert("seq".to_string(), serde_json::json!(0));
-                            obj.insert("replaying".to_string(), serde_json::json!(true));
-                        }
-                        if ws_sender
-                            .send(Message::Text(val.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            debug!("Client disconnected during streaming_events replay");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to serialize streaming event: {}", e);
-                    }
-                }
-            }
-        }
-
-        // Send accumulated stream_delta text as a single partial_text snapshot
-        if !partial_text.is_empty() {
-            debug!(
-                session_id = %session_id,
-                text_len = partial_text.len(),
-                "Sending partial_text snapshot for mid-stream join"
-            );
-            let partial_msg = serde_json::json!({
-                "type": "partial_text",
-                "content": partial_text,
-                "seq": 0,
-                "replaying": true,
-            });
-            if ws_sender
-                .send(Message::Text(partial_msg.to_string().into()))
-                .await
-                .is_err()
-            {
-                debug!("Client disconnected during partial_text");
+            Err(_) => {
+                debug!("Client disconnected during replay");
                 return;
             }
         }
-
-        // Notify client that streaming is in progress (for interrupt button)
-        let status_msg = serde_json::json!({
-            "type": "streaming_status",
-            "is_streaming": true,
-        });
-        if ws_sender
-            .send(Message::Text(status_msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            debug!("Client disconnected during streaming_status");
-            return;
-        }
-    }
-
-    // The messages held for this session, so a client that opens (or comes
-    // back to) the conversation sees what is waiting. Sent even when empty:
-    // the client may still show a list from its previous visit.
-    // A session running on another instance is asked to publish its list —
-    // it arrives through the NATS subscription like any other event.
-    let held = match chat_manager.pending_queue_snapshot(&session_id).await {
-        Some(messages) => Some(messages),
-        None => {
-            let reached = chat_manager
-                .pending_queue_op(&session_id, &crate::chat::pending_queue::QueueOp::Snapshot)
-                .await
-                .unwrap_or(false);
-            // Nobody holds the session: nothing can be waiting.
-            (!reached).then(Vec::new)
-        }
-    };
-    if let Some(messages) = held {
-        let queue_msg = serde_json::json!({ "type": "pending_queue", "messages": messages });
-        if ws_sender
-            .send(Message::Text(queue_msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            debug!("Client disconnected during pending_queue");
-            return;
-        }
-    }
-
-    // Fingerprint-based dedup: when we sent a streaming snapshot (Phase 1.5b),
-    // events emitted in the tiny window BETWEEN subscribe (Phase 1.5a) and
-    // snapshot (Phase 1.5b) may be present in BOTH the snapshot AND the
-    // broadcast receiver. We dedup by fingerprint (type+id or type+hash).
-    //
-    // IMPORTANT: Most snapshot events were emitted BEFORE the subscribe and
-    // are NOT in the broadcast receiver at all. Only the micro-window events
-    // need dedup. Using a counter (previous approach) was wrong because it
-    // assumed ALL snapshot events would arrive via the receiver, causing
-    // genuinely new events (tool_use, tool_result, etc.) to be silently dropped.
-    let mut snapshot_fingerprints: HashSet<String> = if is_currently_streaming {
-        streaming_events
-            .iter()
-            .filter_map(|e| e.fingerprint())
-            .collect()
-    } else {
-        HashSet::new()
-    };
-
-    // Send replay_complete marker
-    debug!(
-        session_id = %session_id,
-        elapsed_ms = loop_start.elapsed().as_millis() as u64,
-        "⏱ Snapshot sent, sending replay_complete"
-    );
-    let replay_complete = serde_json::json!({ "type": "replay_complete" });
-    if ws_sender
-        .send(Message::Text(replay_complete.to_string().into()))
-        .await
-        .is_err()
-    {
-        debug!("Client disconnected after replay");
-        return;
     }
 
     // The session's auto-continue state. Auto-continue is always on (decision 7b95342a)
@@ -616,7 +344,7 @@ async fn handle_ws_chat_loop(
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
             // Serialize (stamped with the forwarding time) and send
-            match live_frame(&$event, chrono::Utc::now()) {
+            match crate::chat::event_stream::live_frame(&$event, chrono::Utc::now()) {
                 Ok(val) => {
                     if $ws
                         .send(Message::Text(val.to_string().into()))
@@ -1233,58 +961,6 @@ async fn handle_ws_chat_loop(
     info!(session_id = %session_id, "Chat WebSocket connection closed");
 }
 
-/// A server time on the chat wire: seconds since the epoch, with the
-/// milliseconds as the fraction (`1760099999.123`). The REST history and every
-/// WebSocket chat event frame carry `created_at` in this unit.
-pub(crate) fn wire_seconds(at: chrono::DateTime<chrono::Utc>) -> f64 {
-    at.timestamp_millis() as f64 / 1000.0
-}
-
-/// A persisted event as a replay frame: its payload, flat, plus `seq`,
-/// `replaying` and `created_at` (the time it was stored). `None` for a record
-/// that must never reach the client: the `tool_result_spill` record carries the
-/// full text of a spilled tool result, which stays server-side only.
-fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> Option<serde_json::Value> {
-    if record.event_type == crate::chat::spill::SPILL_EVENT_TYPE {
-        return None;
-    }
-    let created_at = serde_json::json!(wire_seconds(record.created_at));
-    let frame = match serde_json::from_str::<serde_json::Value>(&record.data) {
-        Ok(serde_json::Value::Object(mut obj)) => {
-            obj.insert("seq".to_string(), serde_json::json!(record.seq));
-            obj.insert("replaying".to_string(), serde_json::json!(true));
-            obj.insert("created_at".to_string(), created_at);
-            serde_json::Value::Object(obj)
-        }
-        // Malformed record: wrap the raw payload in a data field.
-        _ => serde_json::json!({
-            "seq": record.seq,
-            "type": record.event_type,
-            "data": serde_json::Value::String(record.data.clone()),
-            "replaying": true,
-            "created_at": created_at,
-        }),
-    };
-    Some(frame)
-}
-
-/// A live event (local broadcast or relayed over NATS) as a frame: its payload
-/// plus `seq: 0` and `created_at`, the time this server forwards it.
-fn live_frame(
-    event: &crate::chat::types::ChatEvent,
-    now: chrono::DateTime<chrono::Utc>,
-) -> serde_json::Result<serde_json::Value> {
-    let mut val = serde_json::to_value(event)?;
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert("seq".to_string(), serde_json::json!(0));
-        obj.insert(
-            "created_at".to_string(),
-            serde_json::json!(wire_seconds(now)),
-        );
-    }
-    Ok(val)
-}
-
 /// Rate-limiter for neural reinforcement via chat.
 /// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
 /// to avoid runaway energy inflation during rapid conversations.
@@ -1877,7 +1553,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         assert!(
-            replayed_frame(&record).is_none(),
+            crate::chat::event_stream::replayed_frame(&record).is_none(),
             "the spill record must not become a client frame"
         );
     }
