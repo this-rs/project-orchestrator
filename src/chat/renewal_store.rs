@@ -19,7 +19,7 @@
 //!   error, never an empty or initial value.
 
 use anyhow::{anyhow, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::neo4j::traits::GraphStore;
@@ -44,26 +44,15 @@ fn version_key_prefix(id: &str) -> String {
     format!("{id}:v")
 }
 
-fn parse_version(key: &str, id: &str) -> Option<u32> {
-    key.strip_prefix(&version_key_prefix(id))?
-        .split(':')
-        .next()?
-        .parse()
-        .ok()
+fn parse_key(key: &str, id: &str) -> Option<(u32, String)> {
+    let rest = key.strip_prefix(&version_key_prefix(id))?;
+    let (version, hash) = rest.split_once(':')?;
+    Some((version.parse().ok()?, hash.to_string()))
 }
 
 fn content_hash(json: &str) -> String {
     let digest = Sha256::digest(json.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn decode<T: DeserializeOwned>(raw: Option<String>) -> Result<Option<T>> {
-    match raw {
-        None => Ok(None),
-        Some(s) => serde_json::from_str(&s)
-            .map(Some)
-            .map_err(|e| anyhow!("renewal state corrupt: {e}")),
-    }
 }
 
 /// A thin, keyed view of the renewal state of ONE logical session.
@@ -90,9 +79,15 @@ impl<'a> RenewalStore<'a> {
 
     /// The most recent state, or `None` when nothing was ever published.
     ///
-    /// Fails closed: a record that no longer deserialises, or two records that
-    /// claim the same highest version (a concurrent double-write), are both an
-    /// error — never an empty or guessed state.
+    /// Fails closed on every incoherence, never with a `panic` or an empty
+    /// replacement:
+    /// - a key that does not parse (`{id}:v{version}:{hash}`) is an error;
+    /// - two records at the same highest version (a concurrent double-write)
+    ///   are an error;
+    /// - a record whose content no longer matches its key's fingerprint is an
+    ///   error (rewritten in place);
+    /// - a record that fails to deserialise, or whose checkpoint version
+    ///   disagrees with its key, is an error.
     pub async fn load_state(&self, id: &LogicalSessionId) -> Result<Option<RenewalState>> {
         let rows = self
             .graph
@@ -101,14 +96,21 @@ impl<'a> RenewalStore<'a> {
         if rows.is_empty() {
             return Ok(None);
         }
-        let max_version = rows
+        let mut parsed: Vec<(String, u32, String, String)> = Vec::with_capacity(rows.len());
+        for (key, json) in rows {
+            match parse_key(&key, &id.0) {
+                Some((version, hash)) => parsed.push((key, version, hash, json)),
+                None => return Err(anyhow!("renewal key malformed for {}: {key}", id.0)),
+            }
+        }
+        let max_version = parsed
             .iter()
-            .filter_map(|(k, _)| parse_version(k, &id.0))
+            .map(|(_, v, _, _)| *v)
             .max()
-            .expect("non-empty rows must parse to a version");
-        let at_max: Vec<(String, String)> = rows
-            .into_iter()
-            .filter(|(k, _)| parse_version(k, &id.0) == Some(max_version))
+            .ok_or_else(|| anyhow!("renewal state for {} has no version", id.0))?;
+        let at_max: Vec<&(String, u32, String, String)> = parsed
+            .iter()
+            .filter(|(_, v, _, _)| *v == max_version)
             .collect();
         if at_max.len() > 1 {
             return Err(anyhow!(
@@ -118,8 +120,22 @@ impl<'a> RenewalStore<'a> {
                 id.0
             ));
         }
-        let (_, json) = at_max.into_iter().next().expect("exactly one record");
-        decode(Some(json))
+        let (key, _, key_hash, json) = at_max[0];
+        let actual = content_hash(json);
+        if !actual.starts_with(key_hash) {
+            return Err(anyhow!(
+                "renewal record tampered for {key}: content hash mismatch"
+            ));
+        }
+        let state: RenewalState = serde_json::from_str(json)
+            .map_err(|e| anyhow!("renewal state corrupt at {key}: {e}"))?;
+        if state.checkpoint.version != max_version {
+            return Err(anyhow!(
+                "renewal key/checkpoint version mismatch for {key}: key v{max_version}, checkpoint v{}",
+                state.checkpoint.version
+            ));
+        }
+        Ok(Some(state))
     }
 
     /// Every version published for this logical session, ascending (audit).
@@ -128,10 +144,13 @@ impl<'a> RenewalStore<'a> {
             .graph
             .list_llm_settings(SCOPE, &version_key_prefix(&id.0))
             .await?;
-        let mut versions: Vec<u32> = rows
-            .iter()
-            .filter_map(|(k, _)| parse_version(k, &id.0))
-            .collect();
+        let mut versions: Vec<u32> = Vec::with_capacity(rows.len());
+        for (key, _) in rows {
+            match parse_key(&key, &id.0) {
+                Some((version, _)) => versions.push(version),
+                None => return Err(anyhow!("renewal key malformed for {}: {key}", id.0)),
+            }
+        }
         versions.sort_unstable();
         versions.dedup();
         Ok(versions)
@@ -210,7 +229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_same_version_writes_are_detected_not_overwritten() {
+    async fn two_successive_same_version_writes_are_detected() {
         let graph = MockGraphStore::new();
         let store = RenewalStore::new(&graph);
         store
@@ -237,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_state_survives_a_restart() {
+    async fn a_state_reloads_on_a_fresh_adapter_over_the_same_graph() {
         let graph = MockGraphStore::new();
         let st = state(3, 2, "objective");
         RenewalStore::new(&graph)
@@ -270,5 +289,53 @@ mod tests {
                 .version,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn a_record_rewritten_with_different_valid_json_fails_closed() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        store
+            .put_state(&id(), &state(1, 1, "original"))
+            .await
+            .unwrap();
+        let rows = graph
+            .list_llm_settings(SCOPE, &version_key_prefix(&id().0))
+            .await
+            .unwrap();
+        let (key, _) = rows.into_iter().next().unwrap();
+        let tampered = serde_json::to_string(&state(1, 1, "tampered")).unwrap();
+        graph.put_llm_setting(SCOPE, &key, &tampered).await.unwrap();
+        let err = store.load_state(&id()).await.unwrap_err();
+        assert!(err.to_string().contains("hash"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_ledger_fails_closed() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        // current format without the `uncertain` field -> must NOT deserialise
+        // to an empty ledger.
+        let json = serde_json::json!({
+            "checkpoint": checkpoint(1, 1, "o"),
+            "ledger": { "done": ["commit:a"] }
+        })
+        .to_string();
+        let key = format!("{}:v1:{}", id().0, &content_hash(&json)[..16]);
+        graph.put_llm_setting(SCOPE, &key, &json).await.unwrap();
+        let err = store.load_state(&id()).await.unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_key_checkpoint_version_mismatch_fails_closed() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let st = state(1, 1, "o"); // checkpoint.version == 1
+        let json = serde_json::to_string(&st).unwrap();
+        let key = format!("{}:v2:{}", id().0, &content_hash(&json)[..16]);
+        graph.put_llm_setting(SCOPE, &key, &json).await.unwrap();
+        let err = store.load_state(&id()).await.unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{}", err);
     }
 }
