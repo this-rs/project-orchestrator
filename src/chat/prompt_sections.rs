@@ -346,6 +346,8 @@ You MUST **NOT** use Claude Code internal features for project management:
 When asked to "plan", create an **MCP Plan** with Tasks and Steps.
 When asked to "track progress", update **statuses via MCP tools**.
 
+**Tool output:** for `cargo test`, `cargo check`/`build` and `git status`, prefer the `validate` MCP tool over `Bash` — it returns a bounded digest instead of replaying raw output into the context; the full output is kept in a content-addressed store.
+
 **Secrets (passwords, API keys, tokens) — through the vault only:**
 - Never ask the user to paste a secret in the chat, and never print one (no `echo`, `cat`, `env`, `printenv` on it).
 - Need one? `vault(action: "list_available")` shows names and whether you may read them. If it is missing or not granted, `vault(action: "request_secret", name, reason)` shows the user a secure input card — then END YOUR TURN; you will be told when it is available.
