@@ -261,7 +261,9 @@ pub enum ReconcileOutcome {
 /// explicit and forces a reconciliation before resuming.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyLedger {
+    #[serde(default)]
     done: std::collections::BTreeSet<String>,
+    #[serde(default)]
     uncertain: std::collections::BTreeSet<String>,
 }
 
