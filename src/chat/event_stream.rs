@@ -304,6 +304,19 @@ mod tests {
         }
     }
 
+    /// Returns true for the first `n` frames, then false (disconnect).
+    struct DisconnectAfter(usize);
+    #[async_trait::async_trait]
+    impl FrameSink for DisconnectAfter {
+        async fn send_frame(&mut self, _frame: Value) -> bool {
+            if self.0 == 0 {
+                return false;
+            }
+            self.0 -= 1;
+            true
+        }
+    }
+
     #[test]
     fn replayed_frame_wraps_a_malformed_payload_instead_of_dropping_it() {
         let record = ChatEventRecord {
@@ -523,6 +536,73 @@ mod tests {
         assert!(
             caught.nats_chat_sub.is_some(),
             "falls back to a NATS subscription"
+        );
+    }
+
+    /// A message queued on an idle (non-streaming) session is sent immediately,
+    /// reusing the same turn id through send_message_with_turn_id.
+    #[tokio::test]
+    async fn route_queued_user_message_sends_immediately_when_idle() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+
+        let (route, turn_id) = manager
+            .route_queued_user_message(&sid, "now", None)
+            .await
+            .expect("queue succeeds");
+        assert!(matches!(route, DeliveryRoute::Local));
+
+        let events = manager
+            .get_events_since(&sid, 0)
+            .await
+            .expect("events readable");
+        let user_msg = events
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .expect("the user_message is persisted");
+        assert_eq!(
+            user_msg.id, turn_id,
+            "the id is persisted even on the direct-send path"
+        );
+    }
+
+    /// A session with persisted events replays them before anything else: a sink
+    /// that drops the first frame aborts during the replay phase.
+    #[tokio::test]
+    async fn catch_up_aborts_during_replay_when_the_sink_gives_up() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        let _ = manager.route_user_message(&sid, "hi", None).await;
+
+        let mut sink = DisconnectSink;
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(
+            result.is_err(),
+            "a sink that drops the first replayed frame aborts catch-up"
+        );
+    }
+
+    /// After the pending-queue frame, a sink that drops the next frame aborts at
+    /// replay_complete (the terminal marker).
+    #[tokio::test]
+    async fn catch_up_aborts_at_replay_complete_when_the_sink_gives_up() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+
+        let mut sink = DisconnectAfter(1); // queue frame passes, replay_complete fails
+        let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
+        assert!(
+            result.is_err(),
+            "a sink that drops the replay_complete frame aborts catch-up"
         );
     }
 }
