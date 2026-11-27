@@ -17,6 +17,7 @@ pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
 pub mod renewal;
+pub mod renewal_store;
 
 pub mod activation_registry;
 #[cfg(test)]

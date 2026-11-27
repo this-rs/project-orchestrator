@@ -57,6 +57,27 @@ impl std::fmt::Display for RenewalRefused {
     }
 }
 
+/// Why a reconstruction is refused, named rather than hidden behind a truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconstructRefused {
+    /// The mandatory context (objective + constraints) alone exceeds the budget.
+    /// Widening the budget is the only honest way forward.
+    MandatoryOverBudget { required: usize, budget: usize },
+}
+
+impl std::fmt::Display for ReconstructRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MandatoryOverBudget { required, budget } => {
+                write!(
+                    f,
+                    "mandatory context needs {required} tokens, budget is {budget}"
+                )
+            }
+        }
+    }
+}
+
 /// A decision worth carrying past a renewal, short enough to survive a budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarriedDecision {
@@ -119,26 +140,54 @@ pub struct Reconstructed {
     pub kept: Vec<String>,
     /// Items dropped to fit the budget, named so nothing vanishes silently.
     pub omitted: Vec<String>,
+    /// Tokens consumed by the mandatory context (objective + constraints).
+    pub mandatory_tokens: usize,
+    /// Tokens consumed by the optional context actually kept.
+    pub optional_tokens: usize,
 }
 
 /// Rebuilds a working context from a checkpoint under a token budget.
 ///
-/// Order is by decreasing necessity: objective, then constraints, then
-/// decisions, then evidence, then open hypotheses. Nothing is dropped without
-/// being listed in [`Reconstructed::omitted`].
+/// The budget is the **economic** budget of the new technical session's working
+/// memory. It splits in two: the **mandatory** part (objective + constraints),
+/// which must fit or the reconstruction is refused, and the **optional** part
+/// (decisions, pending operations, evidence, open hypotheses), which is filled
+/// by decreasing necessity and dropped — named — when it no longer fits.
+///
+/// Refusing when the mandatory part alone exceeds the budget is deliberate:
+/// closing the technical session would otherwise discard the very thing that
+/// defines the logical session. The caller must widen the budget, or keep the
+/// session open.
 pub fn reconstruct(
     checkpoint: &CognitiveCheckpoint,
     budget_tokens: usize,
     cost_of: impl Fn(&str) -> usize,
-) -> Reconstructed {
+) -> Result<Reconstructed, ReconstructRefused> {
+    // Mandatory context: counted against the budget, never omitted.
+    let mut kept: Vec<String> = Vec::new();
+    kept.push(checkpoint.objective.clone());
+    kept.extend(checkpoint.constraints.iter().cloned());
+    let mandatory_tokens = kept.iter().map(|item| cost_of(item)).sum::<usize>();
+    if mandatory_tokens > budget_tokens {
+        return Err(ReconstructRefused::MandatoryOverBudget {
+            required: mandatory_tokens,
+            budget: budget_tokens,
+        });
+    }
+
+    // Optional context, gated by the remaining budget and named when dropped.
     let mut candidates: Vec<String> = Vec::new();
-    candidates.push(checkpoint.objective.clone());
-    candidates.extend(checkpoint.constraints.iter().cloned());
     candidates.extend(
         checkpoint
             .decisions
             .iter()
             .map(|d| format!("decision: {} — {}", d.what, d.why)),
+    );
+    candidates.extend(
+        checkpoint
+            .pending_operations
+            .iter()
+            .map(|op| format!("pending: {op}")),
     );
     candidates.extend(checkpoint.evidence.iter().map(|e| format!("evidence: {e}")));
     candidates.extend(
@@ -148,9 +197,8 @@ pub fn reconstruct(
             .map(|h| format!("hypothesis: {h}")),
     );
 
-    let mut kept = Vec::new();
     let mut omitted = Vec::new();
-    let mut used = 0usize;
+    let mut used = mandatory_tokens;
     for item in candidates {
         let cost = cost_of(&item);
         if used + cost <= budget_tokens {
@@ -160,7 +208,12 @@ pub fn reconstruct(
             omitted.push(item);
         }
     }
-    Reconstructed { kept, omitted }
+    Ok(Reconstructed {
+        kept,
+        omitted,
+        mandatory_tokens,
+        optional_tokens: used - mandatory_tokens,
+    })
 }
 
 /// One renewal, kept for audit: who was closed, who replaced it, and why.
@@ -176,23 +229,91 @@ pub struct RenewalAudit {
     pub omitted_items: usize,
 }
 
-/// Operations already performed, so a fresh session does not redo them.
+/// The outcome of reconciling an uncertain operation.
+///
+/// Only two of these close the uncertainty; the third keeps it open. A timeout,
+/// a read error or an absence of proof is [`Indeterminate`], never
+/// [`EffectAbsent`]: replaying on missing evidence is exactly the double
+/// execution the ledger exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The effect is confirmed to have happened → the operation is done.
+    EffectConfirmed,
+    /// The effect is confirmed NOT to have happened → safe to retry.
+    EffectAbsent,
+    /// Still cannot tell → stays uncertain, must NOT be retried.
+    Indeterminate,
+}
+
+/// Operations the session has started, so a resumed session neither redoes a
+/// finished one nor replays one whose outcome is unknown.
 ///
 /// Keys are caller-chosen and stable (for example `commit:<sha>` or
-/// `deploy:<env>:<version>`); the ledger is the memory that makes a resumed
-/// turn idempotent.
+/// `deploy:<env>:<version>`). Three states:
+/// - **done**: the operation finished and its result is recorded;
+/// - **uncertain**: it started but the outcome is unknown (the write may or may
+///   not have landed) — it must be *reconciled*, never automatically replayed;
+/// - anything else: never started.
+///
+/// A ledger that only remembers `done` is not enough: an external operation can
+/// succeed before its state is persisted, and a naive "redo everything not
+/// done" would then execute it twice. The uncertain set makes that window
+/// explicit and forces a reconciliation before resuming.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyLedger {
     done: std::collections::BTreeSet<String>,
+    uncertain: std::collections::BTreeSet<String>,
 }
 
 impl IdempotencyLedger {
+    /// Record a finished operation.
     pub fn record(&mut self, key: impl Into<String>) {
-        self.done.insert(key.into());
+        let key = key.into();
+        self.done.insert(key.clone());
+        self.uncertain.remove(&key);
+    }
+
+    /// Record that an operation started but its outcome is unknown.
+    pub fn mark_uncertain(&mut self, key: impl Into<String>) {
+        let key = key.into();
+        if !self.done.contains(&key) {
+            self.uncertain.insert(key);
+        }
+    }
+
+    /// Reconcile an uncertain operation.
+    ///
+    /// [`ReconcileOutcome::EffectConfirmed`] moves it to done;
+    /// [`ReconcileOutcome::EffectAbsent`] clears the uncertainty so it may be
+    /// retried; [`ReconcileOutcome::Indeterminate`] leaves it uncertain — it is
+    /// never treated as done nor as safe to replay.
+    pub fn reconcile(&mut self, key: &str, outcome: ReconcileOutcome) {
+        match outcome {
+            ReconcileOutcome::EffectConfirmed => {
+                self.uncertain.remove(key);
+                self.done.insert(key.to_string());
+            }
+            ReconcileOutcome::EffectAbsent => {
+                self.uncertain.remove(key);
+            }
+            ReconcileOutcome::Indeterminate => {
+                // stays uncertain: no replay, no claim of completion.
+            }
+        }
     }
 
     pub fn already_done(&self, key: &str) -> bool {
         self.done.contains(key)
+    }
+
+    pub fn is_uncertain(&self, key: &str) -> bool {
+        self.uncertain.contains(key)
+    }
+
+    /// Operations whose outcome is unknown and must be reconciled before a
+    /// resumed session may treat them as not-done.
+    pub fn uncertain_keys(&self) -> Vec<&str> {
+        self.uncertain.iter().map(String::as_str).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -200,7 +321,7 @@ impl IdempotencyLedger {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.done.is_empty()
+        self.done.is_empty() && self.uncertain.is_empty()
     }
 }
 
@@ -242,11 +363,12 @@ mod tests {
     #[test]
     fn a_reconstruction_under_budget_names_what_it_drops() {
         let c = checkpoint();
-        let full = reconstruct(&c, 10_000, |s| s.len() / 4);
+        let full = reconstruct(&c, 10_000, |s| s.len() / 4).expect("budget large");
         assert!(full.omitted.is_empty());
         assert_eq!(full.kept.len(), 5);
+        assert!(full.mandatory_tokens > 0);
 
-        let tight = reconstruct(&c, 20, |s| s.len() / 4);
+        let tight = reconstruct(&c, 20, |s| s.len() / 4).expect("20 >= obligatoire");
         assert!(!tight.omitted.is_empty(), "un budget serre doit omettre");
         assert_eq!(
             tight.kept.len() + tight.omitted.len(),
@@ -258,7 +380,7 @@ mod tests {
     #[test]
     fn the_objective_is_kept_before_anything_else() {
         let c = checkpoint();
-        let tight = reconstruct(&c, 12, |s| s.len() / 4);
+        let tight = reconstruct(&c, 20, |s| s.len() / 4).expect("20 >= obligatoire");
         assert_eq!(
             tight.kept.first().map(String::as_str),
             Some(c.objective.as_str())
@@ -313,5 +435,85 @@ mod tests {
         assert!(ledger.is_empty());
         ledger.record("x");
         assert!(!ledger.is_empty());
+    }
+
+    #[test]
+    fn mandatory_context_is_refused_when_over_budget() {
+        let c = checkpoint();
+        let r = reconstruct(&c, 0, |s| s.len() / 4);
+        assert!(
+            matches!(r, Err(ReconstructRefused::MandatoryOverBudget { .. })),
+            "un contexte obligatoire hors budget doit refuser, pas omettre"
+        );
+    }
+
+    #[test]
+    fn mandatory_context_is_counted_against_the_budget() {
+        let c = checkpoint();
+        let mandatory = c.objective.len() / 4 + c.constraints[0].len() / 4;
+        let r = reconstruct(&c, mandatory, |s| s.len() / 4).expect("exactement le minimum");
+        assert!(r.kept.iter().any(|k| k == &c.objective), "objectif omis");
+        assert!(
+            r.kept.iter().any(|k| k == &c.constraints[0]),
+            "contrainte omise"
+        );
+        assert_eq!(r.mandatory_tokens, mandatory);
+        assert_eq!(r.optional_tokens, 0, "aucune place pour l'optionnel");
+        assert!(
+            r.omitted
+                .iter()
+                .all(|k| k != &c.objective && k != &c.constraints[0]),
+            "un item obligatoire figure dans les omis"
+        );
+    }
+
+    #[test]
+    fn pending_operations_are_carried_and_named() {
+        let mut c = checkpoint();
+        c.pending_operations = vec!["deploy:prod:1".into()];
+        let r = reconstruct(&c, 10_000, |s| s.len() / 4).expect("budget large");
+        assert!(r.kept.iter().any(|k| k == "pending: deploy:prod:1"));
+    }
+
+    #[test]
+    fn an_uncertain_operation_is_reconciled_not_replayed() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("deploy:prod:1");
+        assert!(ledger.is_uncertain("deploy:prod:1"));
+        assert!(!ledger.already_done("deploy:prod:1"));
+        assert_eq!(ledger.uncertain_keys(), vec!["deploy:prod:1"]);
+
+        ledger.reconcile("deploy:prod:1", ReconcileOutcome::EffectConfirmed);
+        assert!(ledger.already_done("deploy:prod:1"));
+        assert!(!ledger.is_uncertain("deploy:prod:1"));
+        assert!(ledger.uncertain_keys().is_empty());
+    }
+
+    #[test]
+    fn a_failed_uncertain_operation_can_be_retried() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("write:file:x");
+        ledger.reconcile("write:file:x", ReconcileOutcome::EffectAbsent);
+        assert!(!ledger.already_done("write:file:x"));
+        assert!(!ledger.is_uncertain("write:file:x"));
+    }
+
+    #[test]
+    fn an_indeterminate_operation_is_never_replayed() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("deploy:prod:1");
+        ledger.reconcile("deploy:prod:1", ReconcileOutcome::Indeterminate);
+        assert!(ledger.is_uncertain("deploy:prod:1"));
+        assert!(!ledger.already_done("deploy:prod:1"));
+        assert_eq!(ledger.uncertain_keys(), vec!["deploy:prod:1"]);
+    }
+
+    #[test]
+    fn recording_clears_the_uncertain_state() {
+        let mut ledger = IdempotencyLedger::default();
+        ledger.mark_uncertain("commit:abc");
+        ledger.record("commit:abc");
+        assert!(ledger.already_done("commit:abc"));
+        assert!(!ledger.is_uncertain("commit:abc"));
     }
 }
