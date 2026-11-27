@@ -1847,6 +1847,16 @@ fn text(t: &str) -> Value {
     assistant(json!([{"type": "text", "text": t}]))
 }
 
+/// A streamed text delta (the CLI's `stream_event` / `content_block_delta`): the
+/// manager emits each as a `ChatEvent::StreamDelta` during the turn.
+fn streamed_text(t: &str) -> Value {
+    emit(json!({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0,
+                  "delta": {"type": "text_delta", "text": t}},
+    }))
+}
+
 fn cc_tool_use(id: &str, name: &str, input: Value) -> Value {
     assistant(json!([{"type": "tool_use", "id": id, "name": name, "input": input}]))
 }
@@ -6161,6 +6171,52 @@ async fn the_historical_engine_completes_the_turn_it_ends_on_a_question() {
         (verdict.state, verdict.reason.rule),
         (SessionState::WaitingOnPerson, Rule::QuestionOpen),
         "the card stays answerable while the question waits"
+    );
+}
+
+/// Targeted coverage of the legacy `stream_response` delta stamp: a streamed
+/// `content_block_delta` must reach the client carrying its turn id and a
+/// monotonic offset (not the misleading `seq: 0`).
+#[tokio::test]
+async fn the_legacy_stream_stamps_each_delta_with_its_turn() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    cli.transcript(0, &[streamed_text("hi"), result_ok("hi")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    let w = Watch::start(
+        stage.graph.clone(),
+        &sid,
+        manager.subscribe(&sid).await.unwrap(),
+    );
+    assert!(
+        w.wait(WAIT, |e| matches!(
+            e,
+            ChatEvent::StreamDelta {
+                turn_id: Some(_),
+                offset: Some(_),
+                ..
+            }
+        ))
+        .await,
+        "a legacy stream delta carries its turn id and offset: {:#?}",
+        w.all().await
     );
 }
 
