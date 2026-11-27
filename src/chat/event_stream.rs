@@ -199,19 +199,17 @@ pub(crate) async fn catch_up<S: FrameSink>(
         // Accumulated structured events (tool_use, tool_result, assistant_text…)
         // that occurred during the current stream.
         for event in &streaming_events {
-            match serde_json::to_value(event) {
-                Ok(mut val) => {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("seq".to_string(), serde_json::json!(0));
-                        obj.insert("replaying".to_string(), serde_json::json!(true));
-                    }
-                    if !sink.send_frame(val).await {
-                        return Err(Disconnected);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to serialize streaming event: {}", e);
-                }
+            // A ChatEvent is plain data (strings, uuids, numbers, bools): its
+            // serialization cannot fail, so this documents the invariant rather
+            // than carrying an untestable error branch.
+            let mut val =
+                serde_json::to_value(event).expect("a ChatEvent is always serializable to JSON");
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("seq".to_string(), serde_json::json!(0));
+                obj.insert("replaying".to_string(), serde_json::json!(true));
+            }
+            if !sink.send_frame(val).await {
+                return Err(Disconnected);
             }
         }
 
