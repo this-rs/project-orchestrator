@@ -6255,6 +6255,42 @@ async fn the_legacy_engine_reaches_its_owner_through_nats() {
     );
 }
 
+/// A remote queued message is held (not sent) while the legacy turn is open,
+/// covering the listener's held branch.
+#[tokio::test]
+async fn the_legacy_engine_holds_a_queued_message_through_nats() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    // The turn stays open until interrupted, so a queued message is held.
+    cli.transcript(0, &[await_in("never-comes"), result_ok("done")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    assert!(
+        stage
+            .rpc(&sid, "after", "queued_user_message")
+            .await
+            .unwrap_or(false),
+        "a remote queued message is held on the streaming legacy session"
+    );
+    stage.other.publish_interrupt(&sid);
+}
+
 #[tokio::test]
 async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
     let stage = Stage::new().await;
