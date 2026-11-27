@@ -208,6 +208,10 @@ pub async fn renew(
     safe_point(tool_in_flight, uncertain_write).map_err(|e| anyhow!("renewal refused: {e}"))?;
     let from_epoch = current.epoch;
     let next = current.next_version(CognitiveEpoch(from_epoch.0 + 1));
+    // Validate the reconstruction BEFORE publishing: a reconstruction that does
+    // not fit the budget must not leave a new epoch behind.
+    let reconstructed = reconstruct(&next, budget_tokens, cost_of)
+        .map_err(|e| anyhow!("reconstruction refused: {e}"))?;
     store
         .put_state(
             id,
@@ -217,8 +221,6 @@ pub async fn renew(
             },
         )
         .await?;
-    let reconstructed = reconstruct(&next, budget_tokens, cost_of)
-        .map_err(|e| anyhow!("reconstruction refused: {e}"))?;
     Ok(RenewalOutcome {
         from_epoch,
         to_epoch: next.epoch,
@@ -500,6 +502,29 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("unknown outcome"), "{}", err);
+        assert!(store.load_state(&id()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reconstruction_failure_persists_nothing() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let current = checkpoint(1, 1, "reduce context cost");
+        // budget far too small for the mandatory objective -> reconstruction fails
+        let err = renew(
+            &store,
+            &id(),
+            &current,
+            &IdempotencyLedger::default(),
+            1,
+            |_| 100,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("reconstruction"), "{}", err);
+        // no new epoch left behind: the store is untouched
         assert!(store.load_state(&id()).await.unwrap().is_none());
     }
 }
