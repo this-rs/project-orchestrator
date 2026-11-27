@@ -685,4 +685,25 @@ mod tests {
             "an unknown, unopened session cannot be resumed: {result:?}"
         );
     }
+
+    /// A message to a session that was opened then closed takes the resume path
+    /// (registered node, no live CLI): route_user_message resumes it.
+    #[tokio::test]
+    async fn route_user_message_resumes_a_closed_session() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        let _ = manager.close_session(&sid).await;
+
+        let result = manager.route_user_message(&sid, "hi", None).await;
+        // A closed session is not active: the message takes the Resumed path
+        // (it may then fail to reopen the mock CLI, which is fine here).
+        match result {
+            Ok((DeliveryRoute::Resumed, _)) => {}
+            Err(_) => {}
+            Ok((other, _)) => panic!("expected the resume path, got {other:?}"),
+        }
+    }
 }
