@@ -6220,6 +6220,41 @@ async fn the_legacy_stream_stamps_each_delta_with_its_turn() {
     );
 }
 
+/// A message sent from the other instance reaches the LEGACY engine's owner
+/// through NATS: the listener persists it (with the origin's turn id) and runs
+/// the turn. This exercises the legacy branch of the cross-instance listener.
+#[tokio::test]
+async fn the_legacy_engine_reaches_its_owner_through_nats() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    cli.transcript(0, &[text("answered"), result_ok("answered")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    assert!(
+        stage
+            .rpc(&sid, "from afar", "user_message")
+            .await
+            .unwrap_or(false),
+        "a remote user_message reaches the legacy owner through NATS"
+    );
+}
+
 #[tokio::test]
 async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
     let stage = Stage::new().await;
