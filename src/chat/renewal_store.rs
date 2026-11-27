@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 
 use crate::neo4j::traits::GraphStore;
 
-use super::renewal::{CognitiveCheckpoint, IdempotencyLedger, LogicalSessionId};
+use super::renewal::{
+    reconstruct, safe_point, CognitiveCheckpoint, CognitiveEpoch, IdempotencyLedger,
+    LogicalSessionId, Reconstructed,
+};
 
 /// Namespace of the renewal documents inside the graph KV.
 const SCOPE: &str = "renewal";
@@ -174,6 +177,54 @@ impl<'a> RenewalStore<'a> {
         versions.dedup();
         Ok(versions)
     }
+}
+
+/// The outcome of one completed renewal transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalOutcome {
+    pub from_epoch: CognitiveEpoch,
+    pub to_epoch: CognitiveEpoch,
+    pub checkpoint_version: u32,
+    pub reconstructed: Reconstructed,
+}
+
+/// Orchestrate ONE renewal transition: refuse unless the session is at a safe
+/// point, persist the new checkpoint+ledger BEFORE any irreversible transition,
+/// and reconstruct the working memory the new technical session is seeded with.
+///
+/// This is the transition logic only. Closing the old technical session and
+/// opening the new one is the runtime's job (the manager), after this returns
+/// `Ok`: nothing is closed here, so a failure leaves the session untouched.
+pub async fn renew(
+    store: &RenewalStore<'_>,
+    id: &LogicalSessionId,
+    current: &CognitiveCheckpoint,
+    ledger: &IdempotencyLedger,
+    budget_tokens: usize,
+    cost_of: impl Fn(&str) -> usize,
+    tool_in_flight: bool,
+    uncertain_write: bool,
+) -> Result<RenewalOutcome> {
+    safe_point(tool_in_flight, uncertain_write).map_err(|e| anyhow!("renewal refused: {e}"))?;
+    let from_epoch = current.epoch;
+    let next = current.next_version(CognitiveEpoch(from_epoch.0 + 1));
+    store
+        .put_state(
+            id,
+            &RenewalState {
+                checkpoint: next.clone(),
+                ledger: ledger.clone(),
+            },
+        )
+        .await?;
+    let reconstructed = reconstruct(&next, budget_tokens, cost_of)
+        .map_err(|e| anyhow!("reconstruction refused: {e}"))?;
+    Ok(RenewalOutcome {
+        from_epoch,
+        to_epoch: next.epoch,
+        checkpoint_version: next.version,
+        reconstructed,
+    })
 }
 
 #[cfg(test)]
@@ -379,5 +430,76 @@ mod tests {
         graph.put_llm_setting(SCOPE, &key, &json).await.unwrap();
         let err = store.load_state(&id()).await.unwrap_err();
         assert!(err.to_string().contains("fingerprint"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_renewal_persists_then_reconstructs() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let current = checkpoint(3, 2, "reduce context cost");
+        let out = renew(
+            &store,
+            &id(),
+            &current,
+            &IdempotencyLedger::default(),
+            10_000,
+            |s| s.len() / 4,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.from_epoch, CognitiveEpoch(2));
+        assert_eq!(out.to_epoch, CognitiveEpoch(3));
+        assert_eq!(out.checkpoint_version, 4);
+        assert!(out
+            .reconstructed
+            .kept
+            .iter()
+            .any(|k| k == &current.objective));
+        let loaded = store.load_state(&id()).await.unwrap().unwrap();
+        assert_eq!(loaded.checkpoint.version, 4);
+        assert_eq!(loaded.checkpoint.epoch, CognitiveEpoch(3));
+    }
+
+    #[tokio::test]
+    async fn a_renewal_refuses_on_a_tool_in_flight() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let err = renew(
+            &store,
+            &id(),
+            &checkpoint(1, 1, "o"),
+            &IdempotencyLedger::default(),
+            100,
+            |s| s.len() / 4,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tool"), "{}", err);
+        // nothing was persisted before the refusal
+        assert!(store.load_state(&id()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_renewal_refuses_on_an_uncertain_write() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let err = renew(
+            &store,
+            &id(),
+            &checkpoint(1, 1, "o"),
+            &IdempotencyLedger::default(),
+            100,
+            |s| s.len() / 4,
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown outcome"), "{}", err);
+        assert!(store.load_state(&id()).await.unwrap().is_none());
     }
 }
