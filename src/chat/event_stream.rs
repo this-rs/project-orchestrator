@@ -404,6 +404,16 @@ mod tests {
                 .is_streaming
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             *session.streaming_text.lock().await = "partial".to_string();
+            session
+                .streaming_events
+                .lock()
+                .await
+                .push(ChatEvent::StreamDelta {
+                    text: "d".to_string(),
+                    parent_tool_use_id: None,
+                    turn_id: None,
+                    offset: None,
+                });
         }
 
         let mut sink = VecSink(Vec::new());
@@ -458,6 +468,35 @@ mod tests {
         assert_eq!(
             held.id, turn_id,
             "PendingMessage.id must equal the returned turn_id"
+        );
+    }
+
+    /// A session absent from the active map has no local broadcast and, without
+    /// a NATS emitter, no cross-instance fallback either.
+    #[tokio::test]
+    async fn catch_up_handles_a_dormant_session() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+
+        let mut sink = VecSink(Vec::new());
+        let caught = catch_up(&manager, None, &sid, 0, &mut sink)
+            .await
+            .expect("catch_up succeeds");
+        assert!(
+            caught.event_rx.is_none(),
+            "a dormant session has no local broadcast"
+        );
+        assert!(
+            caught.nats_chat_sub.is_none(),
+            "no NATS fallback without an emitter"
+        );
+        assert!(
+            sink.0
+                .iter()
+                .any(|f| f.get("type").and_then(|t| t.as_str()) == Some("replay_complete")),
+            "replay_complete is still sent"
         );
     }
 }
