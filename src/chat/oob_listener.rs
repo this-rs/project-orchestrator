@@ -716,6 +716,7 @@ async fn maybe_trigger_stream(
             // carry the cognitive router (the manager's primary turn paths do),
             // so an out-of-credit refusal here is reported without a cooldown.
             None,
+            Uuid::new_v4(),
         )
         .await;
     });

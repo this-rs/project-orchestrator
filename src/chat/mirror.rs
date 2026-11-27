@@ -1263,6 +1263,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "live only".into(),
                 parent_tool_use_id: Some(CALL.into()),
+                turn_id: None,
+                offset: None,
             },
             call(
                 "toolu_read",

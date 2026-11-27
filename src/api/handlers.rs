@@ -10544,6 +10544,8 @@ pub(crate) mod tests {
             tx.send(crate::chat::types::ChatEvent::StreamDelta {
                 text: "x".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             })
             .unwrap();
         }
@@ -11786,6 +11788,8 @@ pub(crate) mod tests {
             tx.send(crate::chat::types::ChatEvent::StreamDelta {
                 text: "x".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             })
             .unwrap();
         }

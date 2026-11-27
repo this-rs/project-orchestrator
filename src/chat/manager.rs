@@ -5839,6 +5839,7 @@ impl ChatManager {
                                     search_clone,
                                     documents_clone,
                                     cognitive_routing_clone,
+                                    request.turn_id.unwrap_or_else(Uuid::new_v4),
                                 )
                                 .await;
                             });
@@ -7515,6 +7516,8 @@ impl ChatManager {
                     vec![ChatEvent::StreamDelta {
                         text: text.clone(),
                         parent_tool_use_id: parent,
+                        turn_id: None,
+                        offset: None,
                     }]
                 }
                 // Extract tool_use from ContentBlockStart — this is where tool calls
@@ -8896,6 +8899,7 @@ impl ChatManager {
                 search,
                 documents,
                 cognitive_routing,
+                Uuid::new_v4(),
             )
             .await;
         });
@@ -9727,7 +9731,11 @@ impl ChatManager {
         search: Arc<dyn crate::meilisearch::SearchStore>,
         documents: crate::documents::store::DocumentStore,
         cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
+        turn_id: Uuid,
     ) {
+        // Monotonic position of a StreamDelta within THIS turn (per-turn, not
+        // global): one `stream_response` invocation = one turn, reset here.
+        let mut stream_offset: u64 = 0;
         // The tap that mirrors this session's Claude Code sub-agents (P18c, `chat::mirror`):
         // it sees each event AFTER it was broadcast, and never holds the turn.
         let mirror_tap = active_sessions
@@ -10451,10 +10459,14 @@ impl ChatManager {
                                     let parent = msg.parent_tool_use_id().map(|s| s.to_string());
                                     // Accumulate for mid-stream join snapshot
                                     streaming_text.lock().await.push_str(text);
+                                    let delta_offset = stream_offset;
+                                    stream_offset += 1;
                                     emit_chat(
                                         ChatEvent::StreamDelta {
                                             text: text.clone(),
                                             parent_tool_use_id: parent,
+                                            turn_id: Some(turn_id),
+                                            offset: Some(delta_offset),
                                         },
                                         &events_tx,
                                         &nats,
@@ -11525,6 +11537,7 @@ impl ChatManager {
                 search,
                 documents,
                 cognitive_routing,
+                turn_id,
             )
             .await;
         });
@@ -11827,6 +11840,7 @@ impl ChatManager {
                 search,
                 documents,
                 cognitive_routing,
+                Uuid::new_v4(),
             )
             .await;
         });
@@ -14379,6 +14393,7 @@ impl ChatManager {
                 search,
                 documents,
                 cognitive_routing,
+                turn_id,
             )
             .await;
         });
@@ -34160,6 +34175,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::StreamingStatus {

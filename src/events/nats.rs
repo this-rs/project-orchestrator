@@ -837,6 +837,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "tok".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::Error {
