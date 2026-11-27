@@ -668,4 +668,21 @@ mod tests {
         let result = catch_up(&manager, None, &sid, 0, &mut sink).await;
         assert!(result.is_err());
     }
+
+    /// A message to a session that is registered nowhere takes the resume path
+    /// (it cannot be sent locally nor remotely), covering route_user_message's
+    /// Resumed branch and the resume entry point.
+    #[tokio::test]
+    async fn route_user_message_resumes_an_unopened_session() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+
+        let result = manager.route_user_message(&sid, "hi", None).await;
+        assert!(
+            result.is_err(),
+            "an unknown, unopened session cannot be resumed: {result:?}"
+        );
+    }
 }
