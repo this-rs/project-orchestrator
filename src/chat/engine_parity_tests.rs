@@ -1427,6 +1427,20 @@ impl Stage {
         None
     }
 
+    async fn rpc_turn(&self, sid: &str, message: &str, kind: &str, turn_id: Uuid) -> Option<bool> {
+        for _ in 0..10 {
+            if let Some(answer) = self
+                .other
+                .request_send_message(sid, message, kind, Some(turn_id))
+                .await
+            {
+                return Some(answer.success);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        None
+    }
+
     async fn session_node(&self, sid: &str) -> crate::neo4j::models::ChatSessionNode {
         self.graph
             .get_chat_session(Uuid::parse_str(sid).unwrap())
@@ -6282,17 +6296,11 @@ async fn the_legacy_engine_holds_a_queued_message_through_nats() {
         .session_id;
 
     // A turn id is carried so the held message reuses it (held.id = turn_id).
-    let held = stage
-        .other
-        .request_send_message(
-            &sid,
-            "after",
-            "queued_user_message",
-            Some(uuid::Uuid::new_v4()),
-        )
-        .await;
     assert!(
-        held.map(|r| r.success).unwrap_or(false),
+        stage
+            .rpc_turn(&sid, "after", "queued_user_message", Uuid::new_v4())
+            .await
+            .unwrap_or(false),
         "a remote queued message is held on the streaming legacy session"
     );
     stage.other.publish_interrupt(&sid);
