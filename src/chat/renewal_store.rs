@@ -55,6 +55,11 @@ fn content_hash(json: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Length of the content fingerprint embedded in the key, in hex characters
+/// (half a sha256, 8 bytes). Fixed so that a shorter or empty fingerprint can
+/// never pass a comparison.
+const FINGERPRINT_LEN: usize = 16;
+
 /// A thin, keyed view of the renewal state of ONE logical session.
 pub struct RenewalStore<'a> {
     graph: &'a dyn GraphStore,
@@ -72,7 +77,12 @@ impl<'a> RenewalStore<'a> {
     pub async fn put_state(&self, id: &LogicalSessionId, state: &RenewalState) -> Result<()> {
         let json = serde_json::to_string(state)?;
         let digest = content_hash(&json);
-        let key = format!("{}:v{}:{}", id.0, state.checkpoint.version, &digest[..16]);
+        let key = format!(
+            "{}:v{}:{}",
+            id.0,
+            state.checkpoint.version,
+            &digest[..FINGERPRINT_LEN]
+        );
         self.graph.put_llm_setting(SCOPE, &key, &json).await?;
         Ok(())
     }
@@ -82,9 +92,12 @@ impl<'a> RenewalStore<'a> {
     /// Fails closed on every incoherence, never with a `panic` or an empty
     /// replacement:
     /// - a key that does not parse (`{id}:v{version}:{hash}`) is an error;
-    /// - two records at the same highest version (a concurrent double-write)
-    ///   are an error;
-    /// - a record whose content no longer matches its key's fingerprint is an
+    /// - two records at the SAME version — anywhere in the history, not only at
+    ///   the highest — are an error: a newer snapshot does not resolve an older
+    ///   unresolved double-write;
+    /// - a key fingerprint that is not exactly [`FINGERPRINT_LEN`] hex digits is
+    ///   an error (an empty or shortened fingerprint never passes);
+    /// - a record whose content hash does not equal its key fingerprint is an
     ///   error (rewritten in place);
     /// - a record that fails to deserialise, or whose checkpoint version
     ///   disagrees with its key, is an error.
@@ -103,26 +116,32 @@ impl<'a> RenewalStore<'a> {
                 None => return Err(anyhow!("renewal key malformed for {}: {key}", id.0)),
             }
         }
-        let max_version = parsed
-            .iter()
-            .map(|(_, v, _, _)| *v)
-            .max()
+        let mut by_version: std::collections::BTreeMap<u32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, (_, v, _, _)) in parsed.iter().enumerate() {
+            by_version.entry(*v).or_default().push(i);
+        }
+        for (v, idxs) in &by_version {
+            if idxs.len() > 1 {
+                return Err(anyhow!(
+                    "renewal conflict: {} records at version {v} for {}",
+                    idxs.len(),
+                    id.0
+                ));
+            }
+        }
+        let (&max_version, _) = by_version
+            .last_key_value()
             .ok_or_else(|| anyhow!("renewal state for {} has no version", id.0))?;
-        let at_max: Vec<&(String, u32, String, String)> = parsed
-            .iter()
-            .filter(|(_, v, _, _)| *v == max_version)
-            .collect();
-        if at_max.len() > 1 {
+        let idx = by_version[&max_version][0];
+        let (key, _, key_hash, json) = &parsed[idx];
+        if key_hash.len() != FINGERPRINT_LEN || !key_hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(anyhow!(
-                "renewal conflict: {} records at version {} for {}",
-                at_max.len(),
-                max_version,
-                id.0
+                "renewal key fingerprint malformed for {key}: {key_hash}"
             ));
         }
-        let (key, _, key_hash, json) = at_max[0];
         let actual = content_hash(json);
-        if !actual.starts_with(key_hash) {
+        if &actual[..FINGERPRINT_LEN] != key_hash.as_str() {
             return Err(anyhow!(
                 "renewal record tampered for {key}: content hash mismatch"
             ));
@@ -337,5 +356,28 @@ mod tests {
         graph.put_llm_setting(SCOPE, &key, &json).await.unwrap();
         let err = store.load_state(&id()).await.unwrap_err();
         assert!(err.to_string().contains("mismatch"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_historical_conflict_is_not_masked_by_a_higher_version() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        store.put_state(&id(), &state(1, 1, "A")).await.unwrap();
+        store.put_state(&id(), &state(1, 1, "B")).await.unwrap();
+        store.put_state(&id(), &state(2, 2, "C")).await.unwrap();
+        let err = store.load_state(&id()).await.unwrap_err();
+        assert!(err.to_string().contains("conflict"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_short_fingerprint_does_not_pass() {
+        let graph = MockGraphStore::new();
+        let store = RenewalStore::new(&graph);
+        let st = state(1, 1, "o");
+        let json = serde_json::to_string(&st).unwrap();
+        let key = format!("{}:v1:abcd", id().0); // 4 hex digits, not FINGERPRINT_LEN
+        graph.put_llm_setting(SCOPE, &key, &json).await.unwrap();
+        let err = store.load_state(&id()).await.unwrap_err();
+        assert!(err.to_string().contains("fingerprint"), "{}", err);
     }
 }
