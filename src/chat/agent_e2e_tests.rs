@@ -7125,6 +7125,52 @@ mod parity {
         assert_eq!(r.interrupts(), 1);
     }
 
+    /// The same cross-instance path through the LEGACY (Claude Code) engine: a
+    /// message sent from another instance is persisted on the owner, and a
+    /// queued message is held there.
+    #[tokio::test]
+    async fn a_legacy_session_reaches_the_owner_through_nats() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let r = rig_with(
+            ProviderKind::ClaudeCode,
+            vec![vec![Step::AwaitInterrupt]],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+
+        let mut answered = None;
+        for _ in 0..5 {
+            answered = other
+                .request_send_message(&r.sid, "from afar", "user_message", None)
+                .await;
+            if answered.is_some() {
+                break;
+            }
+        }
+        assert!(answered.expect("the owner answers").success);
+        r.turns_sent(1).await;
+        assert!(r.sent()[0].ends_with("from afar"));
+
+        let held = other
+            .request_send_message(&r.sid, "after", "queued_user_message", None)
+            .await
+            .unwrap();
+        assert!(held.success, "{:?}", held.error);
+        assert_eq!(
+            r.manager
+                .pending_queue_snapshot(&r.sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     // ----- references (`refs_v1`) × the H3 queue of the agent engine -----
 
     /// A decider that is never right: the router of the test only records the text.
