@@ -3020,19 +3020,49 @@ async fn start_setup_server(port: u16, bind: std::net::IpAddr) -> Result<()> {
 
 /// Startup warning for anonymous mode, or `None` when auth is configured.
 ///
-/// The warning names the address the listener actually holds: with the default
-/// `server.bind_addr` (`0.0.0.0`) anonymous mode is reachable from the network,
-/// while a loopback bind keeps it on this machine only.
+/// The warning describes the bind the listener actually holds: the default
+/// `server.bind_addr` (`0.0.0.0`) exposes it on every interface, a loopback bind
+/// keeps it on this machine, and a specific address claims nothing about
+/// reachability that the address alone proves.
 fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) -> Option<String> {
     if auth_configured {
         return None;
     }
+    let (bind, reachable) = bind_description(addr);
     Some(format!(
         "AUTH DISABLED: no `auth` section configured — every API request is served \
-         anonymously. The server listens on {addr} (all interfaces), so anyone who can \
-         reach this port has full access. Configure `auth` (root_account or oidc) \
-         before exposing this host beyond a trusted machine."
+         anonymously. The server listens on {addr} ({bind}), {reachable}. Configure \
+         `auth` (root_account or oidc) before exposing this host beyond a trusted machine."
     ))
+}
+
+/// What the bind is, and who can reach it, for the address actually held.
+///
+/// The message appended "(all interfaces)" whatever the address was, so an
+/// instance bound to `127.0.0.1` was told it was exposed to the network — the
+/// opposite of what it had just been configured for. Each arm states only what
+/// the address proves: a specific address says nothing about the network path
+/// to it, so it makes no reachability claim.
+fn bind_description(addr: &std::net::SocketAddr) -> (&'static str, &'static str) {
+    use std::net::IpAddr;
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => (
+            "every interface",
+            "so anyone who can reach this port has full access",
+        ),
+        IpAddr::V6(ip) if ip.is_unspecified() => (
+            "every interface",
+            "so anyone who can reach this port has full access",
+        ),
+        ip if ip.is_loopback() => (
+            "the loopback interface only",
+            "so any process on this machine can reach it without authenticating",
+        ),
+        _ => (
+            "that address only",
+            "so its exposure follows the network path to that address",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3047,6 +3077,48 @@ mod anonymous_warning_tests {
         let msg = anonymous_mode_warning(false, &addr).expect("must warn");
         assert!(msg.contains("AUTH DISABLED") && msg.contains("0.0.0.0:6600"));
         assert!(anonymous_mode_warning(true, &addr).is_none());
+    }
+
+    /// Default bind (`0.0.0.0`): the warning says every interface, and says
+    /// nothing about loopback.
+    #[test]
+    fn the_default_bind_is_described_as_every_interface() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 17690));
+        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+        assert!(msg.contains("0.0.0.0:17690 (every interface)"), "{msg}");
+        assert!(
+            msg.contains("anyone who can reach this port has full access"),
+            "{msg}"
+        );
+        assert!(!msg.contains("loopback"), "{msg}");
+    }
+
+    /// Regression of the #1343 review: a loopback bind was described as
+    /// "(all interfaces)", i.e. the message told an operator the opposite of
+    /// the bind they had just configured. Both stacks are covered.
+    #[test]
+    fn a_loopback_bind_is_never_described_as_all_interfaces() {
+        for addr in [
+            std::net::SocketAddr::from(([127, 0, 0, 1], 17690)),
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 17690)),
+        ] {
+            let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+            assert!(msg.contains("the loopback interface only"), "{msg}");
+            assert!(!msg.contains("all interfaces"), "{msg}");
+            assert!(!msg.contains("every interface"), "{msg}");
+            assert!(!msg.contains("anyone who can reach this port"), "{msg}");
+        }
+    }
+
+    /// A specific address makes no reachability claim: the address alone does
+    /// not prove who can reach it.
+    #[test]
+    fn a_specific_address_makes_no_reachability_claim() {
+        let addr = std::net::SocketAddr::from(([192, 0, 2, 10], 17690));
+        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+        assert!(msg.contains("that address only"), "{msg}");
+        assert!(!msg.contains("every interface"), "{msg}");
+        assert!(!msg.contains("anyone who can reach this port"), "{msg}");
     }
 }
 
