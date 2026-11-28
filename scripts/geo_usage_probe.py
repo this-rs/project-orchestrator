@@ -23,6 +23,8 @@ TROIS ERREURS DÉJÀ COMMISES ICI, À NE PAS REFAIRE :
 USAGE :
     python3 scripts/geo_usage_probe.py            # rapport
     python3 scripts/geo_usage_probe.py --check    # assertions, sortie non nulle si faux
+    python3 scripts/geo_usage_probe.py --tools     # distribution des sorties d'outil
+    python3 scripts/geo_usage_probe.py --budget    # gain de la projection des réponses MCP
     python3 scripts/geo_usage_probe.py --selftest  # fixtures synthétiques, hors corpus
 """
 import json, glob, os, sys, collections, tempfile
@@ -76,7 +78,7 @@ def scan(f):
             "blobs": blobs, "cost": cost}
 
 
-def residence(f, floor):
+def residence(f, floor, detail=None):
     """[R] Coût de résidence par catégorie, simulation FIFO des compactions.
 
     La taille en jetons d'un bloc vient du DELTA observé du préfixe (jetons
@@ -85,6 +87,9 @@ def residence(f, floor):
     hypothèse explicite, la compaction oublie le plus ancien d'abord.
     Les blocs image ne sont jamais comptés ici (facturation au pixel).
     """
+    # Un bloc est [catégorie, taille, résidence accumulée, indice de détail].
+    # `detail` reçoit un enregistrement par RÉSULTAT d'outil : sa taille et le coût
+    # de relecture qu'il a réellement payé avant de sortir du contexte (FIFO).
     blocks, resid = [], collections.Counter()
     names, prev, pending = {}, None, []
     for line in open(f, errors="ignore"):
@@ -118,30 +123,197 @@ def residence(f, floor):
             if delta > 0:
                 total = sum(c for _, c in pending) or 1
                 for cat, chars in pending:
-                    blocks.append([cat, delta * chars / total])
-            for cat, size in blocks:
-                resid[cat] += size
-            excess = (floor + sum(s for _, s in blocks)) - ctx
+                    blocks.append([cat, delta * chars / total, 0.0, None])
+            for blk in blocks:
+                resid[blk[0]] += blk[1]
+                blk[2] += blk[1]
+            excess = (floor + sum(blk[1] for blk in blocks)) - ctx
             while excess > 0 and blocks:
-                _, size = blocks.pop(0)
-                excess -= size
+                gone = blocks.pop(0)
+                excess -= gone[1]
+                if detail is not None and gone[3] is not None:
+                    detail[gone[3]][2] = gone[2]
             prev = ctx
         elif t == "user":
             ct = (o.get("message") or {}).get("content")
             items = ct if isinstance(ct, list) else [{"type": "text", "text": ct or ""}]
             for b in items:
                 if b.get("type") == "tool_result":
+                    size = len(json.dumps(b.get("content"))) / CHARS_PER_TOKEN
+                    idx = None
+                    if detail is not None:
+                        idx = len(detail)
+                        detail.append([names.get(b.get("tool_use_id"), "?"), size, 0.0])
                     blocks.append(["resultat:" + names.get(b.get("tool_use_id"), "?"),
-                                   len(json.dumps(b.get("content"))) / CHARS_PER_TOKEN])
+                                   size, 0.0, idx])
                 elif b.get("type") == "text":
                     txt = b.get("text") or ""
                     head, sep, rest = txt.partition(SEP)
                     if sep:
-                        blocks.append(["enrichissement_PO", len(head) / CHARS_PER_TOKEN])
-                        blocks.append(["texte_utilisateur", len(rest) / CHARS_PER_TOKEN])
+                        blocks.append(["enrichissement_PO", len(head) / CHARS_PER_TOKEN, 0.0, None])
+                        blocks.append(["texte_utilisateur", len(rest) / CHARS_PER_TOKEN, 0.0, None])
                     else:
-                        blocks.append(["texte_utilisateur", len(txt) / CHARS_PER_TOKEN])
+                        blocks.append(["texte_utilisateur", len(txt) / CHARS_PER_TOKEN, 0.0, None])
+    if detail is not None:
+        for blk in blocks:
+            if blk[3] is not None:
+                detail[blk[3]][2] = blk[2]
     return resid
+
+
+def tool_report(rows):
+    """[R] Distribution des sorties d'outil et coût de relecture, sur tout le corpus.
+
+    Répond à la première exigence de GEO-6 : la masse vient-elle des gros résultats
+    ou de la QUEUE des petits ? Chaque résultat porte sa taille (jetons estimés,
+    3,6 car./jeton) et la résidence qu'il a réellement payée — taille × nombre de
+    requêtes qui l'ont encore, jusqu'à sa sortie du contexte.
+    """
+    results, per_session = [], []
+    for r in rows:
+        detail = []
+        residence(r["path"], r["floor"], detail)
+        results.extend(detail)
+        if detail:
+            got = sum(d[2] for d in detail)
+            tot = sum(residence(r["path"], r["floor"]).values()) or 1
+            per_session.append((r["sid"], len(detail), got, tot))
+    if not results:
+        print("[R] aucun résultat d'outil dans le corpus")
+        return
+    sizes = sorted(d[1] for d in results)
+    res_tot = sum(d[2] for d in results)
+    tot_all = sum(p[3] for p in per_session) or 1
+    q = lambda p: sizes[min(len(sizes) - 1, int(p * len(sizes)))]
+    print(f"[R] SORTIES D'OUTIL — {len(results):,} résultats sur {len(per_session)} sessions")
+    print(f"   taille  p50={q(.5):,.0f} j   p90={q(.9):,.0f} j   p99={q(.99):,.0f} j   "
+          f"max={sizes[-1]:,.0f} j   total ajouté={sum(sizes)/1e6:,.1f} M j")
+    print(f"   relecture (résidence) de TOUTES les sorties d'outil = {res_tot/1e6:,.1f} M jetons-lus "
+          f"({100*res_tot/tot_all:,.1f} % de la résidence du corpus)")
+    buckets = [(0, 2_000, "< 2 000 j"), (2_000, 8_000, "2 000–8 000 j"),
+               (8_000, 10**9, "> 8 000 j")]
+    for lo, hi, label in buckets:
+        got = sum(d[2] for d in results if lo <= d[1] < hi)
+        n = sum(1 for d in results if lo <= d[1] < hi)
+        print(f"   {label:>13} : {n:6,} résultats  {100*got/max(1e-9,res_tot):5.1f} % de la relecture "
+              f"({got/1e6:6.1f} M j)")
+    by_tool = collections.Counter()
+    for name, size, got in results:
+        by_tool[name] += got
+    print("   par outil (relecture) :")
+    for name, got in by_tool.most_common(10):
+        n = sum(1 for d in results if d[0] == name)
+        print(f"     {name:44} {got/1e6:7.1f} M j  {100*got/max(1e-9,res_tot):5.1f} %  ({n:,} appel(s))")
+
+
+# Politique de budget des réponses MCP de PO (GEO-6), tenue avec
+# `src/mcp/response_budget.rs` : un test du module refuse une divergence.
+MAX_INLINE_BYTES = 8000
+MAX_STRING_CHARS = 400
+MAX_ARRAY_ITEMS = 100
+
+
+def elide_text(text):
+    """Le même élision que `response_budget::elide`, sur le YAML réellement envoyé.
+
+    Le sérialiseur émet UN scalaire par ligne : une valeur longue tient donc sur une
+    seule ligne, et couper la ligne à MAX_STRING_CHARS est l'équivalent exact de
+    couper la valeur. Les listes sont comptées par leur nombre de lignes `- `.
+    """
+    out, items = [], 0
+    for line in text.split("\n"):
+        if line.lstrip().startswith("- "):
+            items += 1
+        if len(line) > MAX_STRING_CHARS:
+            line = line[:MAX_STRING_CHARS] + "… [%d chars elided — artefact <ref>]" % (len(line) - MAX_STRING_CHARS)
+        out.append(line)
+    if items > MAX_ARRAY_ITEMS:
+        out.append("… [%d more items elided]" % (items - MAX_ARRAY_ITEMS))
+    return "\n".join(out)
+
+
+def projected_len(text):
+    """Taille après projection : inchangée sous le plafond, sinon élaguée + poignée."""
+    raw = len(text.encode())
+    if raw <= MAX_INLINE_BYTES:
+        return raw
+    return len(elide_text(text).encode()) + 320   # + l'objet `_budget`
+
+
+def po_payloads(f):
+    """Les réponses des outils MCP de PO, dans l'ordre du fichier, en texte."""
+    names, out = {}, []
+    for line in open(f, errors="ignore"):
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") == "assistant":
+            for b in ((o.get("message") or {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    names[b.get("id")] = b.get("name") or "?"
+        elif o.get("type") == "user":
+            ct = (o.get("message") or {}).get("content")
+            items = ct if isinstance(ct, list) else []
+            for b in items:
+                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                    continue
+                tool = names.get(b.get("tool_use_id"), "?")
+                if not tool.startswith("mcp__project-orchestrator__"):
+                    out.append(None)
+                    continue
+                body = b.get("content")
+                if isinstance(body, list):
+                    text = "".join(x.get("text") or "" for x in body if isinstance(x, dict))
+                else:
+                    text = body if isinstance(body, str) else json.dumps(body)
+                out.append((tool.replace("mcp__project-orchestrator__", ""), text))
+    return out
+
+
+def budget_report(rows):
+    """[R] Gain de la projection des réponses MCP de PO, sur les transcripts réels.
+
+    Ce n'est pas un gain constaté en session : c'est la politique appliquée aux
+    RÉPONSES RÉELLES capturées, pondérée par la résidence mesurée de chacune.
+    """
+    tot_raw = tot_proj = res_before = res_after = 0.0
+    projected = 0
+    by_tool = collections.Counter()
+    for r in rows:
+        detail = []
+        residence(r["path"], r["floor"], detail)
+        payloads = po_payloads(r["path"])
+        for d, p in zip(detail, payloads):
+            if p is None:
+                continue
+            name, res_tokens, got = d[0], d[1], d[2]
+            text = p[1]
+            before = len(text.encode())
+            after = projected_len(text)
+            tot_raw += before
+            tot_proj += after
+            share = after / before if before else 1.0
+            res_before += got
+            res_after += got * share
+            if after < before:
+                projected += 1
+            by_tool[name] += got * (1 - share)
+    if not tot_raw:
+        print("[R] aucune réponse d'outil MCP de PO dans le corpus")
+        return
+    print(f"[R] RÉPONSES MCP DE PO — {int(res_before/1e6 and 1) and ''}"
+          f"résidence mesurée {res_before/1e6:,.1f} M jetons-lus")
+    print(f"   octets ajoutés : {tot_raw/1e6:,.2f} Mo → {tot_proj/1e6:,.2f} Mo "
+          f"(−{100*(1-tot_proj/max(1,tot_raw)):.1f} %)")
+    print(f"   relecture : {res_before/1e6:,.1f} M → {res_after/1e6:,.1f} M jetons-lus "
+          f"(−{100*(1-res_after/max(1e-9,res_before)):.1f} %)")
+    print(f"   réponses projetées : {projected:,}")
+    print("   relecture évitée par outil :")
+    for name, saved in by_tool.most_common(8):
+        print(f"     {name:28} {saved/1e6:7.2f} M j")
+    if not any(name == "test" for name in ()):
+        pass
 
 
 def units(mu):
@@ -300,6 +472,30 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         return selftest()
+    if "--budget" in sys.argv:
+        rows = []
+        for sid, f in sessions():
+            s = scan(f)
+            usd = (s["cost"] or {}).get("totalCostUSD") or 0
+            if not s["cost"] or not s["req"] or usd <= 0:
+                continue
+            rows.append({"sid": sid, "path": f, "n": len(s["req"]),
+                         "floor": (sorted(s["shapes"].values())[len(s["shapes"]) // 2]
+                                   if s["shapes"] else 0)})
+        budget_report(rows)
+        return 0
+    if "--tools" in sys.argv:
+        rows = []
+        for sid, f in sessions():
+            s = scan(f)
+            usd = (s["cost"] or {}).get("totalCostUSD") or 0
+            if not s["cost"] or not s["req"] or usd <= 0:
+                continue
+            rows.append({"sid": sid, "path": f, "n": len(s["req"]),
+                         "floor": (sorted(s["shapes"].values())[len(s["shapes"]) // 2]
+                                   if s["shapes"] else 0)})
+        tool_report(rows)
+        return 0
     check = "--check" in sys.argv
     rows = []
     for sid, f in sessions():

@@ -11,6 +11,7 @@ pub mod http_client;
 pub mod http_transport;
 pub mod pipeline_handler;
 pub mod protocol;
+pub mod response_budget;
 pub mod server;
 pub mod tools;
 

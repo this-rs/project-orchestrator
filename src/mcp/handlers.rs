@@ -948,7 +948,15 @@ impl ToolHandler {
     /// Mega-tool names (e.g. "project") are first resolved to legacy names
     /// (e.g. "list_projects") for backward-compatible routing.
     pub async fn handle(&self, name: &str, args: Option<Value>) -> Result<Value> {
-        let args = args.unwrap_or(json!({}));
+        let mut args = args.unwrap_or(json!({}));
+        // `full: true` — the caller wants the raw payload, not a projection (GEO-6).
+        // Read HERE, before dispatch, so no handler ever sees the switch as one of its
+        // own arguments.
+        let full = args
+            .as_object_mut()
+            .and_then(|map| map.remove("full"))
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
         let start = std::time::Instant::now();
 
         // ── External MCP dispatch (server_id::tool_name) ────────────────
@@ -1017,9 +1025,40 @@ impl ToolHandler {
         }
 
         match result {
-            Ok(Some(value)) => Ok(value),
+            Ok(Some(value)) => Ok(self.budget(orig_name, value, full)),
             Ok(None) => Err(anyhow!("Unknown tool: '{}'", name)),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Externalize a response too large to be re-read on every later request, and
+    /// leave a small one exactly as it was (GEO-6: the harness PO owns on the Claude
+    /// Code side is its own MCP payloads — measured 13.5 % of the tool-output
+    /// volume). The full payload goes to the artifact store `validate` reads from,
+    /// so the handle outlives the session and a slice costs no re-execution. A
+    /// projection that fails returns the untouched response: never a lost answer.
+    fn budget(&self, tool: &str, value: Value, full: bool) -> Value {
+        if full {
+            return value;
+        }
+        let store = crate::tool_digest::ArtifactStore::new(self.validator.store_dir());
+        match crate::mcp::response_budget::project(&store, tool, &value) {
+            Ok((projected, outcome)) => {
+                if outcome.projected {
+                    tracing::info!(
+                        tool,
+                        bytes_before = outcome.bytes_before,
+                        bytes_after = outcome.bytes_after,
+                        artefact = outcome.artefact.as_deref().unwrap_or(""),
+                        "[mcp] response externalized to an artefact (GEO-6)"
+                    );
+                }
+                projected
+            }
+            Err(error) => {
+                tracing::warn!(tool, %error, "[mcp] projection failed: full response returned");
+                value
+            }
         }
     }
 
