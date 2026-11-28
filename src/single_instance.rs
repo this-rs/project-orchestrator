@@ -54,7 +54,7 @@ impl fmt::Display for PortOwnedByOrchestrator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "cannot bind 0.0.0.0:{}: a live Project Orchestrator (version {}) already serves this \
+            "cannot bind port {}: a live Project Orchestrator (version {}) already serves this \
              port — this duplicate exits with status 0 so the supervisor (launchd KeepAlive, \
              systemd Restart=) stops relaunching it; the live instance keeps serving. To take \
              over: stop the live instance, then `launchctl kickstart -k gui/$(id -u)/land.ffs.orchestrator`.",
