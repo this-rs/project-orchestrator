@@ -1,0 +1,11 @@
+    Checking tinycrate v0.1.0 (/private/tmp/geo-fixtures/tinycrate)
+warning: unused variable: `unused`
+ --> src/lib.rs:6:9
+  |
+6 |     let unused = 42;
+  |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tinycrate` (lib) generated 1 warning (run `cargo fix --lib -p tinycrate` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s

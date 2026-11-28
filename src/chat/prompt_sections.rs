@@ -155,6 +155,20 @@ impl ActivationCondition {
         }
     }
 
+    /// Section is always included, with a compact variant used for levels in
+    /// [compact_min, compact_max].
+    pub const fn always_with_compact(compact_min: u8, compact_max: u8) -> Self {
+        Self {
+            scaffolding_min: None,
+            scaffolding_max: None,
+            requires_active_plan: false,
+            requires_active_protocol: false,
+            min_task_count: None,
+            always: true,
+            compact_scaffolding_range: Some((compact_min, compact_max)),
+        }
+    }
+
     /// Section is included for scaffolding levels in [min, max] (inclusive).
     pub const fn scaffolding_range(min: u8, max: u8) -> Self {
         Self {
@@ -331,6 +345,8 @@ You MUST **NOT** use Claude Code internal features for project management:
 
 When asked to "plan", create an **MCP Plan** with Tasks and Steps.
 When asked to "track progress", update **statuses via MCP tools**.
+
+**Tool output:** for `cargo test`, `cargo check`/`build` and `git status`, prefer the `validate` MCP tool over `Bash` — it returns a bounded digest instead of replaying raw output into the context; the full output is kept in a content-addressed store.
 
 **Secrets (passwords, API keys, tokens) — through the vault only:**
 - Never ask the user to paste a secret in the chat, and never print one (no `echo`, `cat`, `env`, `printenv` on it).
@@ -1184,22 +1200,22 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             id: PromptSectionId::BestPracticesImpact,
             content: SECTION_BP_IMPACT,
             priority: 8,
-            condition: ActivationCondition::always(),
-            compact_content: None,
+            condition: ActivationCondition::always_with_compact(1, 4),
+            compact_content: Some(SECTION_BP_IMPACT_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesSearch,
             content: SECTION_BP_SEARCH,
             priority: 9,
-            condition: ActivationCondition::scaffolding_range(0, 3),
-            compact_content: None,
+            condition: ActivationCondition::scaffolding_range_with_compact(0, 3, 1, 3),
+            compact_content: Some(SECTION_BP_SEARCH_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesKnowledge,
             content: SECTION_BP_KNOWLEDGE,
             priority: 10,
-            condition: ActivationCondition::always(),
-            compact_content: None,
+            condition: ActivationCondition::always_with_compact(1, 4),
+            compact_content: Some(SECTION_BP_KNOWLEDGE_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesAdvanced,
@@ -1604,6 +1620,7 @@ impl ToolRefGroupId {
                 "vault",
                 "milestone",
                 "day_plan",
+                "validate",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],
@@ -1984,6 +2001,75 @@ pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -
 // ============================================================================
 // Tests
 // ============================================================================
+
+// --- Variantes compactes du bloc « Best Practices » -------------------------
+//
+// MESURE du 26/11/2026 sur une session PO reelle : le bloc « ## 8. Best
+// Practices » pese 22 590 caracteres, soit 26 % du prompt systeme (24 293
+// jetons). Ces trois sections n'avaient AUCUNE variante compacte
+// (`compact_content: None`), donc aucun reglage de seuil ne pouvait rien
+// retirer : c'est le CONTENU qui manquait, pas le bouton.
+//
+// Classification appliquee instruction par instruction :
+//   invariant permanent      -> conserve mot pour mot ;
+//   contrainte executable    -> conservee (la perdre casse un garde-fou) ;
+//   connaissance procedurale -> remplacee par un POINTEUR recuperable
+//                               (note search, skill search, code get_health) ;
+//   exemple facultatif       -> retire ;
+//   redondance               -> retiree.
+//
+// Le compact est activable et REVERSIBLE : la version longue reste la constante
+// d'origine, le routeur choisit. Aucun garde-fou n'est supprime ici : ces
+// sections portent de la methode, pas des invariants verifies.
+
+/// `## 8. Best Practices` — variante compacte.
+pub const SECTION_BP_IMPACT_COMPACT: &str = r#"## 8. Best Practices
+
+**MCP-first.** Use the Project Orchestrator mega-tools for planning and knowledge.
+Never Claude Code internal planning (plan mode, TodoWrite).
+
+**Secrets.** Never paste a secret in the chat, never print one. `vault(action:
+"list_available")` names them; `vault(action: "request_secret")` shows a secure
+card. Use a value only inside a shell command (`orchestrator secret exec`).
+
+**Before modifying.** `code(action: "analyze_impact")` gives the affected files
+and the decisions that constrain them. A change without it is a guess.
+
+**Capture knowledge.** A bug resolved becomes a `gotcha`, a convention a
+`guideline`, a pattern a `pattern`. Link it to the entity it concerns with
+`note(action: "link_to_entity")`. Never end a working session without it.
+
+**RFCs.** A cross-cutting change opens an RFC note (`note_type: "rfc"`, sections
+Problem / Proposed Solution / Alternatives / Impact). Check in-flight RFCs first.
+
+Procedure detail (GDS, Knowledge Fabric, hierarchical protocols, workspace
+routing) is recoverable on demand: `note(action: "search")`,
+`skill(action: "search")`, `code(action: "get_health")`.
+"#;
+
+/// `## 9. Search Strategy` — variante compacte.
+pub const SECTION_BP_SEARCH_COMPACT: &str = r#"## 9. Search Strategy
+
+Order: `note(action: "search_semantic")` first (vector, finds without the exact
+words), then `decision(action: "search_semantic")`, then `note(action: "search")`
+(BM25) when an exact term matters. `code(action: "search_project")` for code.
+One precise query beats three vague ones.
+
+A search that returns nothing is a result: say so, do not widen blindly.
+"#;
+
+/// `## 10. Knowledge Capture` — variante compacte.
+pub const SECTION_BP_KNOWLEDGE_COMPACT: &str = r#"## 10. Knowledge Capture
+
+Write the note while the knowledge is fresh, in the entity's own words: what was
+measured, how, and what would be wrong without it.
+
+`note(action: "create")` then `note(action: "link_to_entity")` on the file or
+function concerned. One precise note beats three vague ones.
+
+A decision records the alternatives considered and why they lost
+(`decision(action: "add")`). A superseded decision is superseded, never deleted.
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -3978,6 +4064,33 @@ mod tests {
         assert_eq!(
             personas.content, SECTION_BP_PERSONAS_COMPACT,
             "L1 should use compact BestPracticesPersonas content"
+        );
+
+        let impact = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesImpact)
+            .expect("BestPracticesImpact should be present at L1");
+        assert_eq!(
+            impact.content, SECTION_BP_IMPACT_COMPACT,
+            "L1 should use compact BestPracticesImpact content"
+        );
+
+        let search = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesSearch)
+            .expect("BestPracticesSearch should be present at L1");
+        assert_eq!(
+            search.content, SECTION_BP_SEARCH_COMPACT,
+            "L1 should use compact BestPracticesSearch content"
+        );
+
+        let knowledge = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesKnowledge)
+            .expect("BestPracticesKnowledge should be present at L1");
+        assert_eq!(
+            knowledge.content, SECTION_BP_KNOWLEDGE_COMPACT,
+            "L1 should use compact BestPracticesKnowledge content"
         );
     }
 

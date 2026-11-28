@@ -65,7 +65,7 @@ use super::types::ChatEvent;
 
 /// Seconds since the epoch, the milliseconds as the fraction (the chat wire's unit).
 fn seconds(at: DateTime<Utc>) -> f64 {
-    crate::api::ws_chat_handler::wire_seconds(at)
+    crate::chat::event_stream::wire_seconds(at)
 }
 
 #[derive(Default)]

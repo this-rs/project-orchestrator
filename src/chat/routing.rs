@@ -1195,3 +1195,64 @@ mod tests {
         assert!((decision.trajectory_confidence() - 1.0).abs() < 1e-12);
     }
 }
+
+#[cfg(test)]
+mod geo_compact_measure {
+    use super::*;
+
+    /// Mesure le prompt de BASE assemblé par le routeur, en régime complet (L0)
+    /// et en régime compact (L1), et vérifie que les invariants survivent au
+    /// compact. C'est une mesure de SÉLECTION assemblée, pas la taille d'une
+    /// constante : si le routeur ne choisissait pas la variante compacte, le
+    /// gain serait nul et ce test le dirait.
+    #[test]
+    fn the_compact_profile_shrinks_the_assembled_prompt_and_keeps_its_invariants() {
+        let router = HeuristicRouter;
+        let ctx = |level: u8| RoutingContext {
+            scaffolding_level: level,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+            ..Default::default()
+        };
+
+        let full = router.route(&ctx(0));
+        let compact = router.route(&ctx(1));
+
+        let mut full_chars = 0usize;
+        for s in &full.sections {
+            full_chars += s.content.len();
+        }
+        let mut compact_chars = 0usize;
+        for s in &compact.sections {
+            compact_chars += s.content.len();
+        }
+
+        assert!(
+            compact_chars < full_chars,
+            "le profil compact doit assembler MOINS que le complet : {compact_chars} vs {full_chars}"
+        );
+
+        let mut compact_text = String::new();
+        for s in &compact.sections {
+            compact_text.push_str(s.content);
+        }
+        // Invariants qu'aucune compression ne doit faire disparaitre.
+        for needle in [
+            "MCP-first",
+            "vault(action:",
+            "analyze_impact",
+            "link_to_entity",
+        ] {
+            assert!(
+                compact_text.contains(needle),
+                "invariant perdu en compact : {needle}"
+            );
+        }
+
+        println!(
+            "prompt de base assemble : {full_chars} car. (L0) -> {compact_chars} car. (L1), -{:.1}%",
+            100.0 * (full_chars.saturating_sub(compact_chars)) as f64 / full_chars as f64
+        );
+    }
+}

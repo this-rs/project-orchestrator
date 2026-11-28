@@ -188,6 +188,8 @@ impl EventMapper {
             } => vec![ChatEvent::StreamDelta {
                 text: text.clone(),
                 parent_tool_use_id: parent.clone(),
+                turn_id: None,
+                offset: None,
             }],
             // Thinking and tool-input fragments have no ChatEvent today.
             AgentEvent::Delta { .. } => Vec::new(),

@@ -2226,6 +2226,9 @@ async fn a_native_session_gets_the_nexus_tools_server_bounded_by_its_policy() {
         [
             "NEXUS_TOOLS_KEY",
             "NEXUS_TOOLS_PROFILE",
+            // The session's own directories, for `validate`: the same scope as its
+            // file tools, never a wider one (see `nexus_tools::launch`).
+            "PO_VALIDATE_ROOTS",
             "TEMP",
             "TMP",
             "TMPDIR"
@@ -8856,7 +8859,7 @@ async fn a_resume_that_completes_while_a_message_asks_nats_is_not_resumed_over()
             first
         },);
     resumed_first.unwrap();
-    assert_eq!(routed.unwrap(), DeliveryRoute::Resumed);
+    assert_eq!(routed.unwrap().0, DeliveryRoute::Resumed);
     let resumed = fake.state.opened_specs.lock().unwrap().clone();
     assert_eq!(resumed.len(), 1, "the session is resumed once");
     assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
@@ -12356,6 +12359,8 @@ fn test_streaming_events_filter_excludes_transient_events() {
         ChatEvent::StreamDelta {
             text: "Hello".into(),
             parent_tool_use_id: None,
+            turn_id: None,
+            offset: None,
         },
         ChatEvent::StreamingStatus { is_streaming: true },
         ChatEvent::StreamingStatus {
@@ -13620,7 +13625,7 @@ async fn test_try_remote_send_no_nats() {
     // No NATS configured → should return false (fallback needed)
     assert!(manager.nats.is_none());
     let result = manager
-        .try_remote_send("any-session-id", "hello", "user_message")
+        .try_remote_send("any-session-id", "hello", "user_message", None)
         .await;
     assert!(result.is_ok());
     assert!(!result.unwrap(), "Should return false without NATS");
@@ -13634,7 +13639,7 @@ async fn test_try_remote_send_all_message_types_no_nats() {
 
     for msg_type in &["user_message", "permission_response", "input_response"] {
         let result = manager
-            .try_remote_send("session-123", "test", msg_type)
+            .try_remote_send("session-123", "test", msg_type, None)
             .await
             .unwrap();
         assert!(!result, "Should return false for {} without NATS", msg_type);
@@ -13804,7 +13809,7 @@ async fn test_routing_decision_local_active_session() {
 
     // try_remote_send without NATS → false
     let remote = manager
-        .try_remote_send("some-session", "hello", "user_message")
+        .try_remote_send("some-session", "hello", "user_message", None)
         .await
         .unwrap();
     assert!(!remote);

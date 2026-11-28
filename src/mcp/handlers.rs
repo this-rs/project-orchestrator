@@ -9,7 +9,9 @@ use crate::neo4j::traits::*;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
+use super::http_client::{
+    extract_id, extract_optional_string, extract_string, extract_string_array, McpHttpClient,
+};
 use crate::graph::models::profile_by_name;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 
@@ -571,6 +573,8 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "close_session", "close_chat_session"),
     ("chat", "send_message", "chat_send_message"),
     ("chat", "list_messages", "list_chat_messages"),
+    ("chat", "usage", "chat_usage"),
+    ("chat", "interrupt", "chat_interrupt"),
     ("chat", "add_discussed", "add_discussed"),
     ("chat", "get_session_entities", "get_session_entities"),
     ("chat", "get_session_tree", "get_session_tree"),
@@ -832,6 +836,12 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("mcp_federation", "tools", "federation_tools"),
     ("mcp_federation", "probe", "federation_probe"),
     ("mcp_federation", "reconnect", "federation_reconnect"),
+
+    // Validate — structured validation: run a bounded command, return a digest
+    ("validate", "test", "validate_test"),
+    ("validate", "check", "validate_check"),
+    ("validate", "git_status", "validate_git_status"),
+    ("validate", "read", "validate_read"),
 ];
 
 /// Handles MCP tool calls by proxying to the REST API.
@@ -846,6 +856,9 @@ pub struct ToolHandler {
     /// MCP Federation registry for external tool dispatch.
     /// Always initialized (empty registry). Servers are added/removed dynamically.
     mcp_registry: crate::mcp_federation::registry::SharedRegistry,
+    /// Structured validation runner (`validate` tool): executes bounded commands
+    /// in-process and digests their output instead of returning the raw bytes.
+    validator: crate::validate::Validator,
 }
 
 impl ToolHandler {
@@ -855,6 +868,7 @@ impl ToolHandler {
             client: http_client,
             collector: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            validator: crate::validate::Validator::from_env(),
         }
     }
 
@@ -867,6 +881,7 @@ impl ToolHandler {
             client: http_client,
             collector: Some(collector),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            validator: crate::validate::Validator::from_env(),
         }
     }
 
@@ -878,6 +893,13 @@ impl ToolHandler {
     /// Get the HTTP client.
     fn http(&self) -> &McpHttpClient {
         &self.client
+    }
+
+    /// Replace the validation runner (tests inject a temp-dir validator so the
+    /// `validate` tool runs without touching the environment).
+    #[cfg(test)]
+    fn set_validator(&mut self, validator: crate::validate::Validator) {
+        self.validator = validator;
     }
 
     /// Resolve mega-tool names to legacy names for backward-compatible routing.
@@ -4587,6 +4609,32 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "chat_usage" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/usage", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "chat_interrupt" => {
+                let id = extract_id(args, "session_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("scope").and_then(|v| v.as_str()) {
+                    body.insert("scope".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("cascade").and_then(|v| v.as_bool()) {
+                    body.insert("cascade".to_string(), json!(v));
+                }
+                let result = http
+                    .post(
+                        &format!("/api/chat/sessions/{}/interrupt", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             "add_discussed" => {
                 let id = extract_id(args, "session_id")?;
                 let entities = args.get("entities").cloned().unwrap_or_else(|| json!([]));
@@ -6746,6 +6794,51 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── Validate: structured validation (in-process, not HTTP) ──
+            // The `validate` tool runs a bounded command in the MCP server
+            // process itself (the machine the agent runs on) and returns a short
+            // digest instead of the raw output; the raw output stays in an
+            // immutable artifact the agent can read back with `validate read`.
+            "validate_test" | "validate_check" | "validate_git_status" => {
+                let action = extract_string(args, "action")?;
+                let cwd = extract_string(args, "cwd")?;
+                let command_args = extract_string_array(args, "command_args").unwrap_or_default();
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(120_000)
+                    .max(1) as u64;
+                let action = crate::validate::Action::parse_action(&action)?;
+                let validator = self.validator.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    validator.run(action, &cwd, &command_args, timeout_ms)
+                })
+                .await
+                .map_err(|e| anyhow!("validate task panicked: {e}"))??;
+                Ok(Some(serde_json::to_value(outcome.response())?))
+            }
+
+            "validate_read" => {
+                let artefact = extract_string(args, "artefact")?;
+                let from_line = args
+                    .get("from_line")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let to_line = args
+                    .get("to_line")
+                    .and_then(|v| v.as_i64())
+                    .map(|t| t.max(0) as usize)
+                    .unwrap_or(from_line + 80);
+                let text = self.validator.read_portion(&artefact, from_line, to_line)?;
+                Ok(Some(json!({
+                    "artefact": artefact,
+                    "from_line": from_line,
+                    "to_line": to_line,
+                    "text": text,
+                })))
+            }
+
             // ── All tools migrated ──────────────────────────────────────
             _ => Ok(None),
         }
@@ -6816,6 +6909,59 @@ mod tests {
         // Create a handler with a dummy HTTP client (no actual server needed for resolution tests)
         let client = McpHttpClient::new("http://localhost:0".to_string(), None);
         ToolHandler::new(client)
+    }
+
+    #[tokio::test]
+    async fn validate_git_status_returns_a_short_digest_through_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "a@b.c"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(repo.join("f.txt"), "v1").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("f.txt"), "v2").unwrap();
+
+        let mut handler = make_handler();
+        handler.set_validator(crate::validate::Validator::new(
+            dir.path().join("artifacts"),
+            vec![dir.path().to_path_buf()],
+        ));
+
+        let value = handler
+            .handle(
+                "validate",
+                Some(json!({"action": "git_status", "cwd": repo.to_str().unwrap()})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["kind"], "git");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["counts"]["modified"], 1);
+
+        // The artifact address the digest printed reads back the exact lines.
+        let artefact = value["artefact"].as_str().unwrap().to_string();
+        let read = handler
+            .handle(
+                "validate",
+                Some(json!({"action": "read", "artefact": artefact, "from_line": 0, "to_line": 5})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read["text"].as_str().unwrap().contains("M f.txt"),
+            "{read:?}"
+        );
     }
 
     #[test]
@@ -7101,6 +7247,48 @@ mod tests {
 
         let client = McpHttpClient::new(base_url.clone(), Some("test-token".to_string()));
         (ToolHandler::new(client), base_url)
+    }
+
+    #[tokio::test]
+    async fn chat_usage_gets_the_session_usage() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat",
+                Some(json!({"action": "usage", "session_id": UUID1})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/chat/sessions/{UUID1}/usage"));
+        assert_eq!(result["body"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn chat_interrupt_posts_default_and_explicit_options() {
+        let (handler, _) = make_http_handler().await;
+        let default = json!({"action": "interrupt", "session_id": UUID1});
+        let explicit = json!({
+            "action": "interrupt",
+            "session_id": UUID1,
+            "scope": "turn",
+            "cascade": true,
+        });
+
+        for (arguments, body) in [
+            (default, json!({})),
+            (explicit, json!({"scope": "turn", "cascade": true})),
+        ] {
+            let result = handler.handle("chat", Some(arguments)).await.unwrap();
+
+            assert_eq!(result["method"], "POST");
+            assert_eq!(
+                result["path"],
+                format!("/api/chat/sessions/{UUID1}/interrupt")
+            );
+            assert_eq!(result["body"], body);
+        }
     }
 
     // -- Provider: the agent door of the `provider` mega-tool (B-M1) -------
@@ -12065,6 +12253,8 @@ mod tests {
             ("update_anchor", "update_chat_anchor"),
             ("remove_anchor", "remove_chat_anchor"),
             ("list_anchored_sessions", "list_anchored_sessions"),
+            ("usage", "chat_usage"),
+            ("interrupt", "chat_interrupt"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();
