@@ -161,12 +161,12 @@ def scan_file(path):
                             else pointer_figures(known, size))
                 else:
                     last_full[title] = turn
-                bodies_exact.setdefault(exact, turn)
-                bodies_loose.setdefault(loose_h, turn)
-                if len(bodies_exact) > 32:
-                    bodies_exact.pop(next(iter(bodies_exact)))
-                if len(bodies_loose) > 32:
-                    bodies_loose.pop(next(iter(bodies_loose)))
+                    bodies_exact.setdefault(exact, turn)
+                    bodies_loose.setdefault(loose_h, turn)
+                    if len(bodies_exact) > 32:
+                        bodies_exact.pop(next(iter(bodies_exact)))
+                    if len(bodies_loose) > 32:
+                        bodies_loose.pop(next(iter(bodies_loose)))
             after += len(kept) * w
             if title in ENRICHMENT_TITLES:
                 after_enr += len(kept) * w

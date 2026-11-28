@@ -320,16 +320,22 @@ impl EnrichmentContext {
     /// Unlike `render()` which wraps in XML tags for user message prepending,
     /// this produces clean markdown sections for direct system prompt inclusion.
     pub fn to_system_prompt_markdown(&self) -> String {
-        if self.sections.is_empty() {
+        Self::render_prompt_sections(&self.sections)
+    }
+
+    fn render_prompt_sections(sections: &[EnrichmentSection]) -> String {
+        if sections.is_empty() {
             return String::new();
         }
 
         let mut output = String::new();
-        if self.has_untrusted_container() {
+        if sections.iter().any(|section| {
+            crate::chat::untrusted::contains_container(&section.content)
+        }) {
             output.push_str(crate::chat::untrusted::UNTRUSTED_PREAMBLE);
             output.push_str("\n\n");
         }
-        for section in &self.sections {
+        for section in sections {
             output.push_str(&format!("## {}\n{}\n\n", section.title, section.content));
         }
         output.trim_end().to_string()
@@ -345,9 +351,16 @@ impl EnrichmentContext {
     /// one could leave an untrusted-data container without its closing tag. What was
     /// left out is said at the end of the block, never dropped in silence.
     pub fn to_system_prompt_markdown_capped(&self, cap: usize) -> String {
-        let full = self.to_system_prompt_markdown();
+        Self::render_capped_sections(&self.sections, cap).0
+    }
+
+    pub(crate) fn render_capped_sections(
+        sections: &[EnrichmentSection],
+        cap: usize,
+    ) -> (String, Vec<usize>) {
+        let full = Self::render_prompt_sections(sections);
         if full.len() <= cap {
-            return full;
+            return (full, (0..sections.len()).collect());
         }
         let preamble_room = crate::chat::untrusted::UNTRUSTED_PREAMBLE.len() + 2;
         let note = |omitted: usize| {
@@ -356,30 +369,31 @@ impl EnrichmentContext {
             )
         };
         // Room for the preamble and the omission note, whatever is kept.
-        let reserve = preamble_room + note(self.sections.len()).len() + 2;
+        let reserve = preamble_room + note(sections.len()).len() + 2;
         let mut room = cap.saturating_sub(reserve);
-        let mut kept: Vec<&EnrichmentSection> = Vec::new();
-        for section in &self.sections {
+        let mut kept = Vec::new();
+        for (index, section) in sections.iter().enumerate() {
             let size = section.title.len() + section.content.len() + 6;
             if size <= room {
                 room -= size;
-                kept.push(section);
+                kept.push(index);
             }
         }
-        let omitted = self.sections.len() - kept.len();
+        let omitted = sections.len() - kept.len();
         let mut output = String::new();
         if kept
             .iter()
-            .any(|s| crate::chat::untrusted::contains_container(&s.content))
+            .any(|&index| crate::chat::untrusted::contains_container(&sections[index].content))
         {
             output.push_str(crate::chat::untrusted::UNTRUSTED_PREAMBLE);
             output.push_str("\n\n");
         }
-        for section in kept {
+        for &index in &kept {
+            let section = &sections[index];
             output.push_str(&format!("## {}\n{}\n\n", section.title, section.content));
         }
         output.push_str(&note(omitted));
-        output
+        (output, kept)
     }
 
     /// True when a section holds a graph-content container (see

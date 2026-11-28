@@ -1945,7 +1945,12 @@ pub(crate) async fn enrichment_for_turn(
     // pays for the same characters again on every later request (GEO-14). The
     // projection changes, never the block: the first delivery stays where it is,
     // and anything that changed materially is delivered in full.
-    let residence = anchor.residence.apply(uuid, &mut ctx.sections);
+    let cap = super::composer::turn_enrichment_cap(window_tokens);
+    let (md, residence) = anchor
+        .residence
+        .apply_with_render(uuid, &mut ctx.sections, |sections| {
+            super::enrichment::EnrichmentContext::render_capped_sections(sections, cap)
+        });
     if residence.pointers > 0 {
         debug!(
             session_id = %session_id,
@@ -1970,8 +1975,6 @@ pub(crate) async fn enrichment_for_turn(
         );
         // Clean markdown prepended to the user message (replaces the old XML-wrapped
         // <enrichment_context> format).
-        let md = ctx
-            .to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
         if !md.is_empty() {
             parts.push(md);
         }
@@ -2759,6 +2762,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
+        if let Some(uuid) = uuid {
+            let residence = super::residence::global();
+            if outcome.compacted {
+                residence.forget(uuid);
+            } else {
+                residence.finish_turn(uuid, outcome.answered);
+            }
+        }
         // PREFIX-CC : le routeur de la session mémorise le préfixe facturé au tour (lectures
         // de cache comprises) — la meilleure estimation du préfixe lu en cache du tour suivant
         // pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens` (Claude Code).
@@ -9841,6 +9852,7 @@ impl ChatManager {
         // Track whether a CompactBoundary was received during this stream turn.
         // When true, we'll rebuild and re-inject project context after the stream ends.
         let mut needs_post_compaction_injection = false;
+        let mut residence_answered = false;
 
         // The ONE expansion of this turn's stored message (`refs::turn`, shared with
         // the agent runtime): the visible text, the `<po-context>` pointers of its
@@ -10664,6 +10676,9 @@ impl ChatManager {
                                 }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
+                                    if matches!(&event, ChatEvent::Result { is_error: false, .. }) {
+                                        residence_answered = true;
+                                    }
                                     if let Some(call) = super::session_grants::observed_call(
                                         super::session_grants::Asker::ClaudeCode,
                                         &event,
@@ -11183,9 +11198,12 @@ impl ChatManager {
         // conversation was given in full is no longer guaranteed to be there, so the
         // residence ledger is dropped and the next turn delivers everything again
         // (GEO-14). A pointer to a message nobody kept would be a lie.
-        if needs_post_compaction_injection {
-            if let Ok(uuid) = Uuid::parse_str(&session_id) {
-                super::residence::global().forget(uuid);
+        if let Some(uuid) = session_uuid {
+            let residence = super::residence::global();
+            if needs_post_compaction_injection {
+                residence.forget(uuid);
+            } else {
+                residence.finish_turn(uuid, residence_answered);
             }
         }
         steps
@@ -23926,6 +23944,9 @@ mod tests {
             [
                 "NEXUS_TOOLS_KEY",
                 "NEXUS_TOOLS_PROFILE",
+                // The session's own directories, for `validate`: the same scope as its
+                // file tools, never a wider one (see `nexus_tools::launch`).
+                "PO_VALIDATE_ROOTS",
                 "TEMP",
                 "TMP",
                 "TMPDIR"

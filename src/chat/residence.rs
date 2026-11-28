@@ -71,6 +71,14 @@ struct SessionLedger {
     /// Turns this session has had enrichment applied for (1-based).
     turn: u32,
     titles: HashMap<String, TitleState>,
+    pending: Vec<RenderedBody>,
+}
+
+#[derive(Debug)]
+struct RenderedBody {
+    title: String,
+    exact: u64,
+    loose: u64,
 }
 
 #[derive(Debug, Default)]
@@ -83,12 +91,18 @@ struct TitleState {
     last_full: Option<u32>,
 }
 
+enum SectionProjection {
+    FullWithoutFingerprint,
+    Full { exact: u64, loose: u64 },
+    Pointer(usize),
+}
+
 /// What one application did, for the log line and for the tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResidenceOutcome {
     /// Sections the pipeline produced.
     pub sections: usize,
-    /// Sections delivered in full.
+    /// Sections kept in full by the renderer.
     pub delivered: usize,
     /// Sections replaced by a bounded pointer.
     pub pointers: usize,
@@ -124,10 +138,11 @@ impl ResidenceLedger {
             .unwrap_or_else(|poison| poison.into_inner());
         let ledger = guard.entry(session).or_default();
         ledger.turn = ledger.turn.saturating_add(1);
+        ledger.pending.clear();
         ledger.turn
     }
 
-    /// Apply the residence policy to the current turn's sections, in place.
+    /// Apply the residence policy to an uncapped sink that confirms delivery.
     ///
     /// Idempotent within a turn: the clock is advanced by [`Self::begin_turn`],
     /// not here, so a second projection of the same turn sees the bodies it just
@@ -136,13 +151,26 @@ impl ResidenceLedger {
     /// opened opens its first one here, so a caller that forgets to is merely
     /// less economical, never wrong.
     pub fn apply(&self, session: Uuid, sections: &mut [EnrichmentSection]) -> ResidenceOutcome {
+        let (_, outcome) = self.apply_with_render(session, sections, |sections| {
+            ((), (0..sections.len()).collect())
+        });
+        self.finish_turn(session, true);
+        outcome
+    }
+
+    /// Project sections and stage the full bodies the renderer kept.
+    /// The renderer returns the original indices of the included sections.
+    /// Only a completed provider turn makes these bodies referenceable.
+    pub(crate) fn apply_with_render<T>(
+        &self,
+        session: Uuid,
+        sections: &mut [EnrichmentSection],
+        render: impl FnOnce(&[EnrichmentSection]) -> (T, Vec<usize>),
+    ) -> (T, ResidenceOutcome) {
         let mut outcome = ResidenceOutcome {
             sections: sections.len(),
             ..Default::default()
         };
-        if sections.is_empty() {
-            return outcome;
-        }
         let mut guard = self
             .sessions
             .lock()
@@ -153,15 +181,16 @@ impl ResidenceLedger {
         }
         let turn = ledger.turn;
 
+        let mut projections = Vec::with_capacity(sections.len());
         for section in sections.iter_mut() {
             let size = section.content.len();
             if size < SECTION_FLOOR {
-                outcome.delivered += 1;
+                projections.push(SectionProjection::FullWithoutFingerprint);
                 continue;
             }
             let body = body_of(&section.content);
             if body.is_empty() {
-                outcome.delivered += 1;
+                projections.push(SectionProjection::FullWithoutFingerprint);
                 continue;
             }
             let exact = fingerprint(&section.title, &body);
@@ -172,7 +201,7 @@ impl ResidenceLedger {
             let loose_seen = state.loose.get(&loose).copied();
             let stale = match state.last_full {
                 None => true,
-                Some(at) => turn.saturating_sub(at) >= REFRESH_EVERY,
+                Some(at) => at == turn || turn.saturating_sub(at) >= REFRESH_EVERY,
             };
 
             let earlier = |seen: Option<u32>| seen.filter(|at| *at < turn);
@@ -185,19 +214,52 @@ impl ResidenceLedger {
 
             match pointer {
                 Some(text) => {
-                    outcome.pointers += 1;
-                    outcome.chars_saved += size.saturating_sub(text.len());
+                    projections.push(SectionProjection::Pointer(size.saturating_sub(text.len())));
                     section.content = text;
                 }
-                None => {
+                None => projections.push(SectionProjection::Full { exact, loose }),
+            }
+        }
+        let (rendered, kept) = render(sections);
+        ledger.pending.clear();
+        for index in kept {
+            match projections[index] {
+                SectionProjection::FullWithoutFingerprint => outcome.delivered += 1,
+                SectionProjection::Full { exact, loose } => {
                     outcome.delivered += 1;
-                    state.last_full = Some(turn);
+                    ledger.pending.push(RenderedBody {
+                        title: sections[index].title.clone(),
+                        exact,
+                        loose,
+                    });
+                }
+                SectionProjection::Pointer(chars_saved) => {
+                    outcome.pointers += 1;
+                    outcome.chars_saved += chars_saved;
                 }
             }
-            remember(&mut state.exact, exact, turn);
-            remember(&mut state.loose, loose, turn);
         }
-        outcome
+        (rendered, outcome)
+    }
+
+    /// Remember the full sections of a turn retained by the provider.
+    pub(crate) fn finish_turn(&self, session: Uuid, answered: bool) {
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(ledger) = guard.get_mut(&session) else {
+            return;
+        };
+        let rendered = std::mem::take(&mut ledger.pending);
+        if answered {
+            for body in rendered {
+                let title = ledger.titles.entry(body.title).or_default();
+                title.last_full = Some(ledger.turn);
+                remember(&mut title.exact, body.exact, ledger.turn);
+                remember(&mut title.loose, body.loose, ledger.turn);
+            }
+        }
     }
 
     /// Forget a session: its next turn delivers everything in full again. Called
@@ -417,6 +479,76 @@ mod tests {
             "the pointer says what differs: {}",
             b[0].content
         );
+    }
+
+    #[test]
+    fn elided_figures_do_not_count_as_an_exact_delivery() {
+        let ledger = ResidenceLedger::new();
+        let session = Uuid::new_v4();
+        let original = wip();
+        let updated = original.replace("99/110  (90%)", "100/110  (91%)");
+
+        ledger.begin_turn(session);
+        let mut first = [section("Work In Progress", wrapped("a1", &original))];
+        assert_eq!(ledger.apply(session, &mut first).delivered, 1);
+
+        for nonce in ["a2", "a3"] {
+            ledger.begin_turn(session);
+            let mut next = [section("Work In Progress", wrapped(nonce, &updated))];
+            assert_eq!(ledger.apply(session, &mut next).pointers, 1);
+            assert!(next[0]
+                .content
+                .contains("same block as turn 1, only figures changed"));
+        }
+    }
+
+    #[test]
+    fn a_section_left_out_by_the_cap_cannot_be_a_reference_target() {
+        use crate::chat::enrichment::EnrichmentContext;
+
+        let ledger = ResidenceLedger::new();
+        let session = Uuid::new_v4();
+        let body = "full block ".repeat(160);
+        let mut first = [section("Work In Progress", &body)];
+        ledger.begin_turn(session);
+        let (sent, initial) = ledger.apply_with_render(session, &mut first, |sections| {
+            EnrichmentContext::render_capped_sections(sections, 1024)
+        });
+        assert!(sent.contains("left out"));
+        assert!(!sent.contains(body.trim_end()));
+        assert_eq!(initial.delivered, 0);
+        ledger.finish_turn(session, true);
+
+        let mut second = [section("Work In Progress", &body)];
+        ledger.begin_turn(session);
+        let (sent, projected) = ledger.apply_with_render(session, &mut second, |sections| {
+            EnrichmentContext::render_capped_sections(sections, 4096)
+        });
+        assert_eq!(projected.pointers, 0, "a capped section was never sent");
+        assert!(sent.contains(body.trim_end()));
+    }
+
+    #[test]
+    fn an_unanswered_turn_cannot_be_a_reference_target() {
+        let ledger = ResidenceLedger::new();
+        let session = Uuid::new_v4();
+        let body = wip();
+        let render = |_: &[EnrichmentSection]| ((), vec![0]);
+
+        ledger.begin_turn(session);
+        let mut stopped = [section("Work In Progress", &body)];
+        assert_eq!(ledger.apply_with_render(session, &mut stopped, render).1.delivered, 1);
+        ledger.finish_turn(session, false);
+
+        ledger.begin_turn(session);
+        let mut answered = [section("Work In Progress", &body)];
+        assert_eq!(ledger.apply_with_render(session, &mut answered, render).1.pointers, 0);
+        ledger.finish_turn(session, true);
+
+        ledger.begin_turn(session);
+        let mut repeated = [section("Work In Progress", &body)];
+        assert_eq!(ledger.apply_with_render(session, &mut repeated, render).1.pointers, 1);
+        assert!(repeated[0].content.contains("unchanged since turn 2"));
     }
 
     #[test]
