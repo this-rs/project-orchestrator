@@ -164,3 +164,209 @@ async fn live_frames_carry_the_forwarding_time_in_seconds() {
     );
     assert_eq!(frame["seq"], 0, "{frame}");
 }
+
+// MCP mutations must appear on the same sockets used by the browser.
+mod mcp_realtime {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::{SinkExt, StreamExt};
+    use nexus_claude::agent::{AgentEvent, StopReason};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::chat::agent_runtime::fake::FakeProvider;
+    use crate::chat::config::{ChatConfig, ProviderPath};
+    use crate::chat::manager::ChatManager;
+    use crate::events::{nats_broker_test::TestBroker, EventBus, HybridEmitter, NatsEmitter};
+    use crate::mcp::{handlers::ToolHandler, McpHttpClient};
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::test_helpers::{mock_app_state_with_graph, server_state_with_chat};
+
+    use super::{Client, WAIT};
+
+    async fn through_frame(
+        ws: &mut Client,
+        description: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut frames = Vec::new();
+        tokio::time::timeout(WAIT, async {
+            while let Some(frame) = ws.next().await {
+                if let Message::Text(text) = frame.unwrap() {
+                    let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                    let matched = predicate(&value);
+                    frames.push(value);
+                    if matched {
+                        return;
+                    }
+                }
+            }
+            panic!("socket closed waiting for {description}: {frames:?}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {description} on the same socket: {frames:?}"));
+        frames
+    }
+
+    async fn connect(addr: std::net::SocketAddr, sid: &str) -> Client {
+        let url = format!("ws://{addr}/ws/chat/{sid}?last_event=999999999999999");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(Message::text("ready")).await.unwrap();
+        through_frame(&mut ws, "replay_complete", |v| {
+            v["type"] == "replay_complete"
+        })
+        .await;
+        ws
+    }
+
+    fn finish_turn(provider: &FakeProvider) {
+        provider.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: Some("test-mcp-chat".into()),
+            structured_output: None,
+            error: None,
+        });
+    }
+
+    fn turn_finished(frame: &Value) -> bool {
+        frame["type"] == "streaming_status" && frame["is_streaming"] == false
+    }
+
+    async fn mcp_sends_to_dormant_conversation(nats: Option<Arc<NatsEmitter>>) {
+        let graph = Arc::new(MockGraphStore::new());
+        let provider = FakeProvider::new();
+        let event_bus = Arc::new(HybridEmitter::new(Arc::new(EventBus::default())));
+        let config = ChatConfig {
+            provider_path: ProviderPath::Agent,
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            mock_app_state_with_graph(graph.clone()).meili,
+            config,
+        )
+        .with_provider_source(Arc::new(provider.clone()))
+        .with_claude_cli_present(true)
+        .with_event_emitter(event_bus.clone());
+        let manager = Arc::new(match &nats {
+            Some(nats) => manager.with_nats(Arc::clone(nats)),
+            None => manager,
+        });
+        let mut state = server_state_with_chat(manager.clone(), graph).await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.event_bus = event_bus.clone();
+        state_mut.nats_emitter = nats;
+        let router = crate::api::create_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let (mut events, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws/events?entity_types=chat_session"
+        ))
+        .await
+        .unwrap();
+        events.send(Message::text("ready")).await.unwrap();
+        through_frame(&mut events, "event socket authentication", |v| {
+            v["type"] == "auth_ok"
+        })
+        .await;
+        // The handler finishes subscribing just after sending the handshake frame.
+        tokio::time::timeout(WAIT, async {
+            while event_bus.subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the event socket is subscribed before the MCP call");
+
+        let mcp = ToolHandler::new(McpHttpClient::new(format!("http://{addr}"), None));
+        let cwd = tempfile::tempdir().unwrap();
+        let created = mcp
+            .handle(
+                "chat",
+                Some(json!({"action": "send_message", "message": "First MCP turn", "cwd": cwd.path()})),
+            )
+            .await
+            .unwrap();
+        let sid = created["session_id"].as_str().expect("MCP session id");
+        let created_frames = through_frame(&mut events, "MCP conversation creation", |v| {
+            v["entity_type"] == "chat_session" && v["action"] == "created"
+        })
+        .await;
+        assert_eq!(created_frames.last().unwrap()["entity_id"], sid);
+        let mut open = connect(addr, sid).await;
+        finish_turn(&provider);
+        through_frame(&mut open, "first turn's completion", turn_finished).await;
+
+        assert_eq!(manager.idle_cleanup_pass(Duration::ZERO).await, [sid]);
+        assert!(!manager.is_session_active(sid).await);
+        let mut dormant = connect(addr, sid).await;
+
+        let sent = mcp
+            .handle(
+                "chat",
+                Some(json!({"action": "send_message", "session_id": sid, "message": "MCP follow-up"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["session_id"], sid);
+        provider.state.push(AgentEvent::Text {
+            text: "MCP answer".into(),
+            seq: None,
+            parent: None,
+        });
+        finish_turn(&provider);
+
+        let (open_frames, dormant_frames) = tokio::join!(
+            through_frame(&mut open, "follow-up on the original socket", turn_finished),
+            through_frame(
+                &mut dormant,
+                "follow-up on the dormant socket",
+                turn_finished
+            ),
+        );
+        for frames in [open_frames, dormant_frames] {
+            let turn: Vec<_> = frames
+                .iter()
+                .filter(|frame| {
+                    frame["content"] == "MCP follow-up"
+                        || frame["content"] == "MCP answer"
+                        || frame["type"] == "result"
+                })
+                .map(|frame| frame["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                turn,
+                ["user_message", "assistant_text", "result"],
+                "{frames:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_follow_up_reaches_open_and_dormant_chat_sockets_without_nats() {
+        mcp_sends_to_dormant_conversation(None).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_follow_up_reaches_open_and_dormant_chat_sockets_with_nats() {
+        let broker = TestBroker::start().await;
+        let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        mcp_sends_to_dormant_conversation(Some(nats)).await;
+    }
+}
