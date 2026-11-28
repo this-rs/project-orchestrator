@@ -2,14 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main, "integ/**"]
+    branches: [main, "integ/**", "consolidation/**"]
   pull_request:
     # integ/<lot>: integration branches. A lot's PRs merge there after review on the FAST tier
     # (lint, security, unit, integration); the lot reaches main through ONE PR integ/<lot> -> main,
     # which runs everything (build, API, coverage and the parity matrix). See the FULL-tier `if`.
     # ready_for_review: marking a draft PR into main as ready is what starts its FULL tier.
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main, "integ/**"]
+    branches: [main, "integ/**", "consolidation/**"]
   # Cold run: nothing restored from any cache (see "Cache policy" below).
   schedule:
     - cron: "17 3 * * *"
@@ -356,6 +356,48 @@ jobs:
       - name: storage-boundary — pilote hors adaptateur
         run: cargo xtask storage-boundary --strict
 
+      # ts-dto : le contrat REST front ↔ back (objectif O1). En CI le checkout
+      # frontend est ABSENT du disque (dépôt séparé) : le portillon parse et
+      # engendre quand même les 25 types (garde-fou contre un crash du
+      # parseur) puis sort 0 — comme path-pins. Sur une machine de dev avec le
+      # frontend en vis-à-vis, il compare le généré au commité et sort 1 en
+      # nommant le fichier et le champ qui dérivent.
+      - name: ts-dto — les DTO TypeScript suivent les types serde
+        run: cargo xtask ts-dto --check
+
+      # ----------------------------------------------------------------------
+      # Deux portillons de la branche de consolidation. Ils vivent dans le job
+      # « Lint & Format », qui est déjà un check requis sur main : ils sont donc
+      # bloquants par héritage, sans toucher à la protection de branche.
+      #
+      # containment : la branche doit CONTENIR origin/main. C'est la règle 2 de
+      # CONSOLIDATION.md — main redescend dans la branche chaque semaine, jamais
+      # l'inverse. Sans cette étape, une branche de plusieurs mois dérive sans
+      # que personne ne le voie et n'est plus fusible le jour où elle marche :
+      # c'est exactement ce qui est arrivé à `consolidation/obrain`.
+      #
+      # path-pins : les voisins (this, obrain, atelier) sont épinglés dans
+      # pins.toml. En CI ils sont ABSENTS du disque : le portillon le dit et sort
+      # 0. Ce qu'il vérifie ici reste utile — qu'aucune dépendance `path = "..…"`
+      # ne référence un dépôt non épinglé. Il devient pleinement actif sur une
+      # machine de développement, où les voisins existent.
+      - name: containment — la branche contient main
+        run: cargo xtask containment
+      - name: path-pins — les voisins sont à leur commit épinglé
+        run: cargo xtask path-pins
+      # Cliquet de la migration Neo4j → obrain (docs/migration/GATES.md, G2-G3) :
+      # un trait de contrat porté à la main ne peut pas perdre son port, et le
+      # backend par défaut reste neo4j tant que la migration n'est pas finie.
+      - name: migration-gate — les traits portés ne régressent pas, le défaut reste neo4j
+        # Rend son verdict même si une étape précédente a échoué. La base est la
+        # cible de la PR (ou le commit précédent sur un push) : une ligne retirée
+        # du cliquet depuis cette base est refusée. Vide (schedule, dispatch) =
+        # pas de comparaison. fetch-depth: 0 rend la base résoluble.
+        if: ${{ !cancelled() }}
+        env:
+          GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: cargo xtask migration-gate --strict --base "$GATE_BASE"
+
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
       # nouvelle chaine d'outils dans un depot Rust.
@@ -691,6 +733,104 @@ jobs:
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
             --test file_paths --test neural_routing_sampler --test note_sweep \
             --test neo4j_integer_fidelity
+
+  # ==========================================================================
+  # Obrain backend — the one job that COMPILES AND RUNS the `obrain-backend`
+  # feature. Without it nothing executes src/obrain/: clippy --all-features
+  # compiles it, nextest runs the default features, and the assertion that counts
+  # the refused methods (tests/obrain_backend.rs) would protect nothing.
+  #
+  # No service: every base is a temporary directory, and the obrain conformance
+  # checks (every `obrain_*` module of tests/store_conformance.rs: one per ported
+  # domain, plus `obrain_transverse` for the cross-domain checks) need neither Neo4j
+  # nor Meilisearch (the `mock_*`/`neo4j_*` halves run in the jobs that have them).
+  # The filter was `obrain_project::` alone (10 tests): widened to `obrain_` (101
+  # tests measured on 23/11/2026: 97 per-domain, plus the 4 cross-domain checks
+  # of `obrain_transverse`) so the obrain leg of the conformance gate
+  # (docs/migration/GATES.md, G4) actually runs.
+  # The kill -9 and inter-process tests re-execute this test binary as their child.
+  # ==========================================================================
+  obrain-backend:
+    name: Obrain backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-obrain-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: false
+
+      - name: Run the obrain backend tests and its share of the conformance suite
+        run: |
+          cargo test --features obrain-backend --test obrain_backend --test store_conformance \
+            --example obrain_mesures -- obrain_ with_the_feature an_unknown
+
+      # The task-and-step portage suite had no job at all, and it was measured
+      # red for a while without anybody seeing it (16/11/2026: three tests,
+      # including one that asserted the full flush per blob-sized write that
+      # obrain #172/#175 and the removal of `flush_complet` had just retired).
+      # A portage suite nothing runs is worse than no suite: it reads as
+      # coverage. No filter: every test of the file runs, and the compilation is
+      # already warm from the step above.
+      # `obrain_dates` rides along: it proves a migrated `ZonedDatetime` is READ
+      # (not replaced by `Utc::now()`), and the two suites are the same kind of
+      # guard — a portage behaviour nothing else asserts.
+      # THREE invocations, not one. In `cargo test <FILTER> --lib --test A --test B`
+      # the positional FILTER applies to EVERY target, so `storage::migrator`
+      # filtered out all of `obrain_taches` and `obrain_dates` (measured on
+      # 7beae326: 0 run, the rest "filtered out") while the step stayed green.
+      # Each step also checks that the tests really RAN: a green run that ran
+      # nothing is the failure this step exists to prevent.
+      - name: Run the migrator unit tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --lib storage::migrator 2>&1 | tee /tmp/migrator.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/migrator.log
+      # Fail-closed publication components (storage::publish, not wired into startup): the
+      # positional filter of the step above does not match them, so they get their own step.
+      # Update the expected count below when tests are added or removed. The filter is a
+      # SUBSTRING of the test path (it would also match e.g. `storage::publisher`).
+      - name: Run the publication component tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --lib storage::publish 2>&1 | tee /tmp/publish.log
+          # Exact count: a silently filtered or removed test fails the step.
+          grep -E 'test result: ok\. 92 passed; 0 failed' /tmp/publish.log
+      - name: Run the task-and-step portage tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --test obrain_taches 2>&1 | tee /tmp/taches.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/taches.log
+      - name: Run the date portage tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --test obrain_dates 2>&1 | tee /tmp/dates.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/dates.log
+
+      # Unit tests inside src/obrain are not included by the integration-test
+      # binaries above, nor by the default-feature unit test job. The auth test
+      # depends on wall-clock scheduling; re-enable it after stabilizing it.
+      - name: Run the obrain library unit tests
+        run: |
+          set -o pipefail
+          cargo test --features obrain-backend --lib obrain:: -- \
+            --skip obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou \
+            2>&1 | tee /tmp/obrain-lib.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed' /tmp/obrain-lib.log
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

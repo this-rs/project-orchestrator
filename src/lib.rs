@@ -39,6 +39,9 @@ pub mod meilisearch;
 pub mod neo4j;
 pub mod neurons;
 pub mod notes;
+/// The obrain storage backend — only with the `obrain-backend` feature.
+#[cfg(feature = "obrain-backend")]
+pub mod obrain;
 pub mod orchestrator;
 pub mod parser;
 pub mod pipeline;
@@ -231,6 +234,9 @@ pub struct YamlConfig {
     /// Storage backend selection (optional — which adapter builds the stores).
     #[serde(default)]
     pub storage: StorageYamlConfig,
+    /// Event transport section (optional — which transport carries chat events).
+    #[serde(default)]
+    pub events: EventsYamlConfig,
     /// Log file section (optional — persistent, rotated, secret-masked traces).
     #[serde(default)]
     pub log: logging::LogYamlConfig,
@@ -254,6 +260,78 @@ pub struct StorageYamlConfig {
     /// Which storage backend builds the stores. Absent ⇒
     /// [`crate::storage::DEFAULT_BACKEND`].
     pub backend: Option<String>,
+    /// Directory of the obrain base, for `backend: obrain`. No default: the
+    /// `obrain` backend refuses to start without it rather than guess a
+    /// location (a guessed path is how a test binary once opened a live base).
+    pub obrain_path: Option<String>,
+    /// Whether the `obrain` backend may CREATE its base when the directory holds
+    /// none. Absent or false: an absent or empty directory is refused, so that a
+    /// typo in `obrain_path` cannot become a new empty base.
+    pub obrain_create: Option<bool>,
+    /// Startup migration of the storage backend (optional — how PO switches
+    /// from the source backend to a requested target).
+    pub migration: MigrationYamlConfig,
+}
+
+/// Startup storage-migration configuration. Each flag has an environment
+/// variable that wins over the YAML; a set but unreadable value is a named boot
+/// error ([`strict_env_flag_over`]);
+/// see [`crate::storage::migrate`] for what each one guards.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct MigrationYamlConfig {
+    /// Stay on the source backend even if a target is requested: the rollback.
+    /// Priority: env var (STORAGE_MIGRATION_ROLLBACK) > YAML > false.
+    pub rollback: Option<bool>,
+    /// Run the migration against a disposable COPY of the source, never the
+    /// source itself. Priority: env var (STORAGE_MIGRATION_DISPOSABLE) > YAML
+    /// > false.
+    pub disposable: Option<bool>,
+    /// The source backend whose data must be carried over to the requested
+    /// target (only `"default"` today). Unset = no migration: the requested
+    /// backend is built as is. The per-type (nodes + links) source == target
+    /// verification is NOT configurable: it always gates the switch.
+    /// Priority: env var (STORAGE_MIGRATION_FROM) > YAML > unset.
+    pub from: Option<String>,
+}
+
+/// Resolved startup-migration configuration (see [`MigrationYamlConfig`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMigrationConfig {
+    /// Stay on the source backend: the rollback demanded by configuration.
+    pub rollback: bool,
+    /// Migrate a disposable copy, never the source.
+    pub disposable: bool,
+    /// The source backend to migrate from; `None` = no migration.
+    pub from: Option<String>,
+}
+
+impl Default for StorageMigrationConfig {
+    /// The defaults when nothing is configured: no rollback, no disposable
+    /// copy, no migration.
+    fn default() -> Self {
+        Self {
+            rollback: false,
+            disposable: false,
+            from: None,
+        }
+    }
+}
+
+/// Event transport selection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EventsYamlConfig {
+    /// Which transport carries chat events between instances. Absent => the
+    /// default (`nats`): [`crate::events::chat_transport::DEFAULT_TRANSPORT`].
+    pub transport: Option<String>,
+    /// Journal file path for the `journal` transport. Absent => the default:
+    /// [`crate::events::chat_transport::DEFAULT_JOURNAL_PATH`].
+    pub journal_path: Option<String>,
+    /// Journal retention bound for the `journal` transport: how many chat
+    /// events the journal keeps before truncating the oldest. Absent =>
+    /// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`].
+    pub max_events: Option<usize>,
 }
 
 /// MCP Federation configuration section.
@@ -557,6 +635,51 @@ pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
 /// ([`parse_env_flag`]): an unknown value falls back to the YAML.
 pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
     env.and_then(parse_env_flag).or(yaml)
+}
+
+/// A flag whose environment variable `name` wins over the YAML, STRICTLY: set
+/// but unreadable (not one of the [`parse_env_flag`] spellings) is a named boot
+/// error instead of a silent fallback to the YAML. For flags whose silent loss
+/// is dangerous (the migration rollback).
+pub(crate) fn strict_env_flag_over(name: &str, yaml: Option<bool>) -> Result<Option<bool>> {
+    match std::env::var(name) {
+        Err(_) => Ok(yaml),
+        // Present but EMPTY (`X=${X:-}` of a compose file) is absent, not an
+        // error: it says nothing. A non-empty unreadable value stays an error.
+        Ok(raw) if raw.trim().is_empty() => Ok(yaml),
+        Ok(raw) => match parse_env_flag(&raw) {
+            Some(v) => Ok(Some(v)),
+            None => anyhow::bail!(
+                "invalid {name}={raw:?}: accepted values: true/false, 1/0, yes/no, on/off"
+            ),
+        },
+    }
+}
+
+/// Resolve the journal retention bound for the `journal` chat transport.
+///
+/// Priority: `EVENTS_MAX_EVENTS` (strict — a set-but-unparseable, negative, or
+/// zero value fails the boot and names the value) > YAML `events.max_events` >
+/// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]. The env var is the
+/// only source that can carry a value `usize` cannot represent (a negative or a
+/// non-numeric string), so it is validated here instead of being silently
+/// dropped; the YAML value is typed `Option<usize>` and its zero/negative cases
+/// are rejected at boot in [`start_server`] (negative fails serde first).
+fn resolve_events_max_events(yaml_max: Option<usize>) -> anyhow::Result<usize> {
+    const ACCEPTED: &str = "accepted values: a whole number >= 1 (e.g. 100000)";
+    let raw = match std::env::var("EVENTS_MAX_EVENTS") {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Ok(yaml_max.unwrap_or(crate::events::chat_transport::DEFAULT_MAX_EVENTS));
+        }
+    };
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("invalid EVENTS_MAX_EVENTS={raw:?}: not a positive integer ({ACCEPTED})")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("invalid EVENTS_MAX_EVENTS={raw:?}: must be at least 1 ({ACCEPTED})");
+    }
+    Ok(parsed)
 }
 
 /// The startup warning for a configured Obscura executable (`OBSCURA_BIN` / `chat.obscura_path`)
@@ -1071,6 +1194,34 @@ pub struct Config {
     /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
     pub storage_backend: String,
 
+    /// Directory of the obrain base, read only by the `obrain` storage backend.
+    /// Priority: env var (STORAGE_OBRAIN_PATH) > YAML (storage.obrain_path) >
+    /// None, in which case that backend refuses to start. Stored unexpanded.
+    pub storage_obrain_path: Option<String>,
+
+    /// Startup storage-migration configuration (rollback / disposable copy /
+    /// per-type verification). See [`crate::storage::migrate`].
+    pub storage_migration: StorageMigrationConfig,
+
+    /// Whether the obrain backend may create its base. Priority: env var
+    /// (STORAGE_OBRAIN_CREATE=true|1) > YAML (storage.obrain_create) > false.
+    pub storage_obrain_create: bool,
+
+    /// Chat transport selection: which transport carries chat events between
+    /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
+    /// > default ("nats").
+    pub events_transport: String,
+
+    /// Journal file path for the `journal` chat transport. Priority: env var
+    /// (EVENTS_JOURNAL_PATH) > YAML (events.journal_path) > default.
+    pub events_journal_path: Option<String>,
+
+    /// Journal retention bound for the `journal` chat transport: how many chat
+    /// events the journal keeps before truncating the oldest. Priority: env var
+    /// (EVENTS_MAX_EVENTS) > YAML (events.max_events) > default
+    /// ([`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]).
+    pub events_max_events: usize,
+
     /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
     pub log: logging::LogSettings,
 
@@ -1097,6 +1248,36 @@ impl Config {
         let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path)?;
 
         // 2. Build Config with env var overrides
+
+        // Journal retention bound: the env var is strict (a set-but-unparseable,
+        // negative, or zero value fails the boot naming the value), else YAML,
+        // else the default. Resolved here so `from_yaml_and_env` returns an Err
+        // instead of silently dropping a bad `EVENTS_MAX_EVENTS`.
+        let events_max_events = resolve_events_max_events(yaml.events.max_events)?;
+
+        // Startup migration flags (env var > YAML > defaults: no rollback, no
+        // disposable copy, no source). The env vars are STRICT: a set but
+        // unreadable value (`STORAGE_MIGRATION_ROLLBACK=ture`) fails the boot by
+        // name — a rollback silently ignored would switch the backend anyway.
+        let storage_migration = StorageMigrationConfig {
+            rollback: strict_env_flag_over(
+                "STORAGE_MIGRATION_ROLLBACK",
+                yaml.storage.migration.rollback,
+            )?
+            .unwrap_or(false),
+            disposable: strict_env_flag_over(
+                "STORAGE_MIGRATION_DISPOSABLE",
+                yaml.storage.migration.disposable,
+            )?
+            .unwrap_or(false),
+            from: std::env::var("STORAGE_MIGRATION_FROM")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or(yaml.storage.migration.from.clone())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        };
+
         Ok(Self {
             setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
@@ -1217,6 +1398,26 @@ impl Config {
                     .backend
                     .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
             }),
+            // Obrain base directory (env var > YAML > None ⇒ the obrain backend refuses)
+            storage_obrain_path: std::env::var("STORAGE_OBRAIN_PATH")
+                .ok()
+                .or(yaml.storage.obrain_path),
+            // Startup migration flags (env var > YAML > defaults). Rollback and
+            // disposable default to false; the per-type verification gate to true.
+            storage_migration,
+            storage_obrain_create: match std::env::var("STORAGE_OBRAIN_CREATE") {
+                Ok(v) => v == "true" || v == "1",
+                Err(_) => yaml.storage.obrain_create.unwrap_or(false),
+            },
+            events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
+                yaml.events
+                    .transport
+                    .unwrap_or_else(|| crate::events::chat_transport::DEFAULT_TRANSPORT.to_string())
+            }),
+            events_journal_path: std::env::var("EVENTS_JOURNAL_PATH")
+                .ok()
+                .or(yaml.events.journal_path),
+            events_max_events,
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
@@ -1606,6 +1807,22 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .ingress
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid ingress config: {e}"))?;
+    // Fail-fast: reject an unknown events.transport before any expensive init.
+    let transport_kind = events::chat_transport::select_transport(&config.events_transport)
+        .map_err(|e| anyhow::anyhow!("Invalid events config: {e}"))?;
+    // Fail-fast: reject an absurd journal retention (0, or a negative number that
+    // could not even be parsed into `usize`) before any expensive init, naming the
+    // value and the accepted values instead of failing late inside
+    // `JournalTransport::open`. The env var was already validated strictly at
+    // config load; this catches a YAML `events.max_events: 0` (a negative YAML
+    // value fails serde before it ever reaches a `Config`).
+    if config.events_max_events == 0 {
+        anyhow::bail!(
+            "invalid events.max_events={}: must be a whole number >= 1 \
+             (accepted values: a whole number >= 1, e.g. 100000)",
+            config.events_max_events
+        );
+    }
     if config.ingress.enabled {
         tracing::info!(
             max_body_bytes = config.ingress.max_body_bytes,
@@ -1625,9 +1842,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("Remote MCP transport disabled (opt-in) — /mcp routes not mounted");
     }
 
-    // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    // Initialize application state. Only the default backend actually connects
+    // to Neo4j/Meilisearch here; the in-memory and obrain backends touch neither
+    // (each says so itself), so the "Connecting…" lines would lie for them.
+    if config.storage_backend == crate::storage::DEFAULT_BACKEND {
+        tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+        tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    }
 
     boot.start("databases");
     let state = AppState::new(config.clone()).await.inspect_err(|e| {
@@ -1683,6 +1904,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     event_bus.start_nats_bridge();
     // Same for graph events (events.graph): cross-instance graph mutations.
     event_bus.start_graph_nats_bridge();
+
+    // Build the chat transport selected above. The `nats` kind reuses the CRUD
+    // NATS emitter (current behaviour); `journal` and `memory` are single-
+    // instance transports that make the choice explicit and decouple chat from
+    // the CRUD event bus.
+    let chat_transport: Option<Arc<dyn events::ChatTransport>> =
+        events::chat_transport::build_chat_transport(
+            transport_kind,
+            nats_emitter.clone(),
+            config.events_journal_path.as_deref(),
+            config.events_max_events,
+        )?;
 
     // Extract neural_router, trajectory_collector, trajectory_store
     // and mcp_registry before state is moved into Orchestrator
@@ -2087,8 +2320,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             // The gate READS the quota registry the router and the sessions share.
             .with_quota(quota_registry.clone()),
         ));
-        if let Some(ref nats) = nats_emitter {
-            cm = cm.with_nats(nats.clone());
+        if let Some(ref transport) = chat_transport {
+            cm = cm.with_nats(transport.clone());
         }
         if let Some(ref tc) = *trajectory_collector.read().unwrap() {
             cm = cm.with_trajectory_collector(tc.clone());
@@ -2547,7 +2780,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         watcher,
         chat_manager,
         event_bus,
-        nats_emitter,
+        nats_emitter: chat_transport,
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),
@@ -3012,6 +3245,18 @@ mod anonymous_warning_tests {
     }
 }
 
+/// A configuration read the way the boot reads it, under the lock of the
+/// tests that set configuration env vars (`config_tests::ENV_LOCK`): without
+/// it, a parallel test setting `STORAGE_MIGRATION_ROLLBACK=ture` fails this
+/// read at random.
+#[cfg(test)]
+pub(crate) fn config_for_test(file: &std::path::Path) -> Config {
+    let _env = config_tests::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Config::from_yaml_and_env(Some(file)).unwrap()
+}
+
 #[cfg(test)]
 mod config_tests {
     use super::*;
@@ -3027,7 +3272,7 @@ mod config_tests {
     /// `test_explicit_config_path_bypasses_auto_detect` reads it back fails the
     /// latter with `left: 7777, right: 1111`. Poison-tolerant on purpose: a
     /// panicking test must not turn every later one into a spurious failure.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_yaml_config_loading() {
@@ -3408,6 +3653,40 @@ server:
     // ========================================================================
     // New auth config format tests
     // ========================================================================
+
+    /// The journal retention env var is strict: a set-but-absurd value (0,
+    /// negative, non-numeric) fails the boot naming the value and the accepted
+    /// values, instead of being silently dropped onto the YAML/default.
+    #[test]
+    fn test_events_max_events_resolution_is_strict() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+
+        // Unset: the YAML value wins, else the default.
+        assert_eq!(
+            resolve_events_max_events(None).unwrap(),
+            crate::events::chat_transport::DEFAULT_MAX_EVENTS
+        );
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 42);
+
+        // A valid env var overrides the YAML.
+        std::env::set_var("EVENTS_MAX_EVENTS", "7");
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 7);
+
+        // Absurd values fail, naming the value and the accepted values.
+        for bad in ["0", "-5", "abc", "1.5"] {
+            std::env::set_var("EVENTS_MAX_EVENTS", bad);
+            let msg = resolve_events_max_events(Some(42)).unwrap_err().to_string();
+            assert!(
+                msg.contains("EVENTS_MAX_EVENTS"),
+                "var name missing: {msg:?}"
+            );
+            assert!(msg.contains(bad), "value {bad:?} missing: {msg:?}");
+            assert!(msg.contains(">= 1"), "accepted values missing: {msg:?}");
+        }
+
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+    }
 
     #[test]
     fn test_new_auth_format_root_account_only() {
@@ -3902,6 +4181,79 @@ chat:
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
     }
 
+    #[test]
+    fn storage_migration_flags_resolve_env_over_yaml_over_defaults() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
+        std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
+        std::env::remove_var("STORAGE_MIGRATION_FROM");
+
+        // Defaults when nothing is configured: no rollback, no disposable, no source.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        std::fs::write(&file_path, "storage:\n  backend: obrain\n").unwrap();
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(!config.storage_migration.rollback);
+        assert!(!config.storage_migration.disposable);
+        assert_eq!(config.storage_migration.from, None);
+
+        // YAML wins over the defaults.
+        std::fs::write(
+            &file_path,
+            "storage:\n  backend: obrain\n  migration:\n    rollback: true\n    \
+             disposable: true\n    from: default\n",
+        )
+        .unwrap();
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(config.storage_migration.rollback);
+        assert!(config.storage_migration.disposable);
+        assert_eq!(config.storage_migration.from.as_deref(), Some("default"));
+
+        // Environment wins over YAML.
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "false");
+        std::env::set_var("STORAGE_MIGRATION_FROM", "");
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(!config.storage_migration.rollback);
+        assert!(!config.storage_migration.disposable);
+        assert_eq!(
+            config.storage_migration.from.as_deref(),
+            Some("default"),
+            "an empty env value is unset: the YAML decides"
+        );
+
+        // An unreadable flag is a named boot error, never a silent fallback to
+        // the YAML (here: rollback: true would be silently kept or lost).
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "ture");
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("STORAGE_MIGRATION_ROLLBACK") && err.contains("ture"),
+            "{err}"
+        );
+        // Present but EMPTY (`${X:-}` in a compose file) is absent: the YAML
+        // (rollback: true) decides, nothing fails.
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "  ");
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert!(
+            config.storage_migration.rollback,
+            "empty = absent: the YAML wins"
+        );
+        assert!(config.storage_migration.disposable);
+        std::env::set_var("STORAGE_MIGRATION_ROLLBACK", "false");
+        std::env::set_var("STORAGE_MIGRATION_DISPOSABLE", "oui");
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STORAGE_MIGRATION_DISPOSABLE"), "{err}");
+
+        std::env::remove_var("STORAGE_MIGRATION_ROLLBACK");
+        std::env::remove_var("STORAGE_MIGRATION_DISPOSABLE");
+        std::env::remove_var("STORAGE_MIGRATION_FROM");
+    }
+
     /// A duplicate instance must die on the port BEFORE any initialization.
     ///
     /// Regression for the night launchd's KeepAlive relaunched the service 443
@@ -3917,8 +4269,7 @@ chat:
         let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = holder.local_addr().unwrap().port();
 
-        let mut config =
-            Config::from_yaml_and_env(Some(Path::new("/nonexistent/po-bind-first.yaml"))).unwrap();
+        let mut config = crate::config_for_test(Path::new("/nonexistent/po-bind-first.yaml"));
         // Set explicitly rather than through YAML/env: other tests in this
         // module mutate the environment concurrently.
         config.setup_completed = true;
@@ -3972,6 +4323,7 @@ chat:
     /// silently replaced by defaults (which would look like a first run).
     #[test]
     fn from_yaml_and_env_errors_on_malformed_yaml() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("config.yaml");
         std::fs::write(&file_path, "setup_completed: [oops\n").unwrap();

@@ -414,7 +414,7 @@ impl Neo4jClient {
               AND ($project_id IS NULL OR s.project_id = $project_id OR s.project_id IS NULL)
               AND ($project_id IS NOT NULL OR s.project_id IS NULL)
             RETURN s
-            ORDER BY s.energy DESC, s.name ASC
+            ORDER BY s.energy DESC, s.name ASC, s.id ASC
             SKIP $offset
             LIMIT $limit
             "#;
@@ -470,7 +470,7 @@ impl Neo4jClient {
                 entity_id: coalesce(e.path, e.id, '')
             }) AS anchors
             RETURN n, anchors
-            ORDER BY n.energy DESC
+            ORDER BY n.energy DESC, n.id DESC
             LIMIT 500
             "#,
         )
@@ -522,7 +522,7 @@ impl Neo4jClient {
             r#"
             MATCH (d:Decision)-[:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
             RETURN d
-            ORDER BY d.decided_at DESC
+            ORDER BY d.decided_at DESC, d.id DESC
             LIMIT 200
             "#,
         )
@@ -701,7 +701,7 @@ impl Neo4jClient {
             r#"
             MATCH (n:Note {id: $note_id})-[:MEMBER_OF]->(s:Skill)
             RETURN s
-            ORDER BY s.energy DESC
+            ORDER BY s.energy DESC, s.id DESC
             LIMIT 100
             "#,
         )
@@ -722,7 +722,7 @@ impl Neo4jClient {
             r#"
             MATCH (s:Skill {project_id: $project_id})
             RETURN s
-            ORDER BY s.energy DESC, s.name ASC
+            ORDER BY s.energy DESC, s.name ASC, s.id ASC
             LIMIT 1000
             "#,
         )
@@ -828,7 +828,7 @@ impl Neo4jClient {
               // Current knowledge only (never archived/obsolete/superseded).
               AND n.status IN ['active', 'needs_review'] AND n.superseded_by IS NULL
             RETURN n
-            ORDER BY n.energy DESC
+            ORDER BY n.energy DESC, n.id DESC
             LIMIT 500
             "#,
         )
@@ -855,7 +855,7 @@ impl Neo4jClient {
             MATCH (d:Decision)-[:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
             WHERE coalesce(d.status, 'accepted') IN ['proposed', 'accepted']
             RETURN d
-            ORDER BY d.decided_at DESC
+            ORDER BY d.decided_at DESC, d.id DESC
             LIMIT 200
             "#,
         )

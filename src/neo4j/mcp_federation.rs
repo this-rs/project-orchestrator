@@ -250,7 +250,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (t:McpTool {server_id: $server_id})
-            RETURN t ORDER BY t.name
+            RETURN t ORDER BY t.name, t.id ASC
             "#,
         )
         .param("server_id", server_id.to_string());

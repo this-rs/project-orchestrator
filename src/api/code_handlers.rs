@@ -825,8 +825,7 @@ pub async fn analyze_impact(
         .orchestrator
         .neo4j()
         .get_affected_communities(&all_affected)
-        .await
-        .unwrap_or_default();
+        .await?;
 
     // Compute risk level using composite formula when GDS data is available
     // Profile fusion weights adjust the relative importance of each factor:
@@ -935,8 +934,7 @@ pub async fn analyze_impact(
             .orchestrator
             .neo4j()
             .get_decisions_affecting(entity_type_label, &target, None)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // Also check decisions affecting directly affected files (deduplicated)
         for affected_file in directly_affected.iter().take(5) {
@@ -944,8 +942,7 @@ pub async fn analyze_impact(
                 .orchestrator
                 .neo4j()
                 .get_decisions_affecting("File", affected_file, None)
-                .await
-                .unwrap_or_default();
+                .await?;
             for d in file_decisions {
                 if !decisions.iter().any(|existing| existing.id == d.id) {
                     decisions.push(d);
@@ -961,8 +958,7 @@ pub async fn analyze_impact(
             .orchestrator
             .neo4j()
             .get_context_cards_batch(&directly_affected, &pid.to_string())
-            .await
-            .unwrap_or_default()
+            .await?
     } else {
         Vec::new()
     };
@@ -974,8 +970,7 @@ pub async fn analyze_impact(
         .orchestrator
         .neo4j()
         .get_file_transitive_co_changers(&target, transitive_config.min_transitive_score, 20)
-        .await
-        .unwrap_or_default();
+        .await?;
 
     // Build ranked view: direct files score 1.0, transitive-only score 0.33
     let ranked_affected = {
@@ -2084,15 +2079,13 @@ pub async fn get_code_health(
         .orchestrator
         .neo4j()
         .get_top_hotspots(project.id, 5)
-        .await
-        .unwrap_or_default();
+        .await?;
 
     let knowledge_gaps = state
         .orchestrator
         .neo4j()
         .get_top_knowledge_gaps(project.id, 5)
-        .await
-        .unwrap_or_default();
+        .await?;
 
     let risk_assessment = state
         .orchestrator
@@ -2179,8 +2172,7 @@ pub async fn get_code_health(
             .orchestrator
             .neo4j()
             .get_all_pagerank_values(project.id)
-            .await
-            .unwrap_or_default();
+            .await?;
         analyze_distribution(&pr_vals)
     };
 
@@ -2190,8 +2182,7 @@ pub async fn get_code_health(
             .orchestrator
             .neo4j()
             .get_all_risk_score_values(project.id)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         let dist = analyze_distribution(&risk_vals);
         let p95 = if !risk_vals.is_empty() {
@@ -2208,8 +2199,7 @@ pub async fn get_code_health(
             .orchestrator
             .neo4j()
             .get_community_risk_vectors(project.id)
-            .await
-            .unwrap_or_default();
+            .await?;
         test_community_homogeneity(&groups)
     };
 

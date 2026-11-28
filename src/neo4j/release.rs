@@ -134,7 +134,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $project_id})-[:HAS_RELEASE]->(r:Release)
             RETURN r
-            ORDER BY r.created_at DESC
+            ORDER BY r.created_at DESC, r.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -321,7 +321,7 @@ impl Neo4jClient {
             r#"
             MATCH (r:Release {id: $id})-[:INCLUDES_TASK]->(t:Task)
             RETURN t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("id", release_id.to_string());
@@ -387,7 +387,7 @@ impl Neo4jClient {
             MATCH (p:Project {{id: $project_id}})-[:HAS_RELEASE]->(r:Release)
             {}
             RETURN r
-            ORDER BY {} {}
+            ORDER BY {} {}, r.id
             SKIP {}
             LIMIT {}
             "#,

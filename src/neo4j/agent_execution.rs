@@ -742,7 +742,7 @@ impl Neo4jClient {
             r#"
             MATCH (ae:AgentExecution {run_id: $run_id})
             RETURN ae
-            ORDER BY ae.started_at ASC
+            ORDER BY ae.started_at ASC, ae.id ASC
             "#,
         )
         .param("run_id", run_id.to_string());
@@ -762,7 +762,7 @@ impl Neo4jClient {
             r#"
             MATCH (ae:AgentExecution {status: 'running'})
             RETURN ae
-            ORDER BY ae.started_at ASC
+            ORDER BY ae.started_at ASC, ae.id ASC
             "#,
         );
 

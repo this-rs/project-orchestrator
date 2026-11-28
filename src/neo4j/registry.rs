@@ -144,7 +144,7 @@ impl super::client::Neo4jClient {
         let data_cypher = format!(
             "MATCH (ps:PublishedSkill) {}
              RETURN ps
-             ORDER BY ps.trust_score DESC, ps.published_at DESC
+             ORDER BY ps.trust_score DESC, ps.published_at DESC, ps.id DESC
              SKIP $offset LIMIT $limit",
             where_clause
         );

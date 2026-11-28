@@ -71,7 +71,7 @@ impl Neo4jClient {
                  count(f) AS file_count,
                  collect(f.path) AS all_paths,
                  size([x IN collect(DISTINCT f.cc_wl_hash) WHERE x IS NOT NULL AND x <> 0]) AS unique_fps
-            ORDER BY file_count DESC
+            ORDER BY file_count DESC, cid DESC
             RETURN cid, label, file_count,
                    [p IN all_paths | p][..3] AS key_files,
                    unique_fps
@@ -186,7 +186,7 @@ impl Neo4jClient {
             WITH func, f, count(DISTINCT caller) AS in_deg, count(DISTINCT callee) AS out_deg
             WHERE in_deg >= $threshold
             RETURN func.name AS name, f.path AS file, in_deg, out_deg
-            ORDER BY in_deg DESC
+            ORDER BY in_deg DESC, func.id DESC
             LIMIT 10
             "#,
         )
@@ -308,7 +308,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $pid})-[:HAS_CHAT_SESSION]->(s:ChatSession)
-            WITH s ORDER BY s.created_at DESC LIMIT $max_sessions
+            WITH s ORDER BY s.created_at DESC, s.id DESC LIMIT $max_sessions
             WITH collect(s) AS sessions
             UNWIND range(0, size(sessions) - 2) AS i
             WITH sessions[i] AS current_session, sessions[i+1] AS prev_session
@@ -485,7 +485,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
             WHERE t.status IN ['completed', 'failed']
-            WITH t ORDER BY t.updated_at DESC LIMIT 20
+            WITH t ORDER BY t.updated_at DESC, t.id DESC LIMIT 20
             WITH count(t) AS total,
                  sum(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed,
                  avg(coalesce(t.frustration_score, 0.0)) AS avg_frust
@@ -716,7 +716,7 @@ impl Neo4jClient {
             WITH [n IN cycle_nodes | n.path] AS cycle
             WITH cycle, cycle[0] AS canonical
             RETURN DISTINCT cycle
-            ORDER BY size(cycle)
+            ORDER BY size(cycle), cycle
             LIMIT 10
             "#,
         )
@@ -875,7 +875,7 @@ impl Neo4jClient {
             WHERE f.betweenness IS NOT NULL
             RETURN f.path AS path, f.betweenness AS betweenness,
                    f.community_label AS community_label
-            ORDER BY f.betweenness DESC
+            ORDER BY f.betweenness DESC, f.path DESC
             LIMIT $limit
             "#,
         )
@@ -1680,7 +1680,7 @@ impl Neo4jClient {
             // co_change_count is 0 when there are no CO_CHANGED rels
             WITH f, commit_count, total_churn,
                  CASE WHEN commit_count = 0 THEN 0 ELSE co_change_raw END AS co_change_count
-            ORDER BY commit_count DESC
+            ORDER BY commit_count DESC, f.path DESC
             RETURN f.path AS path, commit_count, total_churn, co_change_count
             "#,
         )
@@ -1784,7 +1784,7 @@ impl Neo4jClient {
             WITH f, note_count, decision_count,
                  toInteger(energy_sum + decision_count * 2) AS raw_density
             RETURN f.path AS path, note_count, decision_count, raw_density
-            ORDER BY raw_density DESC
+            ORDER BY raw_density DESC, f.path DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -2075,7 +2075,7 @@ impl Neo4jClient {
                    0 AS total_churn,
                    COALESCE(f.co_change_count, 0) AS co_change_count,
                    f.churn_score AS churn_score
-            ORDER BY f.churn_score DESC
+            ORDER BY f.churn_score DESC, f.path DESC
             LIMIT $limit
             "#,
         )
@@ -2113,7 +2113,7 @@ impl Neo4jClient {
                    COALESCE(f.note_count, 0) AS note_count,
                    COALESCE(f.decision_count, 0) AS decision_count,
                    f.knowledge_density AS knowledge_density
-            ORDER BY f.knowledge_density ASC
+            ORDER BY f.knowledge_density ASC, f.path ASC
             LIMIT $limit
             "#,
         )
@@ -2432,7 +2432,7 @@ impl Neo4jClient {
             WITH f.cc_wl_hash AS wl_hash, COLLECT(f.path) AS members
             WHERE SIZE(members) >= $min_size
             RETURN wl_hash, members
-            ORDER BY SIZE(members) DESC
+            ORDER BY SIZE(members) DESC, wl_hash DESC
             "#,
         )
         .param("project_id", project_id)

@@ -9,6 +9,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The refusals of the obrain backend, generated from the store contracts —
+/// compiled and run only with the `obrain-backend` feature.
+#[cfg(feature = "obrain-backend")]
+#[path = "build/refus_obrain.rs"]
+mod refus_obrain;
+
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -28,6 +34,15 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PO_GIT_DESCRIBE");
     println!("cargo:rerun-if-env-changed=PO_GIT_SHA");
+
+    #[cfg(feature = "obrain-backend")]
+    {
+        let racine =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        let sortie =
+            PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("obrain_refus.rs");
+        refus_obrain::generer(&racine, &sortie);
+    }
 
     // Allow packagers to pin the values explicitly (both, or either one).
     let pinned_describe = std::env::var("PO_GIT_DESCRIBE").ok();

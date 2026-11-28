@@ -1,0 +1,390 @@
+# Portes de qualité de la migration Neo4j → obrain (+ this-rs)
+
+Ce document est le **contrat** des contrôles qui empêchent la migration de régresser
+et qui permettent de la contrôler de bout en bout. Pour chaque porte : sa commande,
+ce qu'elle prouve, ce qu'elle ne prouve PAS, et son **état réel**. « Non fait » est un
+statut honnête : une porte absente n'est pas une porte verte.
+
+Directive qui gouverne le reste (20/11/2026) : **on ne branche rien en production tant
+que la migration vers obrain et this-rs n'est pas faite.** Le backend par défaut reste
+`default` (Neo4j) ; la garde de bascule (#1248) est du code inactif.
+
+Référence de la cible : `CONSOLIDATION.md` (règles, barre de performance, porte de bascule).
+
+## ⚠ Ce qui rend une porte bloquante
+
+Une étape CI rouge n'empêche une fusion que si le check est **requis** sur la branche
+cible. Mesuré le 20/11/2026 par l'API GitHub : `consolidation/obrain-default` n'était
+protégée par **rien** (`Branch not protected`, HTTP 404) — les portes ci-dessous
+signalaient sans bloquer.
+
+**C'est réglé depuis le 21/11/2026** (API, relu et non recopié) :
+
+- checks requis : `Lint & Format`, `Unit Tests`, `Integration Tests`, `Obrain backend` ;
+- `strict: false` — la branche n'a pas à être à jour, mais les checks doivent être verts
+  **sur le SHA de tête de la PR** ;
+- `enforce_admins: true` — le blocage s'applique aussi à l'orchestrateur, qui est la seule
+  identité qui fusionne : sans ce réglage, la protection ne gênerait personne ;
+- pull request obligatoire, mais **zéro approbation exigée** (`required_approving_review_count: 0`, pas de code owners) : la PR est le passage obligé, pas une revue ; force-push et suppression de branche interdits.
+
+Effet vérifié le jour même : une PR dont un de ces quatre checks n'a pas conclu passe en
+`mergeStateStatus: BLOCKED`, et une PR verte sur son SHA de tête passe `CLEAN`.
+
+Ce que ça **ne** couvre pas, et qu'il faut savoir :
+- un job **instable** (le test `kill9` de `Obrain backend`) bloque une PR saine : on
+  relance le job, **jamais** on ne lève la protection ;
+- `strict: false` veut dire que la combinaison « tête de PR + nouvelle base » n'est pas
+  testée par GitHub : c'est à l'orchestrateur de rebaser et de relancer avant de fusionner ;
+- un changement qui réécrit `xtask/` ou le cliquet reste couvert par la relecture, pas
+  par la protection : une PR peut modifier la porte elle-même et rester verte.
+
+## Vue d'ensemble
+
+| # | Porte | Ce qu'elle prouve | Où elle tourne | État réel (relu le 24/11/2026 pour G9 et G10 ; 20/11 ailleurs) |
+|---|---|---|---|---|
+| G1 | containment | la branche contient `origin/main` | CI, Lint & Format | **non contenue à l'instant de la mesure** (23/11/2026, 23:05 UTC, après `git fetch origin`) : `origin/main` a des commits absents de `origin/consolidation/obrain-default` ; commande et nombres dans `CONSOLIDATION.md`, règle 2. Vert après #1253 (20/11), puis `main` a avancé |
+| G2 | cliquet des traits portés | le cliquet est exactement l'ensemble des traits portés **selon le compilateur**, et il ne rétrécit pas | CI : Obrain backend (test du cliquet) + Lint & Format (`migration-gate --strict --base`) | **22 / 22** portés ; `AnalyticsStore` en partie — 79 des 145 méthodes servent (25 A1 #1250, 23 A2 #1258, 15 mémoire #1260, 15 agents et vues #1261, plus `run_data_migrations`), **66 refusées par nom** ; `SearchStore` porté (#1251, barre de performance non tenue, G8) |
+| G3 | défaut neo4j | détecteur sur la source : le défaut reste Neo4j (définition, fabrique, câblage, déploiement) | CI, Lint & Format (même commande) | **conforme** ; détecteur, pas preuve de comportement (angles morts listés) |
+| G4 | conformité des stores | les contrôles par domaine répondent pareil sur Neo4j, le mock et obrain | CI : Integration Tests (Neo4j réel) et Obrain backend | jambe **Neo4j : tourne en CI**. Jambe **obrain** : les modules `obrain_` tournent dans le job Obrain backend. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur obrain ; les 17 autres restent à couvrir sur obrain |
+| G5 | refus nommés | une méthode non portée refuse par son nom (`NonPorte`), jamais un résultat vide | build + CI, Obrain backend | le générateur refuse la compilation si un impl manuel oublie une méthode ; les refus sont vérifiés par `not_ported`. Le job exécute les tests unitaires `obrain::` avec la feature, sauf `auth::tests::la_consommation_prend_l_heure_sous_le_verrou`, qui dépend d'une fenêtre temporelle et doit être stabilisé avant sa réactivation |
+| G6 | parité de lecture sur copie | les mêmes requêtes REST rendent les mêmes réponses sur obrain et sur une copie Neo4j | **manuel** | **à rejouer** sur la consolidation (dernière mesure : 16/11, branche antérieure) |
+| G7 | oracle de copie | comptes par type, empreinte par label, zéro quarantaine après migration | `tests/obrain_migrateur.rs` (`--ignored`, Neo4j jetable) + tests de `storage::migrator` | **migrateur réel dans le dépôt** (`src/storage/migrator/`, feature `obrain-backend`) ; comptes par type, empreinte par label et zéro quarantaine (imposé dans `copy`) démontrés sur une base jetable de 13 nœuds ; **nanosecondes tronquées : non résolu, bascule bloquée** ; source non gelée : gel opérationnel exigé ; **non rejoué sur la copie complète (33 Go)**, non branché en CI (il faut un Neo4j) |
+| G8 | performance | barre de `CONSOLIDATION.md` : rien ne croît avec N sur un chemin de requête | **manuel** | **non tenue** sur SearchStore (#1251) : ouverture, filtre par projet, suppression |
+| G9 | double-run | un même trafic sur Neo4j et obrain, divergences classées | — | **conçue le 24/11 (`859da3d6`), non implémentée** : N1 corpus figé VERSIONNÉ dans le dépôt (requêtes réelles + réponses Neo4j, à committer), quatre classes D1–D4, sortie D1 = D2 = 0 ; N2 miroir de lecture derrière `PO_DOUBLE_RUN=lecture`, écritures jamais doublées ; N3 = G10 |
+| G10 | retour arrière | une bascule qui ne perd aucune écriture en silence : le rollback rejoue ce qui a un inverse prouvé, refuse le reste par son nom et désigne le repli (restauration de sauvegarde) | tests de `storage::migrate` et `storage::mod` (fusionnés par #1248) | **rouge, conception arrêtée le 24/11 (`9bbbbbb1`)** : journal des écritures au point d'écriture unique + **refus nommé par domaine** + détection des écrivains inconnus (#1270, écrite non branchée) livrés en premier — le vert signifie « aucune perte silencieuse », pas « retour arrière à chaud dans tous les cas » ; rejeu des domaines à inverse prouvé ensuite |
+| G11 | stabilité des tests | aucun test de la migration ne passe ou n'échoue au hasard | — | **ouvert** : `kill9_during_creations…` instable (tâche `TEST-KILL9-INSTABLE`) ; `obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou` exclu de la CI (horloge) ; `storage::migrator` n'est PAS un test instable : ce step est la première compilation à froid de la bibliothèque avec la feature (6 min 26 s sur le run vert 45111474405, 12 min 29 s pour le step précédent). Un run a dépassé le délai du job (45 min, annulé, run 45113636283) et un autre a échoué (run 45103207452, log expiré) : c'est le temps de compilation sur le runner, les 23 tests passent en 25 s en local, 5/5 ; `obrain::chat::tests::c5_empreinte_publie_le_updated_at_ecrit` dépend d'un `sleep` de 5 ms (horloge), non exclu |
+
+## Détail des portes automatisées
+
+### G1 — containment
+`cargo xtask containment`. Une PR vers la consolidation est rouge tant que la branche
+ne contient pas `origin/main` ; cela se règle par une descente de `main` dans la
+consolidation, jamais l'inverse.
+
+### G2 — cliquet des traits portés
+« Porté » est la notion **du compilateur** : le générateur `build/refus_obrain.rs` lit
+`src/obrain/` avec `syn` et ne génère pas de refus pour un trait implémenté à la main ; il
+publie la liste dans `project_orchestrator::obrain::methodes_portees()`. Une recherche de
+texte serait en désaccord avec lui (module désactivé par `#[cfg]`, macro, chaîne) : la porte
+n'en fait donc aucune.
+
+Deux contrôles complémentaires :
+1. Le test `the_migration_ratchet_is_exactly_the_set_of_ported_traits`
+   (`tests/obrain_backend.rs`, job Obrain backend) exige que `xtask/migration-portees.txt`
+   soit **exactement** l'ensemble des traits portés :
+   - un trait listé qui n'est plus porté échoue (`RÉGRESSION`) ;
+   - un trait porté absent du cliquet échoue (`NON CONSIGNÉ`) : un nouveau port est protégé
+     dès la PR qui l'introduit.
+2. `cargo xtask migration-gate --strict --base <rev>` (job Lint & Format) refuse une ligne
+   retirée du cliquet depuis la base (`CLIQUET RÉDUIT`). Sans ce second contrôle, retirer un
+   port **et** sa ligne dans la même PR passerait le test (les deux ensembles rétrécissent
+   ensemble). En CI, la base est la cible de la PR, ou le commit précédent sur un push.
+
+Preuves rejouées (20/11/2026) :
+
+| Scénario | Résultat |
+|---|---|
+| état réel | test vert ; porte : 20 traits, exit 0 |
+| ligne `ProjectStore` retirée du cliquet | test : `NON CONSIGNÉ ["ProjectStore"]` ; porte avec base : `CLIQUET RÉDUIT`, exit 1 |
+| `AnalyticsStore` listé sans être porté | test : `RÉGRESSION ["AnalyticsStore"]` |
+
+**Limites connues** : un `impl` dont toutes les méthodes refusent à la main compte comme
+porté (le générateur compte les méthodes écrites, voir `REFUS_ECRITS_A_LA_MAIN`) ; `GraphStore`
+figure parmi les portés parce que son `impl` manuel est imposé (`capabilities` n'a pas de
+défaut), ce qui rend le compte « 20 / 22 » un peu flatteur. La porte exécute le code de la PR. Une PR qui réécrit la porte elle-même
+(changer le chemin du cliquet, par exemple) peut la neutraliser. Ce risque se règle par la
+relecture des changements de `xtask/` et du cliquet, et par la protection de la branche.
+
+### G3 — défaut neo4j
+Même commande que G2 (second contrôle). C'est un **détecteur** sur la source, pas une preuve
+de comportement. Refusé quand :
+- `DEFAULT_BACKEND` n'est pas défini **exactement une fois** avec la valeur `"default"`
+  (une seconde définition sous `#[cfg]`, ou cachée dans une chaîne, est refusée) ;
+- le bras `BackendKind::Default` de la fabrique n'appelle plus `Self::default_backend(`
+  (contrôle de texte : ce que fait `default_backend` n'est pas vérifié) ;
+- `src/lib.rs` ne retombe plus, **dans le code**, sur `DEFAULT_BACKEND` quand rien n'est
+  configuré (une copie dans une chaîne ne compte pas) ;
+- un fichier de déploiement suivi par git fixe `STORAGE_BACKEND` ou `backend:` à obrain :
+  `*.yml`, `*.yaml`, `*.env`, `*.service`, `*.sh`, `*.toml`, `*.json`, `*.tpl`, `*.j2`,
+  `Dockerfile*`, `docker-compose*`, leurs variantes `.example`, y compris `.github/workflows/` et une liste
+  d'environnement Kubernetes (`- name: STORAGE_BACKEND` / `value: obrain`). Sont exclus :
+  `docs/`, `tests/`, `examples/`, `tools/`, `benches/`, `xtask/`, `src/`, `build/`.
+
+Preuves rejouées sur une copie indépendante : bras `Default` recâblé sur obrain, câblage
+remplacé avec une copie gardée dans une chaîne, service systemd, `config.yaml.example`,
+liste d'environnement k8s : tous refusés, exit 1. L'arbre réel ne produit aucun faux positif.
+
+**Angles morts** (non détectés, mesurés le 20/11/2026) :
+- dans `src/lib.rs` : un repli sur obrain placé **avant** le défaut, ou une transformation
+  **après** lui (`….replace("default", "obrain")`) ; une copie du câblage dans du code mort ;
+- dans la fabrique : un `return Self::obrain_backend(…)` placé au début de `default_backend`
+  (le bras appelle toujours `default_backend`, la porte reste verte) ;
+- dans le déploiement : une valeur atteinte par indirection (`ARG B=obrain` puis
+  `ENV STORAGE_BACKEND=$B`) ; une liste k8s où `value: obrain` précède
+  `name: STORAGE_BACKEND` ; une clé `backend:` dont la valeur est sur la ligne suivante ;
+  une extension hors de la liste ci-dessus.
+
+Ce que la constante
+sélectionne est couvert par le test `default_backend_is_selected_for_the_default_value`,
+qui vérifie la correspondance valeur → variant, et non que le variant construit Neo4j.
+
+### G4 — conformité des stores
+`tests/store_conformance.rs` exécute les contrôles par domaine (`*_checks!`) sur Neo4j, le
+mock et obrain. Parmi les 30 contrôles transverses de `all_checks!`, 13 tournent aussi sur
+obrain : quatre dans `obrain_protocol`, cinq dans `obrain_ingress` et quatre dans
+`obrain_transverse`. Les 17 autres n'ont pas de jambe obrain ; `note_checks` n'a pas de jambe mock. Les
+divergences connues sont listées dans `EXPECTED_DIVERGENCES` ; le test échoue si une
+divergence listée est corrigée (« now conforms »), ce qui force à retirer l'entrée.
+- Jambe Neo4j : job **Integration Tests**, avec un service Neo4j et `HARNESS_NEO4J_REQUIRED=1`
+  (un Neo4j absent est un échec, pas un saut).
+- Jambe obrain : job **Obrain backend**. Le filtre CI retient les modules `obrain_`,
+  dont `obrain_transverse`, et aucun test `mock_` ni `neo4j_`.
+- En local sans Neo4j, la jambe Neo4j passe sans s'exécuter : seule la CI fait foi.
+
+### G5 — refus nommés : les tests unitaires de `src/obrain/`
+Le job Obrain backend exécute les tests de bibliothèque sélectionnés par `obrain::`, et
+échoue si aucun test n'a tourné. Un test sensible à l'ordonnancement reste exclu
+(`--skip`, qui compare par sous-chaîne) ; il est suivi en G11 et sa stabilisation est
+nécessaire avant sa réactivation en CI.
+
+## Portes manuelles ou non faites
+
+### G6 — parité de lecture (LECTURE-NATIVE)
+Rejouer les routes REST sur obrain et sur une copie Neo4j, champ à champ, et classer chaque
+écart (non porté / perte de migration / lecture du portage / bénin). La mesure du 16/11 ne
+vaut plus : elle portait sur une branche où les dates étaient mal lues.
+
+### G7 — oracle de copie
+Copie jetable, comptes par type égaux, empreinte par label égale, zéro nœud en quarantaine,
+dates relues à la microseconde (troncature des nanosecondes non résolue : voir ci-dessous). C'est la porte que demande #1246. La spécification
+`obrain-migration-spec.md` est **hors dépôt** (à la racine du dossier de travail).
+
+Le migrateur réel est dans le dépôt : `src/storage/migrator/` (feature `obrain-backend`), branché
+par `StorageBackend::from_config` ; il implémente `Migrator`. Décision sur l'empreinte (§0 point 10
+de la spécification) : **elle entre dans la vérification de bascule**, au sein de `Migrator::copy`
+(le trait ne change pas). Après l'écriture, la base est relue DEPUIS LE DISQUE (chaque slot de nœud
+et de lien, indépendamment des compteurs du moteur) et comparée, par label et par type, à ce que
+le côté source a calculé sur les valeurs converties : nombre d'entités, nombre de propriétés, somme
+(commutative) des hachages `(clé, valeur)` par entité, extrémités d'un lien comprises. Un écart
+fait échouer la copie avec le label nommé, donc PO reste sur la source. Coût : un parcours de plus
+de la cible. Limite : l'empreinte prouve que le moteur a stocké ce qu'on lui a donné, pas que la
+conversion Bolt → obrain est fidèle à ce que Neo4j dit de la valeur (c'est l'oracle `verif` du
+spike, `valueType()`/`toString()` côté serveur, manuel, qui a trouvé le défaut des entiers
+négatifs de neo4rs ; ce défaut est corrigé par `vendor/neo4rs`, et vérifié par la jambe
+`counts_equal_switch_once…` : -1 et -16 relus négatifs dans la cible). Mono-label : un nœud à
+plusieurs labels refuse la copie, par son nom.
+
+**Ce que l'empreinte ne prouve pas.** Elle est calculée sur les valeurs DÉJÀ converties : elle ne
+démontre pas une copie « strictement identique » à la source. Trois points précis :
+
+1. **Zéro quarantaine, imposé dans la copie.** La relecture utilise le moteur brut et ne voit rien
+   des index de PO ; le démarrage normal ne fait que journaliser un rapport d'ouverture non vide.
+   `Migrator::copy` ouvre donc la copie comme PO l'ouvre (`ObrainGraphStore::open`) avant la fin
+   et la refuse, par les nœuds nommés, si le rapport n'est pas `RapportOuverture::default()`
+   (test `a_copy_that_po_opens_in_quarantine_is_refused_though_counts_and_fingerprint_agree`).
+   Le marqueur de base PO (`po-obrain-base`) doit exister pour cette ouverture ; il est retiré en
+   cas de refus, et le marqueur de fin `.po-migration-done` n'est écrit qu'après.
+2. **Datetimes : la troncature à la microseconde vient de la représentation choisie et des
+   lecteurs, pas du stockage d'obrain.** Au rev épinglé `345d5ea7`, `Timestamp` stocke des
+   **nanosecondes** (`obrain-common/src/types/timestamp.rs` l.17) ; seul `ZonedDatetime` stocke des
+   microsecondes (`zoned_datetime.rs` l.16-17, champ `utc_micros` l.44). La copie convertit vers `ZonedDatetime`, et les
+   décodeurs de PO lisent par `as_micros` : c'est là que les nanosecondes se perdent. Une piste
+   « instant en `Timestamp` nanosecondes plus décalage » ne vaudrait que pour les `DateTime` à
+   décalage fixe : `DateTimeZoneId` (nom de fuseau) et `LocalDateTime` (sans fuseau) sont refusés
+   aujourd'hui et ne seraient pas préservés par elle. Rien n'est démontré sans perte. La troncature
+   actuelle est **comptée** (`CopyReport::sub_microsecond_datetimes`), journalisée (`tracing::warn!`, dont le texte « obrain stores no finer » est faux, comme les commentaires de `conv.rs` l.40 et l.213-215 et de `migrate.rs` l.300 : `Timestamp` stocke des nanosecondes)
+   et consignée dans le marqueur de fin (champ additif `narrowings.sub_microsecond_datetimes`). La
+   politique d'acceptation n'est PAS changée (`conv.rs` accepte la troncature), et **ce point n'est pas réglé** : la parité
+   des dates n'est pas démontrée. Prototype testé seulement (non branché) : un entier annexe
+   `<clé>__nanos` rend l'aller-retour exact. Il ne suffit pas à la parité : les décodeurs de PO
+   lisent la valeur principale en microsecondes ; tris, filtres, contraintes et mises à jour peuvent
+   ignorer le reliquat ou le laisser périmé. Manque, avant toute décision : un contrat versionné
+   par type (`Timestamp` / `ZonedDatetime`, offset compris), un traitement explicite des dates
+   imbriquées dans listes et cartes (encodage par chemin ou refus nommé), des tests par les
+   adaptateurs PO réels (lecture, écriture, comparaison, tri, mise à jour et suppression
+   atomiques, collisions de noms de propriété, dates avant 1970, bornes), une empreinte source →
+   valeur recomposée, et un **inventaire mesuré** des datetimes sub-microseconde sur une copie
+   figée de la source (non fait : aucune base réelle n'a été touchée). `chrono::Utc::now()` écrit
+   des nanosecondes : ne pas supposer le volume négligeable. **La bascule reste bloquée** sur ce
+   point jusqu'à décision explicite.
+   **Impact fonctionnel concret : les tombstones signés.** Le payload Ed25519 d'un tombstone
+   couvre `issued_at` à la nanoseconde (`src/sharing/tombstone.rs` l.144-145,
+   `SecondsFormat::Nanos`). Neo4j le stocke en `datetime` (nanosecondes,
+   `src/neo4j/sharing.rs` l.260-267). Le migrateur le tronque à la microseconde, et la relecture
+   par PO sur obrain (`lire_tombe`, `src/obrain/sharing.rs` l.215) passe par `date_optionnelle`
+   puis `as_micros` : une signature émise à une précision non alignée sur la microseconde
+   peut devenir **invalide après migration**. Les comptes et l'égalité à la microseconde ne le
+   voient pas. **Porte exigée** : un test de bout en bout sur base jetable qui signe un tombstone
+   à `.123456789`, le stocke dans Neo4j, migre, rouvre par PO et vérifie la signature et
+   l'autorité. Tant qu'une représentation et des lecteurs fidèles n'existent pas, la copie d'un
+   tombstone dont `issued_at` a des nanosecondes non multiples de 1000 doit être **refusée**
+   explicitement, et non acceptée.
+   **Fait (24/11/2026)** : le refus existe. `conv::SIGNED_INSTANTS` nomme les paires
+   `(label, propriété)` couvertes par une signature (`("Tombstone", "issued_at")` seule pour
+   l'instant) ; `note_signed_instant`, appelé par `props_of` pour chaque propriété d'un nœud,
+   compte dans `Losses::signed_instant_narrowed` un tel instant que la conversion tronquerait,
+   et `Losses::refusal` en fait une cause de refus nommée, vue dès la lecture des propriétés
+   (`check_no_refusal`). La troncature générale reste acceptée et comptée pour toute autre
+   propriété. Démontré sans Neo4j (`a_signed_tombstone_instant_with_nanoseconds_refuses_the_copy`,
+   `the_signed_instant_guard_refuses_only_what_a_signature_covers`,
+   `a_tombstone_row_with_nanoseconds_fails_the_early_check_and_a_note_row_does_not`). **Reste
+   dû** : le test de bout en bout sur base jetable (signature relue par PO après migration), et
+   la représentation fidèle qui permettra de lever ce refus. Un tombstone à nanosecondes dans la
+   source réelle rend donc la copie **impossible**, par son nom, jusque-là.
+3. **Source non gelée.** La source est lue en direct, en plusieurs phases (identifiants, structure,
+   propriétés) par plages parallèles. Le verrou `LOCK_SUFFIX` est un fichier local à la machine et
+   `ReadOnlyGate` est interne au processus : ni l'un ni l'autre n'arrête un écrivain externe (autre
+   instance PO, client Neo4j direct). **Détecté** : un nœud supprimé entre la lecture des
+   identifiants et celle des propriétés (nommé) ; un nœud ou un lien dont le compte par type a
+   changé entre le début et la fin de la copie (comptes relus après la copie, copie nettoyée,
+   type nommé : `a_source_whose_counts_moved_during_the_copy_is_refused_and_cleaned`).
+   **Non détecté** : une mise à jour de propriétés qui ne change aucun compte ; un ajout compensé
+   par une suppression du même type ; un second hôte PO sur le même Neo4j. La production exige un
+   **gel opérationnel des écrivains externes** pendant la copie. « Zéro perte démontrée » n'est
+   PAS affirmé. Sont démontrés par des tests sans Neo4j (en CI) : le refus d'une source dont les
+   comptes ont bougé et le refus d'une copie que PO ouvre en quarantaine. Le refus d'un nœud
+   supprimé pendant la copie n'est testé qu'avec un Neo4j jetable
+   (`a_node_deleted_during_the_copy_fails_it_by_name`, `--ignored`, hors CI).
+
+Rejouer : voir l'en-tête de `tests/obrain_migrateur.rs` (Neo4j jetable sur 27688, jamais 7687).
+
+### G8 — performance
+Barre de `CONSOLIDATION.md`. Mesurée le 20/11 à 100 k et 1 M documents sur SearchStore, avec
+l'exemple `examples/obrain_mesures_recherche.rs` (alors sur la branche de #1251 ; **présent
+dans la consolidation** depuis la fusion de #1251, relu le 24/11/2026) : ouverture 0,6 s → 7 s, filtre par projet 0,4 ms → 8,9 ms, suppression par id
+5 ms → 21 ms. Barre non tenue. Une PR qui touche un chemin chaud doit livrer ses mesures à
+1 M et 5 M avant et après.
+
+### G9 — double-run
+
+Non conçue au 23/11/2026. **Conçue le 24/11/2026** (décision `859da3d6`) ; rien n'est encore implémenté.
+
+But : un même trafic, deux moteurs, des divergences **classées** — pas une impression de parité.
+Trois niveaux, chacun avec son critère de sortie ; aucun ne dispense du précédent.
+
+**N1 — corpus figé, exécuté et classé (obligatoire, hors ligne).**
+Entrées : les requêtes réelles de PO et les réponses Neo4j du MÊME jeu, **versionnées dans le
+dépôt**. Elles n'y sont pas aujourd'hui : le banc du 23/11 (requêtes réelles rejouées par Neo4j 5.26
+et par obrain sur 4 327 350 nœuds) vit sur la machine de banc et non dans le dépôt, et
+`CONSOLIDATION.md` cite un autre compte (104) pour une mesure différente. N1 commence donc par
+**committer les deux fichiers** (`plan_reel.tsv` des requêtes, `resultats_neo4j.tsv` des réponses) ou
+par les régénérer sous `COPIE-REFERENCE` : le corpus qui fait foi est le fichier versionné, jamais un
+chiffre recopié dans un plan.
+Exécution : chaque requête sur obrain **contre la même copie gelée**, comparaison positionnelle
+(noms de colonnes, ordre des lignes, valeurs). Quatre classes, pas de « autre » : **D1** valeur
+fausse, **D2** ordre non total (même multiensemble, ordre différent), **D3** refus nommé
+(`NonPorte` ou erreur de traduction), **D4** forme non supportée par le traducteur.
+Sortie : D1 = 0 et D2 = 0 non expliqué ; chaque D3/D4 est listé, compté et rattaché à une tâche
+ou à une issue moteur. Ce que N1 ne prouve pas : les écritures (le corpus est en lecture) ni la
+concurrence.
+
+**N2 — miroir de lecture en direct (recommandé, derrière un drapeau).**
+`PO_DOUBLE_RUN=lecture` : chaque lecture est rejouée sur l'autre moteur, la réponse de la source
+fait foi, l'écart est journalisé avec l'id de requête et sa classe. **Aucune écriture n'est
+doublée** : PO reste l'écrivain unique d'obrain (décision du 10/11 — la v0.0.1 ne garantit pas les
+transactions concurrentes). Échantillonnage déclaré ; la latence de la seconde jambe est mesurée à
+part et n'entre jamais dans le SLO.
+Sortie : 24 h de trafic réel avec D1 = 0.
+
+**N3 — exercice de retour arrière** : c'est G10, pas G9.
+
+Ce que G9 ne peut pas prouver : qu'une **écriture** diverge. Les deux moteurs ne sont écrits que par
+PO, donc une divergence d'écriture est un bug de PO, pas un sujet de double-run ; ce sont G4
+(conformité des stores) et G7 (oracle de copie) qui la couvrent.
+
+### G10 — retour arrière
+Fusionné par #1248 (`src/storage/migrate.rs`, `src/storage/mod.rs`).
+
+**Sélection de la source** par variable de configuration : implémentée et testée avec un
+migrateur factice. La source n'est jamais modifiée par PO (par contrat du trait
+`Migrator`).
+
+**Écritures post-bascule** : les écritures faites sur obrain après la bascule ne sont ni
+recopiées ni réconciliées vers Neo4j — elles sont **perdues** pour la source. Cette perte
+est annoncée dans le message de rollback (le marqueur `.po-migration-rolled-back` ne porte
+qu'un horodatage et signale l'autre sens : les écritures faites sur la source pendant le
+rollback manquent à la cible si on la ressert). Un rollback sans `from` est refusé si la cible
+contient des données (`rollback_without_from_refuses_a_non_empty_obrain_target`,
+`storage::mod`), mais la perte reste :
+- **non détectée** par comparaison de contenu ;
+- **non testée** sur des données réelles (aucun test ne crée d'écriture après la bascule
+  pour vérifier qu'elle manque côté source) ;
+- pas de test de bout en bout avec le vrai migrateur.
+
+**Décision du 24/11/2026 (`9bbbbbb1`) : réconciliation fail-closed PAR DOMAINE.** Chaque domaine est
+recopié vers Neo4j s'il a un inverse prouvé, et **refusé nommément** sinon. La recopie inverse
+complète et la double écriture ont été écartées : la première exige un second chemin de migration
+avant de pouvoir livrer quoi que ce soit ; la seconde crée deux vérités que la v0.0.1 d'obrain ne
+sait pas tenir, faute de transactions concurrentes.
+
+**Ce qui est livré en premier, et qui rend la porte verte :** le journal des écritures + le **refus
+nommé systématique**, sans aucun rejeu. Le retour arrière cesse d'être une variable de configuration
+dès la première écriture post-bascule, et le dit. C'est un comportement vrai, borné et testable — pas
+une reconnaissance de perte.
+
+Les quatre pièces, et ce que chacune empêche :
+1. **Journal des écritures applicatives.** obrain n'expose pas de flux d'écritures réutilisable (son
+   WAL est interne, non rejouable vers un autre moteur) : la traçabilité s'accroche donc au **point
+   d'écriture unique de PO** (une porte par domaine : `ObrainGraphStore` et ses sous-traits). Chaque
+   écriture réussie ajoute une ligne append-only avec domaine, opération, clé et horodatage monotone,
+   `fsync` au commit — même discipline que `writer_lease` de **this-rs** (`this/src/storage/writer_lease.rs`, dépôt voisin, hors de celui-ci).
+2. **Rejeu idempotent, dans l'ordre du journal**, `MERGE` sur la clé du domaine, avec vérification
+   après rejeu (compte par type + échantillon relu). Un domaine sans inverse prouvé ne rejoue pas :
+   il **refuse par son nom** (`RollbackRefused { domaines_non_couverts, premiere_ecriture }`).
+3. **Détection des écrivains inconnus** : empreinte logique de publication relue en lecture seule (les
+   composants fail-closed de #1270 existent mais ne sont pas branchés). Sans elle, un binaire
+   antérieur écrirait sans journal et le refus serait contourné par le silence.
+4. **Marqueur de rollback en deux temps** (début, fin) portant la liste des domaines et l'horodatage
+   du journal : un rejeu interrompu est repris à l'ouverture suivante, jamais rejoué à l'aveugle ni
+   perdu.
+
+**Tests exigés** :
+- `rollback_before_any_post_flip_write_is_a_config_variable` — aucune écriture post-bascule : la
+  source est resélectionnée, cible et source intactes ;
+- `rollback_refuses_when_a_post_flip_write_exists` — une écriture après bascule puis un rollback :
+  refus **nommé**, avec le domaine et l'horodatage de la première écriture, et la source **non
+  modifiée** ;
+- `unknown_writer_blocks_rollback` — empreinte modifiée par un autre binaire : refus ;
+- `interruption_during_replay_resumes_without_duplicate` — coupure au milieu du rejeu, reprise,
+  aucun doublon ;
+- `rollback_with_proven_inverse_replays_in_journal_order_and_is_idempotent` — un domaine à inverse
+  prouvé, rejoué deux fois : même état, zéro doublon.
+
+**État de la porte** : rouge tant que les quatre pièces ne sont pas là et que les tests **1, 2 et 3**
+ne passent pas. Les tests **4** (reprise après interruption) et **5** (rejeu idempotent d'un domaine)
+**ne conditionnent pas le vert** : ils conditionnent le PREMIER DOMAINE RECOPIÉ, donc
+l'élargissement. Un vert obtenu sur « refus nommé seulement » est un vert honnête, mais il ne dit pas
+que le retour arrière fonctionne à chaud.
+
+**Ce que « vert » veut dire, et ce que ça ne veut pas dire.** Vert = **aucune perte silencieuse** : le
+rollback rejoue les domaines dont l'inverse est prouvé et, pour tous les autres, il **refuse par son
+nom** et désigne le repli. Il ne veut pas dire « retour arrière = une variable, dans tous les cas » :
+à la première bascule, le repli des domaines non couverts est la **restauration de sauvegarde** —
+procédure écrite et exercée sur une copie — et c'est ce que la décision `9bbbbbb1` appelle « le repli
+livré à la première bascule ». La ligne « e » de la porte de bascule de `CONSOLIDATION.md` doit donc
+se lire avec cette réserve : tant que les domaines ne sont pas recopiés, revenir en arrière est une
+restauration, pas un basculement de variable, et la décision de basculer se prend en le sachant.
+
+### G11 — stabilité des tests
+`kill9_during_creations…` échoue au hasard, de deux façons mesurées : le garde-fou de timing
+(« no kill landed inside a creation over 12 rounds ») et un `unwrap()` sur une ligne de
+journal tronquée par le SIGKILL. #1222 (manche « suspendue ») est close sans fusion, mais son
+résidu a été porté par **#1257** (`987480e2`, ancêtre de la consolidation, relu le 24/11/2026) :
+`tests/obrain_backend.rs` arme le kill dans une création par construction (`suspendu`, tour 0)
+et écarte la ligne de journal tronquée avant de la lire. Ce que cela ne prouve pas : que le test
+soit devenu stable — il n'a pas été re-mesuré en boucle depuis ; le statut « ouvert » tient
+jusqu'à cette mesure. Une porte instable ne prouve rien.
+
+Exclu du job Obrain backend tant qu'il dépend de l'horloge :
+`obrain::auth::tests::la_consommation_prend_l_heure_sous_le_verrou`. Le test de visibilité
+avant durabilité de `obrain::commit` tourne désormais en CI (il ne tournait dans aucun job) : il se
+synchronise par un crochet de test au lieu d'une fenêtre de temps.
+
+## Règles de contrôle
+
+- Toute PR de la migration consigne ses portes dans un commentaire : critères, rouge-sans /
+  vert-avec rejoué, relecture indépendante, contrat et doc, à jour de la base, CI verte.
+- Le cliquet G2 ne rétrécit pas ; un retrait voulu est une décision écrite ici, et la porte
+  le refusera quand même tant que la base contient la ligne.
+- La bascule en production n'est pas une porte de plus : elle exige G4, G6, G7, G8, G9, G10 et G11
+  vertes, et la levée de la directive du 20/11.

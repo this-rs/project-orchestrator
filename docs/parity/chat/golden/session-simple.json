@@ -1,0 +1,13 @@
+[
+  {"type": "auth_ok", "user": {"id": "<user-id>", "email": "<email>", "name": "<name>"}, "features": ["refs_v1"]},
+  {"type": "pending_queue", "messages": []},
+  {"type": "replay_complete"},
+  {"type": "auto_continue_state_changed", "session_id": "<session>", "enabled": true, "seq": 0},
+  {"$client": "user_message", "content": "Bonjour, quel est le statut du projet ?"},
+  {"type": "system_init", "cli_session_id": "<cli-session>", "model": "<model>", "tools": ["Bash", "Read", "Edit", "Write", "Glob", "Grep"], "mcp_servers": [], "seq": 0, "created_at": "<ts>"},
+  {"type": "user_message", "content": "Bonjour, quel est le statut du projet ?", "seq": 0, "created_at": "<ts>"},
+  {"type": "stream_delta", "text": "Le plan est ", "seq": 0, "created_at": "<ts>"},
+  {"type": "stream_delta", "text": "en cours.", "seq": 0, "created_at": "<ts>"},
+  {"type": "assistant_text", "content": "Le plan est en cours.", "seq": 0, "created_at": "<ts>"},
+  {"type": "result", "session_id": "<session>", "duration_ms": "<dur>", "cost_usd": "<cost>", "subtype": "success", "is_error": false, "num_turns": 1, "usage": "<usage>", "model": "<model>", "stop_reason": "completed", "seq": 0, "created_at": "<ts>"}
+]

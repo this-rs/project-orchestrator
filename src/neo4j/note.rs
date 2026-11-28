@@ -1269,7 +1269,7 @@ impl Neo4jClient {
                 WHERE e.{} ENDS WITH $entity_id
                   AND n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.importance DESC, n.created_at DESC
+                ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
                 "#,
                 node_label, match_field
             )
@@ -1279,7 +1279,7 @@ impl Neo4jClient {
                 MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
                 WHERE n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.importance DESC, n.created_at DESC
+                ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
                 "#,
                 node_label, match_field
             )
@@ -1642,7 +1642,7 @@ impl Neo4jClient {
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
                    path_names, distance, avg_path_pagerank,
                    tail(rel_types) AS relation_path, path_rel_weight, hop_weights
-            ORDER BY score DESC
+            ORDER BY score DESC, n.id DESC
             LIMIT $limit
             "#,
             target_match, rel_pattern, max_depth
@@ -1761,7 +1761,7 @@ impl Neo4jClient {
                    ['LINKED_TO_TRANSITIVE'] AS relation_path,
                    tw AS path_rel_weight,
                    [] AS hop_weights
-            ORDER BY score DESC
+            ORDER BY score DESC, n.id DESC
             LIMIT $limit
             "#,
             target_match
@@ -1953,7 +1953,7 @@ impl Neo4jClient {
             MATCH (n:Note)-[:LINKED_TO]->(w)
             WHERE n.status IN ['active', 'needs_review']
             RETURN n, w.name AS workspace_name
-            ORDER BY n.importance DESC, n.created_at DESC
+            ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -2070,7 +2070,7 @@ impl Neo4jClient {
             WHERE n.status IN ['needs_review', 'stale']
             {}
             RETURN n
-            ORDER BY n.staleness_score DESC, n.importance DESC
+            ORDER BY n.staleness_score DESC, n.importance DESC, n.id DESC
             LIMIT 500
             "#,
             scope
@@ -2106,6 +2106,8 @@ impl Neo4jClient {
     /// a half-life of ~20.8 days). This means actively-maintained
     /// code keeps its linked notes fresher.
     pub async fn update_staleness_scores(&self) -> Result<usize> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // This updates staleness based on time since last confirmation,
         // with a freshness discount from recent commit touches.
         let q = query(
@@ -2360,6 +2362,8 @@ impl Neo4jClient {
         workspace_slug: Option<&str>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         // Convert f32 to f64 for neo4rs
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
 
@@ -2376,7 +2380,7 @@ impl Neo4jClient {
                 WHERE n.status IN ['active', 'needs_review']
                 AND n.project_id = $project_id
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
             "#;
             (cypher.to_string(), Some(pid.to_string()))
@@ -2393,7 +2397,7 @@ impl Neo4jClient {
                     OR n.project_id = ''
                 )
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
                 "#;
             (cypher.to_string(), None)
@@ -2404,7 +2408,7 @@ impl Neo4jClient {
                 YIELD node AS n, score
                 WHERE n.status IN ['active', 'needs_review']
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
             "#;
             (cypher.to_string(), None)
@@ -2567,6 +2571,8 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> Result<Vec<(String, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
         let query_limit = (limit * 3) as i64; // over-fetch for post-filtering
 
@@ -2576,7 +2582,7 @@ impl Neo4jClient {
             YIELD node AS f, score
             WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
             RETURN f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, f.path DESC
             LIMIT $limit
             "#
         } else {
@@ -2584,7 +2590,7 @@ impl Neo4jClient {
             CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
             YIELD node AS f, score
             RETURN f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, f.path DESC
             LIMIT $limit
             "#
         };
@@ -2617,6 +2623,8 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> Result<Vec<(String, String, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
         let query_limit = (limit * 3) as i64;
 
@@ -2627,7 +2635,7 @@ impl Neo4jClient {
             MATCH (fn)<-[:CONTAINS]-(f:File)
             WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
             RETURN fn.name AS name, f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, fn.id DESC
             LIMIT $limit
             "#
         } else {
@@ -2636,7 +2644,7 @@ impl Neo4jClient {
             YIELD node AS fn, score
             MATCH (fn)<-[:CONTAINS]-(f:File)
             RETURN fn.name AS name, f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, fn.id DESC
             LIMIT $limit
             "#
         };
@@ -2715,7 +2723,7 @@ impl Neo4jClient {
         let cypher = r#"
             MATCH (n:Note {id: $id})-[s:SYNAPSE]-(neighbor:Note)
             RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight
-            ORDER BY weight DESC
+            ORDER BY weight DESC, neighbor_id DESC
         "#;
 
         let q = query(cypher).param("id", note_id.to_string());
@@ -2822,7 +2830,7 @@ impl Neo4jClient {
             WHERE (n:Note OR n:Decision) AND (neighbor:Note OR neighbor:Decision)
             RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight,
                    CASE WHEN neighbor:Decision THEN 'Decision' ELSE 'Note' END AS entity_type
-            ORDER BY weight DESC
+            ORDER BY weight DESC, neighbor_id DESC
         "#;
 
         let q = query(cypher).param("id", node_id.to_string());
@@ -2956,6 +2964,8 @@ impl Neo4jClient {
     /// (its energy is current as of now). Notes decaying below 0.05 are
     /// floored to 0.0 ("dead neuron").
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // Notes of dormant projects are only stamped: their energy is frozen
         // while nobody works on the project, and decay resumes from the
         // moment it is active again (see dormant_project_ids).
@@ -3351,6 +3361,8 @@ impl Neo4jClient {
         scope: Option<String>,
         dormant: Vec<String>,
     ) -> Result<PassReport> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // The scope guard, spliced into both queries. A project pass walks only
         // its own notes; the global pass walks everything except the dormant
         // projects.
@@ -4255,7 +4267,7 @@ impl Neo4jClient {
             "MATCH (a:Note {project_id: $pid})-[s:SYNAPSE]->(b:Note {project_id: $pid})
              WHERE s.weight >= $min_weight AND a.id < b.id
              RETURN a.id AS source_id, b.id AS target_id, s.weight AS weight
-             ORDER BY s.weight DESC",
+             ORDER BY s.weight DESC, source_id DESC, target_id DESC",
         )
         .param("pid", project_id.to_string())
         .param("min_weight", min_weight);

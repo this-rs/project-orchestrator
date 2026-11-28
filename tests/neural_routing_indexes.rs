@@ -38,7 +38,7 @@ use uuid::Uuid;
 fn startup_creates_the_vector_index_the_nn_router_queries() {
     // The chain is lib.rs → storage backend → neo4j::trajectory::open → ensure_indexes
     // (the storage refactor moved the call out of lib.rs; the guard follows it).
-    let storage = include_str!("../src/storage.rs");
+    let storage = include_str!("../src/storage/mod.rs");
     let trajectory = include_str!("../src/neo4j/trajectory.rs");
     assert!(
         storage.contains("trajectory::open("),

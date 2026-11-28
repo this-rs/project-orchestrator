@@ -149,6 +149,8 @@ impl Neo4jClient {
         half_life_days: f64,
         now: DateTime<Utc>,
     ) -> Result<usize> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         if !scope.default_enabled && scope.enabled.is_empty() {
             return Ok(0);
         }

@@ -179,7 +179,7 @@ impl Neo4jClient {
 
     /// List all users
     pub async fn list_users(&self) -> Result<Vec<UserNode>> {
-        let q = query("MATCH (u:User) RETURN u ORDER BY u.created_at DESC");
+        let q = query("MATCH (u:User) RETURN u ORDER BY u.created_at DESC, u.id DESC");
 
         let mut result = self.graph.execute(q).await?;
         let mut users = Vec::new();
@@ -495,7 +495,7 @@ impl Neo4jClient {
     ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
         let q = query(
             "MATCH (mt:McpToken {user_id: $user_id})
-             RETURN mt ORDER BY mt.created_at DESC",
+             RETURN mt ORDER BY mt.created_at DESC, mt.id DESC",
         )
         .param("user_id", user_id.to_string());
 

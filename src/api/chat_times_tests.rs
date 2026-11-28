@@ -263,13 +263,15 @@ mod mcp_realtime {
         .with_claude_cli_present(true)
         .with_event_emitter(event_bus.clone());
         let manager = Arc::new(match &nats {
-            Some(nats) => manager.with_nats(Arc::clone(nats)),
+            Some(nats) => {
+                manager.with_nats(Arc::clone(nats) as Arc<dyn crate::events::ChatTransport>)
+            }
             None => manager,
         });
         let mut state = server_state_with_chat(manager.clone(), graph).await;
         let state_mut = Arc::get_mut(&mut state).unwrap();
         state_mut.event_bus = event_bus.clone();
-        state_mut.nats_emitter = nats;
+        state_mut.nats_emitter = nats.map(|n| n as Arc<dyn crate::events::ChatTransport>);
         let router = crate::api::create_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

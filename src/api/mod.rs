@@ -26,6 +26,8 @@ pub mod handlers;
 pub mod hook_handlers;
 pub mod ingress_handlers;
 #[cfg(test)]
+mod journal_ws_tests;
+#[cfg(test)]
 mod keepalive_ws_tests;
 #[cfg(test)]
 pub(crate) mod list_routes_tests;

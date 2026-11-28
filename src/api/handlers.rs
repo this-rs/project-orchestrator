@@ -8,7 +8,7 @@ use crate::api::{
 };
 use crate::auth::extractor::AuthUser;
 use crate::chat::ChatManager;
-use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
+use crate::events::{ChatTransport, EventEmitter, HybridEmitter};
 use crate::graph::algorithms::add_thermal_noise;
 use crate::identity::InstanceIdentity;
 use crate::neo4j::models::{
@@ -43,7 +43,7 @@ pub struct ServerState {
     pub event_bus: Arc<HybridEmitter>,
     /// NATS emitter for inter-process chat events and interrupts.
     /// None when NATS is not configured (local-only mode).
-    pub nats_emitter: Option<Arc<NatsEmitter>>,
+    pub nats_emitter: Option<Arc<dyn ChatTransport>>,
     /// Auth config. `None` means **anonymous/open access**: `require_auth`
     /// injects anonymous claims and lets every request through (no JWT needed).
     /// Only intended for local single-user use; a WARN is logged at startup.
@@ -221,6 +221,10 @@ pub struct ServiceHealthStatus {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    /// Which storage backend built the stores (`storage.backend`): `default`
+    /// or `memory`. Read by the setup/health probes to tell an ephemeral,
+    /// in-memory instance from a Neo4j/Meili-backed one.
+    pub storage_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<ServiceHealthStatus>,
     /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
@@ -368,6 +372,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
         Json(HealthResponse {
             status: status.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            storage_backend: state.orchestrator.config().storage_backend.clone(),
             services: Some(ServiceHealthStatus {
                 neo4j: if neo4j_ok {
                     "connected".to_string()
@@ -5381,10 +5386,7 @@ pub async fn update_fabric_scores(
 
     // Also compute churn, knowledge_density, and risk scores
     let neo = state.orchestrator.neo4j();
-    let churn = neo
-        .compute_churn_scores(project_id)
-        .await
-        .unwrap_or_default();
+    let churn = neo.compute_churn_scores(project_id).await?;
     let churn_count = churn.len();
     let _ = neo.batch_update_churn_scores(&churn).await;
 
@@ -7466,10 +7468,9 @@ pub async fn get_plan_dependency_graph(
 
     // Batch-fetch enrichment data (counts + step details) for all tasks
     let task_ids: Vec<String> = tasks.iter().map(|t| t.id.to_string()).collect();
-    let enrichment = neo4j
-        .get_task_enrichment_data(&task_ids)
-        .await
-        .unwrap_or_default();
+    // A refusal must not become an empty enrichment: steps and counters at 0
+    // read as "nothing to do", which is a different answer from "cannot read".
+    let enrichment = neo4j.get_task_enrichment_data(&task_ids).await?;
 
     // Which of those sessions are actually running. This used to be read from
     // `cs.is_streaming` in Neo4j, a property nothing writes, so
@@ -9067,7 +9068,13 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let obj = json.as_object().expect("health payload is an object");
 
-        for key in ["status", "version", "services", "storage_capabilities"] {
+        for key in [
+            "status",
+            "version",
+            "storage_backend",
+            "services",
+            "storage_capabilities",
+        ] {
             assert!(obj.contains_key(key), "missing top-level key `{key}`");
         }
 

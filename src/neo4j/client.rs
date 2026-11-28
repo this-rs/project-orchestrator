@@ -313,6 +313,48 @@ impl WhereBuilder {
     }
 }
 
+/// How long startup waits for Neo4j before declaring it unreachable
+/// (`NEO4J_STARTUP_TIMEOUT_SECS`, default 3). Startup only: a running
+/// process keeps neo4rs' own reconnection.
+fn startup_connect_budget() -> std::time::Duration {
+    let secs = std::env::var("NEO4J_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The one-line startup failure: service, address, variable, time waited.
+fn startup_unreachable_error(uri: &str, waited: std::time::Duration, cause: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Neo4j is unreachable at {uri} after {:.1}s ({cause}). \
+         Fix NEO4J_URI (or neo4j.uri in config.yaml), or start Neo4j",
+        waited.as_secs_f32()
+    )
+}
+
+/// True when a driver error says the server cannot be reached (an
+/// infrastructure fault) rather than a schema statement being refused
+/// (e.g. the constraint already exists).
+fn is_infrastructure_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    [
+        "connection refused",
+        "io error",
+        "timed out",
+        "timeout",
+        "unreachable",
+        "broken pipe",
+        "connection reset",
+        "no route",
+        "dns",
+        "failed to lookup",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
 impl Neo4jClient {
     /// Manifest of the capabilities this adapter actually provides.
     ///
@@ -391,9 +433,32 @@ impl Neo4jClient {
             "Connecting to Neo4j with configured pool"
         );
 
-        let graph = Graph::connect(config)
-            .await
-            .context("Failed to connect to Neo4j")?;
+        let budget = startup_connect_budget();
+        let started = std::time::Instant::now();
+        // `Graph::connect` is lazy (the pool dials on first use) and neo4rs
+        // then retries with growing delays: probe with a bounded `RETURN 1`.
+        let probe = async {
+            let graph = Graph::connect(config).await?;
+            graph.run(query("RETURN 1")).await?;
+            Ok::<_, neo4rs::Error>(graph)
+        };
+        let graph = match tokio::time::timeout(budget, probe).await {
+            Ok(Ok(graph)) => graph,
+            Ok(Err(e)) => {
+                return Err(startup_unreachable_error(
+                    uri,
+                    started.elapsed(),
+                    &e.to_string(),
+                ))
+            }
+            Err(_) => {
+                return Err(startup_unreachable_error(
+                    uri,
+                    started.elapsed(),
+                    "no answer within the startup budget",
+                ))
+            }
+        };
 
         let client = Self {
             graph: Arc::new(graph),
@@ -443,6 +508,12 @@ impl Neo4jClient {
 
     /// Initialize the graph schema with constraints and indexes
     async fn init_schema(&self) -> Result<()> {
+        // The composite constraints below (anchor_session_target, day_plan_key,
+        // routing_arm_key, …) only hold if the engine actually enforces them. A
+        // backend without `composite_unique` would accept the schema but allow
+        // duplicate rows silently — fail loud instead.
+        self.capabilities()
+            .require("Neo4j", Capability::CompositeUnique)?;
         let constraints = vec![
             // Project constraints
             "CREATE CONSTRAINT project_id IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE",
@@ -794,13 +865,27 @@ impl Neo4jClient {
 
         for constraint in constraints {
             if let Err(e) = self.graph.run(query(constraint)).await {
-                tracing::warn!("Constraint may already exist: {}", e);
+                let msg = e.to_string();
+                if is_infrastructure_error(&msg) {
+                    return Err(anyhow::anyhow!(
+                        "Neo4j schema initialisation failed: the server is unreachable ({msg}). \
+                         Check NEO4J_URI and that Neo4j is running"
+                    ));
+                }
+                tracing::debug!("Constraint already exists or not applicable: {msg}");
             }
         }
 
         for index in indexes {
             if let Err(e) = self.graph.run(query(index)).await {
-                tracing::warn!("Index may already exist: {}", e);
+                let msg = e.to_string();
+                if is_infrastructure_error(&msg) {
+                    return Err(anyhow::anyhow!(
+                        "Neo4j schema initialisation failed: the server is unreachable ({msg}). \
+                         Check NEO4J_URI and that Neo4j is running"
+                    ));
+                }
+                tracing::debug!("Index already exists or not applicable: {msg}");
             }
         }
 
@@ -1384,5 +1469,45 @@ mod schema_expectation_tests {
         for anchor in ["anchor_id", "anchor_session_target", "anchor_event_id"] {
             assert!(EXPECTED_CONSTRAINTS.contains(&anchor), "{anchor}");
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_unreachable_tests {
+    use super::*;
+
+    #[test]
+    fn infrastructure_errors_are_told_from_existing_constraints() {
+        assert!(is_infrastructure_error(
+            "an IO error occurred: Connection refused (os error 61)"
+        ));
+        assert!(is_infrastructure_error("operation timed out"));
+        assert!(!is_infrastructure_error(
+            "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists: constraint exists"
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_against_a_closed_port_fails_fast_and_names_the_service() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let uri = format!("127.0.0.1:{port}");
+        let t = std::time::Instant::now();
+        let err = Neo4jClient::new(&uri, "neo4j", "x")
+            .await
+            .err()
+            .expect("startup must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            t.elapsed()
+        );
+        assert!(
+            msg.contains("Neo4j") && msg.contains(&uri) && msg.contains("NEO4J_URI"),
+            "{msg}"
+        );
     }
 }

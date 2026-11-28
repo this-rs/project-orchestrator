@@ -22,7 +22,8 @@ use uuid::Uuid;
 
 use crate::chat::manager::ChatManager;
 use crate::chat::types::ChatEvent;
-use crate::events::{NatsEmitter, Subscriber};
+use crate::events::chat_transport::{ChatTransport, JournalTransport, ReplayError};
+use crate::events::Subscriber;
 use crate::neo4j::models::ChatEventRecord;
 
 type RuntimeReceiver = broadcast::Receiver<ChatEvent>;
@@ -183,7 +184,7 @@ pub(crate) struct Disconnected;
 /// event loop continues with.
 pub(crate) async fn catch_up<S: FrameSink>(
     chat_manager: &ChatManager,
-    nats: Option<&NatsEmitter>,
+    transport: Option<&dyn ChatTransport>,
     session_id: &str,
     last_event: i64,
     sink: &mut S,
@@ -200,40 +201,46 @@ pub(crate) async fn catch_up<S: FrameSink>(
     const SKIP_REPLAY_THRESHOLD: i64 = 1_000_000_000_000;
 
     if last_event < SKIP_REPLAY_THRESHOLD {
-        let events = chat_manager
-            .get_events_since(session_id, last_event)
-            .await
-            .unwrap_or_default();
-
-        if !events.is_empty() {
-            for event in events {
-                if let Some(msg) = replayed_frame(&event) {
-                    if !sink.send_frame(msg).await {
-                        return Err(Disconnected);
-                    }
-                }
-            }
-        } else if last_event == 0 {
-            // Fallback: load from Nexus SDK for pre-migration sessions.
-            match chat_manager
-                .get_session_messages(session_id, None, None)
+        // The journal has its own durable cursor space. A reconnect on that
+        // transport never falls back to the graph's unrelated event sequence.
+        if let Some(journal) = transport.and_then(|transport| transport.as_journal()) {
+            replay_journal(sink, journal, session_id, last_event).await?;
+        } else {
+            let events = chat_manager
+                .get_events_since(session_id, last_event)
                 .await
-            {
-                Ok(loaded) => {
-                    for event in &loaded.events {
-                        if let Some(msg) = replayed_frame(event) {
-                            if !sink.send_frame(msg).await {
-                                return Err(Disconnected);
-                            }
+                .unwrap_or_default();
+
+            if !events.is_empty() {
+                for event in events {
+                    if let Some(msg) = replayed_frame(&event) {
+                        if !sink.send_frame(msg).await {
+                            return Err(Disconnected);
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "Failed to load message history for replay"
-                    );
+            } else if last_event == 0 {
+                // Fallback: load from Nexus SDK for pre-migration sessions.
+                match chat_manager
+                    .get_session_messages(session_id, None, None)
+                    .await
+                {
+                    Ok(loaded) => {
+                        for event in &loaded.events {
+                            if let Some(msg) = replayed_frame(event) {
+                                if !sink.send_frame(msg).await {
+                                    return Err(Disconnected);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to load message history for replay"
+                        );
+                    }
                 }
             }
         }
@@ -252,11 +259,11 @@ pub(crate) async fn catch_up<S: FrameSink>(
         active_rx
     };
 
-    let nats_chat_sub: Option<Subscriber> = if let Some(nats) = nats {
-        match nats.subscribe_remote_chat_events(session_id).await {
+    let nats_chat_sub: Option<Subscriber> = if let Some(transport) = transport {
+        match transport.subscribe_remote_chat_events(session_id).await {
             Ok(sub) => Some(sub),
             Err(e) => {
-                tracing::warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
+                tracing::warn!(session_id = %session_id, error = %e, "Failed to subscribe to chat transport events");
                 None
             }
         }
@@ -271,8 +278,8 @@ pub(crate) async fn catch_up<S: FrameSink>(
         chat_manager.get_streaming_snapshot(session_id).await;
 
     if !is_currently_streaming {
-        if let Some(nats) = nats {
-            if let Some(snapshot) = nats.request_streaming_snapshot(session_id).await {
+        if let Some(transport) = transport {
+            if let Some(snapshot) = transport.request_streaming_snapshot(session_id).await {
                 is_currently_streaming = snapshot.is_streaming;
                 partial_text = snapshot.partial_text;
                 streaming_events = snapshot.events;
@@ -363,6 +370,51 @@ pub(crate) async fn catch_up<S: FrameSink>(
     })
 }
 
+/// Replay only this session from the journal's shared cursor space. Report
+/// an expired cursor explicitly before continuing into live catch-up.
+async fn replay_journal<S: FrameSink>(
+    sink: &mut S,
+    journal: &JournalTransport,
+    session_id: &str,
+    since: i64,
+) -> Result<(), Disconnected> {
+    match journal.replay(since.max(0) as u64) {
+        Ok(events) => {
+            for entry in events
+                .into_iter()
+                .filter(|entry| entry.session_id == session_id)
+            {
+                let Ok(mut frame) = serde_json::to_value(&entry.event) else {
+                    continue;
+                };
+                if let Some(fields) = frame.as_object_mut() {
+                    fields.insert("seq".to_string(), serde_json::json!(entry.cursor));
+                    fields.insert("replaying".to_string(), serde_json::json!(true));
+                }
+                if !sink.send_frame(frame).await {
+                    return Err(Disconnected);
+                }
+            }
+        }
+        Err(ReplayError::CursorTooOld { oldest, requested }) => {
+            let frame = serde_json::json!({
+                "type": "error",
+                "code": "cursor_too_old",
+                "message": format!(
+                    "replay cursor {requested} is older than the journal's retained window \
+                     (oldest retained cursor {oldest}); a replay would be silently truncated"
+                ),
+                "oldest": oldest,
+                "requested": requested,
+            });
+            if !sink.send_frame(frame).await {
+                return Err(Disconnected);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +491,54 @@ mod tests {
                 .any(|f| f.get("type").and_then(|t| t.as_str()) == Some("replay_complete")),
             "replay_complete is always sent"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_uses_the_journal_cursor_and_keeps_sessions_separate() {
+        let state = mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = Uuid::new_v4().to_string();
+        let other_sid = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &sid).await;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = JournalTransport::open(dir.path().join("chat.log"), 2).unwrap();
+        for (session_id, content) in [
+            (&sid, "expired"),
+            (&other_sid, "other session"),
+            (&sid, "retained"),
+        ] {
+            journal.publish_chat_event(
+                session_id,
+                ChatEvent::UserMessage {
+                    content: content.to_string(),
+                },
+            );
+        }
+
+        let mut sink = VecSink(Vec::new());
+        catch_up(&manager, Some(&journal), &sid, 1, &mut sink)
+            .await
+            .unwrap();
+        let replay: Vec<_> = sink
+            .0
+            .iter()
+            .filter(|f| f["type"] == "user_message")
+            .collect();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0]["content"], "retained");
+        assert_eq!(replay[0]["seq"], 3);
+        assert_eq!(replay[0]["replaying"], true);
+
+        let mut expired = VecSink(Vec::new());
+        catch_up(&manager, Some(&journal), &sid, 0, &mut expired)
+            .await
+            .unwrap();
+        assert_eq!(expired.0[0]["code"], "cursor_too_old");
+        assert_eq!(expired.0[0]["oldest"], 2);
+        assert_eq!(expired.0[0]["requested"], 0);
+        assert!(expired.0.iter().all(|f| f["type"] != "user_message"));
+        assert!(expired.0.iter().any(|f| f["type"] == "replay_complete"));
     }
 
     #[tokio::test]

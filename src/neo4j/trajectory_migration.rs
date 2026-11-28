@@ -215,7 +215,7 @@ async fn get_session_ids(graph: &Graph, limit: usize) -> Result<Vec<Uuid>> {
     let q = query(
         "MATCH (s:ChatSession)
          RETURN s.id AS id
-         ORDER BY s.created_at DESC
+         ORDER BY s.created_at DESC, s.id DESC
          LIMIT $limit",
     )
     .param("limit", limit as i64);
