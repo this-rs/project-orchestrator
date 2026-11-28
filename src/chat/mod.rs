@@ -65,6 +65,7 @@ pub mod provider;
 #[cfg(test)]
 mod refs_wiring_tests;
 pub mod relay;
+pub mod residence;
 pub(crate) mod resume_guard;
 pub mod retrieval_trigger;
 pub mod routing;

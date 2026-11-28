@@ -1551,11 +1551,28 @@ impl AnchorCache {
 pub struct AnchorSession {
     pub mode: AnchorContextMode,
     pub cache: std::sync::Arc<AnchorCache>,
+    /// What this conversation has already been given, so a turn does not re-send
+    /// it (see [`super::residence`]). Shared by every turn of a session: the
+    /// manager owns it, so it outlives the per-turn `AnchorSession`.
+    pub residence: std::sync::Arc<super::residence::ResidenceLedger>,
 }
 
 impl AnchorSession {
     pub fn new(mode: AnchorContextMode, cache: std::sync::Arc<AnchorCache>) -> Self {
-        Self { mode, cache }
+        Self {
+            mode,
+            cache,
+            residence: super::residence::global(),
+        }
+    }
+
+    /// The session's residence ledger, as the manager owns it.
+    pub fn with_residence(
+        mut self,
+        residence: std::sync::Arc<super::residence::ResidenceLedger>,
+    ) -> Self {
+        self.residence = residence;
+        self
     }
 }
 

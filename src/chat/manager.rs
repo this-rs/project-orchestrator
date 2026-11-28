@@ -1939,7 +1939,23 @@ pub(crate) async fn enrichment_for_turn(
         restricted_content,
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
-    let ctx = pipeline.execute(&input).await;
+    let mut ctx = pipeline.execute(&input).await;
+    // What this conversation was already given in full becomes a bounded pointer:
+    // a block written at an earlier turn is still in the prefix, and re-sending it
+    // pays for the same characters again on every later request (GEO-14). The
+    // projection changes, never the block: the first delivery stays where it is,
+    // and anything that changed materially is delivered in full.
+    let residence = anchor.residence.apply(uuid, &mut ctx.sections);
+    if residence.pointers > 0 {
+        debug!(
+            session_id = %session_id,
+            sections = residence.sections,
+            delivered = residence.delivered,
+            pointers = residence.pointers,
+            chars_saved = residence.chars_saved,
+            "[residence] a block already given this conversation is pointed at"
+        );
+    }
     let mut parts: Vec<String> = Vec::new();
     if !live_block.is_empty() {
         // The live block opens the enrichment, like the other stages: never the prefix.
@@ -9779,6 +9795,13 @@ impl ChatManager {
             }
         };
 
+        // The same clock as the native engine (GEO-14): a turn began here, and the
+        // residence ledger counts turns by the engine's, not by the number of times
+        // a prompt was projected (a retry must not point at an unsent message).
+        if let Ok(turn_uuid) = Uuid::parse_str(&session_id) {
+            super::residence::global().begin_turn(turn_uuid);
+        }
+
         // When the turn started: the duration of a stopped turn the CLI gave none
         // (`interrupted_turn_end`).
         let turn_started = std::time::Instant::now();
@@ -11156,6 +11179,15 @@ impl ChatManager {
         };
 
         // 1. Post-compaction context re-injection
+        // A compaction rewrites the history the pointers refer to: what this
+        // conversation was given in full is no longer guaranteed to be there, so the
+        // residence ledger is dropped and the next turn delivers everything again
+        // (GEO-14). A pointer to a message nobody kept would be a lie.
+        if needs_post_compaction_injection {
+            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                super::residence::global().forget(uuid);
+            }
+        }
         steps
             .run(
                 "post_compaction",
@@ -20257,6 +20289,9 @@ impl ChatManager {
     ) -> Result<()> {
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             self.anchor_cache.forget(uuid);
+            // A reopened session starts with an empty prefix: everything is delivered
+            // again rather than pointed at a message nobody kept.
+            super::residence::global().forget(uuid);
         }
         // Any close but the Done release (which marks the session AFTER this) ends the
         // team's right to resume it.
