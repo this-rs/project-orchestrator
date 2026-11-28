@@ -33,7 +33,7 @@ TRANSCRIPTS = os.environ.get(
 # [S] Barème NON validé. L'ajustement tombe à 0,2 % sur ses propres données : c'est
 # du surapprentissage, pas une preuve. En leave-one-out l'erreur empirique de
 # prédiction est de 12,7 % — une erreur de prédiction ponctuelle, PAS un intervalle
-# de confiance. Préférer toujours les prix DÉCLARÉS par le provider (--prices).
+# de confiance. Les prix déclarés par le provider restent la référence.
 R_CACHE_WRITE, R_CACHE_READ, R_OUTPUT = 1.25, 0.10, 5.00
 CHARS_PER_TOKEN = 3.6                                       # [S] ordre de grandeur
 SEP = "\n\n---\n\n"                                         # frontière enrichissement PO / texte
@@ -42,7 +42,7 @@ SEP = "\n\n---\n\n"                                         # frontière enrichi
 def sessions(root=None):
     for d in sorted(glob.glob(root or TRANSCRIPTS)):
         for f in glob.glob(os.path.join(d, "*.jsonl")):
-            yield os.path.basename(d).split("chat-neutral-")[-1][:8], f
+            yield os.path.basename(d).split("chat-neutral-")[-1], f
 
 
 def scan(f):
@@ -188,6 +188,33 @@ def report(rows, label=""):
     return rel
 
 
+def leave_one_session_out(rows):
+    """Estime le coût d'un transcript avec les prix ajustés sur d'autres sessions."""
+    by_session = collections.defaultdict(list)
+    for row in rows:
+        by_session[row["sid"]].append(row)
+
+    error_usd = comparable_usd = scored = unnotable = singular = 0
+    for sid, held_out in by_session.items():
+        prices, _ = solve_prices([row for row in rows if row["sid"] != sid])
+        for row in held_out:
+            needed = {model for model, usage in row["mu"].items()
+                      if model != "<synthetic>" and units(usage) > 0}
+            if not needed or not needed.issubset(prices):
+                unnotable += 1
+                continue
+            if any(not 0 <= prices[model] < float("inf") for model in needed):
+                singular += 1
+                continue
+            estimated = sum(units(row["mu"][model]) * prices[model] for model in needed)
+            error_usd += abs(estimated - row["usd"])
+            comparable_usd += row["usd"]
+            scored += 1
+
+    error_pct = 100 * error_usd / comparable_usd if comparable_usd else None
+    return error_pct, scored, unnotable, singular
+
+
 def selftest():
     """Fixtures synthétiques : aucune dépendance au corpus réel."""
     d = tempfile.mkdtemp()
@@ -251,6 +278,19 @@ def selftest():
     p, err = solve_prices(rows)
     if not abs(p.get("m1", 0) - 1.0) < 0.01:
         fails.append(f"prix mal résolu : attendu 1.0, obtenu {p.get('m1')}")
+    # Deux factures à usage égal. L'ajustement à 6 % masque une erreur de
+    # prédiction à 12 %. Un autre fichier du même dossier doit rester exclu.
+    usage = {"m1": {"inputTokens": 1_000_000}}
+    holdout = [{"sid": "a", "usd": 0.94, "mu": usage},
+               {"sid": "b", "usd": 1.06, "mu": usage}]
+    _, fit_errors = solve_prices(holdout)
+    error_pct, scored, _, _ = leave_one_session_out(holdout)
+    if not (sum(fit_errors) / 2 < 0.10 and error_pct is not None
+            and abs(error_pct - 12) < 0.01 and scored == 2):
+        fails.append("l'ajustement et la validation hors session ne sont pas distingués")
+    error_pct, scored, _, _ = leave_one_session_out([holdout[0], holdout[0]])
+    if error_pct is not None or scored:
+        fails.append("un autre fichier de la session a servi à ajuster ses propres prix")
     for msg in fails:
         print("ÉCHEC:", msg)
     print("selftest OK" if not fails else f"selftest : {len(fails)} échec(s)")
@@ -293,27 +333,12 @@ def main():
         sizes = sorted(sz for _, sz in allb)
         print(f"[M] blobs d'injection système : lignes={len(allb)}, empreintes distinctes={len(hashes)}, "
               f"taille médiane={sizes[len(sizes) // 2]:,} carr. (non attribuables par requête depuis ces lignes)")
-    # VALIDATION HORS ÉCHANTILLON — leave-one-out. Une session retirée est prédite
-    # par les prix appris SANS elle. Elle n'est notable que si tous ses modèles sont
-    # appris ailleurs ; sinon elle est comptée comme non notable, jamais dans l'erreur.
     rows.sort(key=lambda r: r["sid"])
-    tot_err = tot_noted = scored = unnotable = singular = 0
-    for i, r in enumerate(rows):
-        prices, _ = solve_prices([x for j, x in enumerate(rows) if j != i])
-        if not prices or any(v != v for v in prices.values()):
-            singular += 1
-            continue
-        need = [m for m in r["mu"] if m != "<synthetic>" and units(r["mu"][m]) > 0]
-        if any(m not in prices for m in need):
-            unnotable += 1
-            continue
-        tot_err += abs(sum(units(r["mu"].get(m, {})) * prices[m] for m in prices) - r["usd"])
-        tot_noted += r["usd"]
-        scored += 1
-    print(f"[R] leave-one-out : notées={scored}/{len(rows)}, non notables={unnotable} "
-          f"(modèle absent des autres), singulières={singular}, "
-          f"erreur={100 * tot_err / tot_noted:.1f}%" if tot_noted else
-          "[R] leave-one-out : aucune session notable (corpus trop mince)")
+    error_pct, scored, unnotable, singular = leave_one_session_out(rows)
+    error_label = f"{error_pct:.1f}%" if error_pct is not None else "indisponible"
+    print(f"[R] leave-one-out par session : transcriptions comparables={scored}/{len(rows)}, "
+          f"usages non comparables={unnotable}, ajustements inutilisables={singular}, "
+          f"erreur={error_label}")
     print("[R] NB : l'erreur sur le corpus complet (ci-dessous) n'est PAS une validation, "
           "c'est un ajustement sur ses propres données.")
     report(rows, "corpus complet")
@@ -321,17 +346,17 @@ def main():
     big = max(rows, key=lambda r: r["usd"])
     res = residence(big["path"], big["floor"])
     tots = sum(res.values())
-    print(f"\n[R] RÉSIDENCE — session {big['sid']} ({big['usd']:.2f} USD, {big['n']} requêtes, "
+    print(f"\n[R] RÉSIDENCE — session {big['sid'][:8]} ({big['usd']:.2f} USD, {big['n']} requêtes, "
           f"plancher {big['floor']:,.0f} j)")
     for cat, v in res.most_common(8):
         print(f"   {cat:44} {v/1e6:7.1f} M jetons-lus  {100*v/tots:5.1f}%")
 
     if check:
-        prices, err = solve_prices(rows)
-        rel = 100 * sum(err) / max(1e-9, total)
         fails = []
-        if rel > 10:
-            fails.append(f"modèle de coût à {rel:.1f}% (>10%) : multiplicateurs faux")
+        if scored != len(rows):
+            fails.append(f"recoupement hors session incomplet : {scored}/{len(rows)} transcriptions")
+        if error_pct is not None and error_pct > 10:
+            fails.append(f"erreur de coût hors session à {error_pct:.1f}% (>10%)")
         if not (1 <= tots / max(1, big["n"] * big["floor"]) <= 60):
             fails.append("résidence incohérente avec le contexte observé")
         for f_ in fails:
