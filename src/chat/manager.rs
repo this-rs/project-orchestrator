@@ -1939,7 +1939,28 @@ pub(crate) async fn enrichment_for_turn(
         restricted_content,
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
-    let ctx = pipeline.execute(&input).await;
+    let mut ctx = pipeline.execute(&input).await;
+    // What this conversation was already given in full becomes a bounded pointer:
+    // a block written at an earlier turn is still in the prefix, and re-sending it
+    // pays for the same characters again on every later request (GEO-14). The
+    // projection changes, never the block: the first delivery stays where it is,
+    // and anything that changed materially is delivered in full.
+    let cap = super::composer::turn_enrichment_cap(window_tokens);
+    let (md, residence) = anchor
+        .residence
+        .apply_with_render(uuid, &mut ctx.sections, |sections| {
+            super::enrichment::EnrichmentContext::render_capped_sections(sections, cap)
+        });
+    if residence.pointers > 0 {
+        debug!(
+            session_id = %session_id,
+            sections = residence.sections,
+            delivered = residence.delivered,
+            pointers = residence.pointers,
+            chars_saved = residence.chars_saved,
+            "[residence] a block already given this conversation is pointed at"
+        );
+    }
     let mut parts: Vec<String> = Vec::new();
     if !live_block.is_empty() {
         // The live block opens the enrichment, like the other stages: never the prefix.
@@ -1954,8 +1975,6 @@ pub(crate) async fn enrichment_for_turn(
         );
         // Clean markdown prepended to the user message (replaces the old XML-wrapped
         // <enrichment_context> format).
-        let md = ctx
-            .to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
         if !md.is_empty() {
             parts.push(md);
         }
@@ -2743,6 +2762,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
+        if let Some(uuid) = uuid {
+            let residence = super::residence::global();
+            if outcome.compacted {
+                residence.forget(uuid);
+            } else {
+                residence.finish_turn(uuid, outcome.answered);
+            }
+        }
         // PREFIX-CC : le routeur de la session mémorise le préfixe facturé au tour (lectures
         // de cache comprises) — la meilleure estimation du préfixe lu en cache du tour suivant
         // pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens` (Claude Code).
@@ -9779,6 +9806,13 @@ impl ChatManager {
             }
         };
 
+        // The same clock as the native engine (GEO-14): a turn began here, and the
+        // residence ledger counts turns by the engine's, not by the number of times
+        // a prompt was projected (a retry must not point at an unsent message).
+        if let Ok(turn_uuid) = Uuid::parse_str(&session_id) {
+            super::residence::global().begin_turn(turn_uuid);
+        }
+
         // When the turn started: the duration of a stopped turn the CLI gave none
         // (`interrupted_turn_end`).
         let turn_started = std::time::Instant::now();
@@ -9818,6 +9852,7 @@ impl ChatManager {
         // Track whether a CompactBoundary was received during this stream turn.
         // When true, we'll rebuild and re-inject project context after the stream ends.
         let mut needs_post_compaction_injection = false;
+        let mut residence_answered = false;
 
         // The ONE expansion of this turn's stored message (`refs::turn`, shared with
         // the agent runtime): the visible text, the `<po-context>` pointers of its
@@ -10641,6 +10676,15 @@ impl ChatManager {
                                 }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
+                                    if matches!(
+                                        &event,
+                                        ChatEvent::Result {
+                                            is_error: false,
+                                            ..
+                                        }
+                                    ) {
+                                        residence_answered = true;
+                                    }
                                     if let Some(call) = super::session_grants::observed_call(
                                         super::session_grants::Asker::ClaudeCode,
                                         &event,
@@ -11156,6 +11200,18 @@ impl ChatManager {
         };
 
         // 1. Post-compaction context re-injection
+        // A compaction rewrites the history the pointers refer to: what this
+        // conversation was given in full is no longer guaranteed to be there, so the
+        // residence ledger is dropped and the next turn delivers everything again
+        // (GEO-14). A pointer to a message nobody kept would be a lie.
+        if let Some(uuid) = session_uuid {
+            let residence = super::residence::global();
+            if needs_post_compaction_injection {
+                residence.forget(uuid);
+            } else {
+                residence.finish_turn(uuid, residence_answered);
+            }
+        }
         steps
             .run(
                 "post_compaction",
@@ -20257,6 +20313,9 @@ impl ChatManager {
     ) -> Result<()> {
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             self.anchor_cache.forget(uuid);
+            // A reopened session starts with an empty prefix: everything is delivered
+            // again rather than pointed at a message nobody kept.
+            super::residence::global().forget(uuid);
         }
         // Any close but the Done release (which marks the session AFTER this) ends the
         // team's right to resume it.
@@ -23891,6 +23950,9 @@ mod tests {
             [
                 "NEXUS_TOOLS_KEY",
                 "NEXUS_TOOLS_PROFILE",
+                // The session's own directories, for `validate`: the same scope as its
+                // file tools, never a wider one (see `nexus_tools::launch`).
+                "PO_VALIDATE_ROOTS",
                 "TEMP",
                 "TMP",
                 "TMPDIR"

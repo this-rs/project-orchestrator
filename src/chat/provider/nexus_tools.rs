@@ -1688,6 +1688,22 @@ pub async fn attach(
     args.push(tools.join(","));
     args.extend(engine_args);
     let mut env = token.environment();
+    // `validate` runs in the session's OWN directories and nowhere else — the same scope
+    // as its file tools, never a wider one. Nothing set this before, so the validator kept
+    // only the engine's launch directory: on every project opened elsewhere the tool
+    // answered `working directory ... is not authorized`, which is why it was called 0
+    // times across 782 measured sessions. A brick that costs nothing and does nothing is
+    // worse than no brick: it reads as a saving already taken.
+    {
+        let mut roots: Vec<std::path::PathBuf> = vec![input.cwd.to_path_buf()];
+        roots.extend(extra_dirs.iter().cloned());
+        if let Ok(joined) = std::env::join_paths(&roots) {
+            env.insert(
+                "PO_VALIDATE_ROOTS".to_owned(),
+                joined.to_string_lossy().into_owned(),
+            );
+        }
+    }
     // A temporary directory of its own: `nexus-tools` keeps the outputs of its commands in
     // `<tmp>/nexus-tools-<pid>`, which the hooks then know to be this session's (and only it).
     if let Some(tmp) = session_temp_dir(input.session_id) {
