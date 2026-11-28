@@ -5780,6 +5780,10 @@ impl ChatManager {
                             }
                         } else {
                             // Not streaming — persist user_message, broadcast, spawn stream
+                            // One turn id for the whole turn: the user_message event and the
+                            // stream deltas must share it, including for an old NATS RPC
+                            // message that carried no `turn_id` (else each would mint its own).
+                            let turn_id = request.turn_id.unwrap_or_else(Uuid::new_v4);
                             if let Ok(uuid) = Uuid::parse_str(&session_id) {
                                 // Update message count
                                 if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
@@ -5798,7 +5802,7 @@ impl ChatManager {
 
                                 // Persist user_message event, stamped with the origin's turn id.
                                 let user_event = crate::neo4j::models::ChatEventRecord {
-                                    id: request.turn_id.unwrap_or_else(Uuid::new_v4),
+                                    id: turn_id,
                                     session_id: uuid,
                                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
                                     event_type: "user_message".to_string(),
@@ -5866,7 +5870,7 @@ impl ChatManager {
                                     search_clone,
                                     documents_clone,
                                     cognitive_routing_clone,
-                                    request.turn_id.unwrap_or_else(Uuid::new_v4),
+                                    turn_id,
                                 )
                                 .await;
                             });
@@ -35512,6 +35516,113 @@ mod tests {
     // ========================================================================
     // NATS RPC routing tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn a_legacy_rpc_without_a_turn_id_correlates_the_prompt_and_delta() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let state = mock_app_state();
+        let session = crate::test_helpers::test_chat_session(None);
+        state.neo4j.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let peer = NatsEmitter::new(broker.client().await, "events");
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(owner);
+        let mut cli = test_support::insert_mock_cli_session(&manager, &sid).await;
+        let mut events = manager.subscribe(&sid).await.unwrap();
+        let cancel = CancellationToken::new();
+        manager.spawn_nats_rpc_listener(&sid, manager.active_sessions.clone(), cancel.clone());
+
+        // Wait for the RPC listener with a request that cannot start a turn.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if peer
+                    .request_send_message(&sid, "", "set_auto_continue", None)
+                    .await
+                    .is_some_and(|reply| reply.success)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the owner listens for RPCs");
+
+        let reply = peer
+            .request_send_message(&sid, "from afar", "user_message", None)
+            .await
+            .expect("the legacy owner replies");
+        assert!(reply.success, "{reply:?}");
+        let prompt = tokio::time::timeout(Duration::from_secs(5), cli.sent_input_rx.recv())
+            .await
+            .expect("the CLI receives the RPC prompt")
+            .unwrap();
+        assert!(prompt.message["content"].to_string().contains("from afar"));
+
+        cli.inbound_message_tx
+            .send(Message::StreamEvent {
+                event: StreamEventData::ContentBlockDelta {
+                    index: 0,
+                    delta: StreamDelta::TextDelta {
+                        text: "remote reply".into(),
+                    },
+                },
+                session_id: None,
+                parent_tool_use_id: None,
+            })
+            .unwrap();
+        let delta = next_matching(&mut events, |event| {
+            matches!(
+                event,
+                ChatEvent::StreamDelta { .. } | ChatEvent::Error { .. }
+            )
+        })
+        .await;
+        let user_events: Vec<_> = manager
+            .get_events_since(&sid, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "user_message")
+            .collect();
+        assert_eq!(user_events.len(), 1, "one persisted prompt for one RPC");
+        assert!(
+            matches!(&delta, ChatEvent::StreamDelta {
+                turn_id: Some(id), offset: Some(0), ..
+            } if *id == user_events[0].id),
+            "delta {delta:?} must identify persisted prompt {}",
+            user_events[0].id,
+        );
+
+        cli.inbound_message_tx
+            .send(Message::Result {
+                subtype: "success".into(),
+                duration_ms: 1,
+                duration_api_ms: 1,
+                is_error: false,
+                num_turns: 1,
+                session_id: sid,
+                total_cost_usd: None,
+                usage: None,
+                result: None,
+                structured_output: None,
+            })
+            .unwrap();
+        next_matching(&mut events, |event| {
+            matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        cancel.cancel();
+    }
 
     #[tokio::test]
     async fn an_event_on_a_dormant_thread_reaches_local_websocket_subscribers_over_nats() {
