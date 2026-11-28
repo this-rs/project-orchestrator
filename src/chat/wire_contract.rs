@@ -445,10 +445,14 @@ fn server_examples() -> Vec<ServerExample> {
             ChatEvent::StreamDelta {
                 text: s("I will "),
                 parent_tool_use_id: parent(),
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::StreamDelta {
                 text: s("I will "),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             },
         ),
         ServerExample::same(ChatEvent::StreamingStatus { is_streaming: true }),

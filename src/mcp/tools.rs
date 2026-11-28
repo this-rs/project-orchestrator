@@ -47,6 +47,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         trajectory_tool(),
         lifecycle_hook_tool(),
         mcp_federation_tool(),
+        validate_tool(),
     ]
 }
 
@@ -962,7 +963,7 @@ fn chat_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "close_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions"],
+                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "close_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions", "usage", "interrupt"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID. For send_message: resume this existing session instead of creating a new one (omit to start a new conversation)"},
@@ -981,6 +982,8 @@ fn chat_tool() -> ToolDefinition {
                 "entity_id": {"type": "string", "description": "Entity UUID (associate_with): plan or task UUID to link"},
                 "source": {"type": "string", "description": "Link source (associate_with): 'manual', 'auto', etc. Default: 'manual'"},
                 "run_id": {"type": "string", "description": "PlanRun UUID (get_run_sessions)"},
+                "scope": {"type": "string", "description": "Interrupt scope (interrupt): 'turn' (ends the turn only, background subprocesses stay alive) or 'turn_and_tools' (default; also stops every descendant CLI tool)"},
+                "cascade": {"type": "boolean", "description": "Also stop every descendant session (interrupt, delegation cascade)"},
                 "project_id": {"type": "string", "description": "Project UUID (get_session_entities — scoping filter)"},
                 "limit": {"type": "integer", "description": "Max items"},
                 "text": {"type": "string", "description": "The message (team_message)"},
@@ -1637,6 +1640,30 @@ fn mcp_federation_tool() -> ToolDefinition {
     }
 }
 
+fn validate_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "validate".to_string(),
+        description: "Run a bounded validation command and return a short deterministic digest instead of the raw output. The full output is preserved in an immutable artifact addressed by its sha256; the `read` action fetches an exact slice without re-running the command.".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["test", "check", "git_status", "read"],
+                    "description": "Operation to perform"
+                },
+                "cwd": {"type": "string", "description": "Working directory (test/check/git_status). Refused unless authorized."},
+                "command_args": {"type": "array", "items": {"type": "string"}, "description": "Extra arguments appended to the cargo command (test/check), e.g. a test filter"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (test/check/git_status, default 120000)"},
+                "artefact": {"type": "string", "description": "Artifact sha256 ref to read (read)"},
+                "from_line": {"type": "integer", "description": "First line, 0-based inclusive (read, default 0)"},
+                "to_line": {"type": "integer", "description": "Last line, 0-based exclusive (read, default from_line+80)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1648,8 +1675,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            33,
-            "Expected 33 mega-tools, got {}",
+            34,
+            "Expected 34 mega-tools, got {}",
             tools.len()
         );
     }

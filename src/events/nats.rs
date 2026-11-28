@@ -11,6 +11,7 @@ use super::types::{CrudEvent, EventEmitter, TransportState};
 use crate::chat::types::ChatEvent;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::chat_transport::{ChatTransport, RelayFailure, StreamingSnapshot};
 use super::transport::{Message, Subject, Subscriber};
@@ -30,6 +31,10 @@ pub struct ChatRpcRequest {
     pub message: String,
     /// Message type: "user_message", "permission_response", "input_response"
     pub message_type: String,
+    /// Stable turn id (the id of the persisted `user_message` event). Absent
+    /// for an older caller: the receiving instance then mints its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<Uuid>,
 }
 
 /// Response payload for cross-instance chat message routing via NATS request/reply.
@@ -487,11 +492,13 @@ impl NatsEmitter {
         session_id: &str,
         message: &str,
         message_type: &str,
+        turn_id: Option<Uuid>,
     ) -> Option<ChatRpcResponse> {
         let subject = self.rpc_send_subject(session_id);
         let request = ChatRpcRequest {
             message: message.to_string(),
             message_type: message_type.to_string(),
+            turn_id,
         };
 
         let payload = match serde_json::to_vec(&request) {
@@ -730,8 +737,9 @@ impl ChatTransport for NatsEmitter {
         session_id: &str,
         message: &str,
         message_type: &str,
+        turn_id: Option<Uuid>,
     ) -> Option<ChatRpcResponse> {
-        NatsEmitter::request_send_message(self, session_id, message, message_type).await
+        NatsEmitter::request_send_message(self, session_id, message, message_type, turn_id).await
     }
 
     fn request_cancel<'a>(
@@ -899,6 +907,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "tok".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::Error {
@@ -942,6 +952,7 @@ mod tests {
         let request = ChatRpcRequest {
             message: "Hello world".to_string(),
             message_type: "user_message".to_string(),
+            turn_id: None,
         };
 
         let payload = serde_json::to_vec(&request).unwrap();
@@ -989,6 +1000,7 @@ mod tests {
             let request = ChatRpcRequest {
                 message: "test".to_string(),
                 message_type: msg_type.to_string(),
+                turn_id: None,
             };
             let payload = serde_json::to_vec(&request).unwrap();
             let deserialized: ChatRpcRequest = serde_json::from_slice(&payload).unwrap();

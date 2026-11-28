@@ -16,6 +16,8 @@ pub mod content_policy;
 pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
+pub mod renewal;
+pub mod renewal_store;
 
 pub mod activation_registry;
 #[cfg(test)]
@@ -39,6 +41,7 @@ pub mod envelope;
 /// T9: offline transverse evaluation (labeled fixtures, three arms, leak gate).
 #[cfg(test)]
 mod eval_transverse;
+pub mod event_stream;
 pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod lasting_rules;
@@ -62,6 +65,7 @@ pub mod provider;
 #[cfg(test)]
 mod refs_wiring_tests;
 pub mod relay;
+pub mod residence;
 pub(crate) mod resume_guard;
 pub mod retrieval_trigger;
 pub mod routing;

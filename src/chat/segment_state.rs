@@ -1047,6 +1047,8 @@ mod tests {
         let d = |s: &str| ChatEvent::StreamDelta {
             text: s.into(),
             parent_tool_use_id: None,
+            turn_id: None,
+            offset: None,
         };
         tail.record(
             &ChatEvent::UserMessage {

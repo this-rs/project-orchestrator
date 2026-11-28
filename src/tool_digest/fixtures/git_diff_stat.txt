@@ -1,0 +1,3 @@
+ a.txt | 3 ++-
+ b.txt | 1 +
+ 2 files changed, 3 insertions(+), 1 deletion(-)

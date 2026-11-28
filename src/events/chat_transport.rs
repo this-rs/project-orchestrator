@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Why a cancel asked of another instance came back without an answer
 /// ([`ChatTransport::request_cancel`]).
@@ -132,11 +133,13 @@ pub trait ChatTransport: Send + Sync {
     /// Ask the instance that owns a session to send a message to it (the RPC
     /// "send a message" request), returning its `ChatRpcResponse`, or `None`
     /// when nobody answers within the timeout.
+    /// A supplied `turn_id` correlates the persisted message with its streamed response.
     async fn request_send_message(
         &self,
         session_id: &str,
         message: &str,
         message_type: &str,
+        turn_id: Option<Uuid>,
     ) -> Option<ChatRpcResponse>;
 
     /// Ask the instance that owns a session to cancel it, returning its raw
@@ -348,6 +351,7 @@ impl ChatTransport for InMemoryChatTransport {
         _session_id: &str,
         _message: &str,
         _message_type: &str,
+        _turn_id: Option<Uuid>,
     ) -> Option<ChatRpcResponse> {
         None
     }
@@ -746,6 +750,7 @@ impl ChatTransport for JournalTransport {
         _session_id: &str,
         _message: &str,
         _message_type: &str,
+        _turn_id: Option<Uuid>,
     ) -> Option<ChatRpcResponse> {
         None
     }

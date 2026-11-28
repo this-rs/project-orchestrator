@@ -2016,6 +2016,13 @@ impl AgentSessionHandle {
         self.arm_turn_watchdog(self.turn_generation());
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
+        // The residence ledger's clock moves with the engine's, here: the enrichment
+        // of this turn asks it which blocks the conversation was already given in
+        // full, and a prompt projected twice within one turn must not count as two
+        // turns — a pointer would name a message the provider never received (GEO-14).
+        if let Ok(uuid) = uuid::Uuid::parse_str(&self.session_id) {
+            crate::chat::residence::global().begin_turn(uuid);
+        }
         let from_user = kind == PendingMessageKind::User;
         match kind {
             PendingMessageKind::SystemHint => {
