@@ -3079,18 +3079,29 @@ mod anonymous_warning_tests {
         assert!(anonymous_mode_warning(true, &addr).is_none());
     }
 
-    /// Default bind (`0.0.0.0`): the warning says every interface, and says
-    /// nothing about loopback.
+    /// Default bind: the warning says every interface, and says nothing about
+    /// loopback. Both wildcards are covered — `::` is a bind an operator can
+    /// pick, and the message must describe it as the same exposure as `0.0.0.0`.
     #[test]
-    fn the_default_bind_is_described_as_every_interface() {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 17690));
-        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
-        assert!(msg.contains("0.0.0.0:17690 (every interface)"), "{msg}");
-        assert!(
-            msg.contains("anyone who can reach this port has full access"),
-            "{msg}"
-        );
-        assert!(!msg.contains("loopback"), "{msg}");
+    fn a_wildcard_bind_is_described_as_every_interface() {
+        for (addr, shown) in [
+            (
+                std::net::SocketAddr::from(([0, 0, 0, 0], 17690)),
+                "0.0.0.0:17690",
+            ),
+            (
+                std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 17690)),
+                "[::]:17690",
+            ),
+        ] {
+            let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+            assert!(msg.contains(&format!("{shown} (every interface)")), "{msg}");
+            assert!(
+                msg.contains("anyone who can reach this port has full access"),
+                "{msg}"
+            );
+            assert!(!msg.contains("loopback"), "{msg}");
+        }
     }
 
     /// Regression of the #1343 review: a loopback bind was described as
