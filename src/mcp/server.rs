@@ -223,7 +223,7 @@ impl McpServer {
             .await;
 
         let tool_result = match result {
-            Ok(value) => ToolCallResult::success(json_to_compact(&value)),
+            Ok(value) => ToolCallResult::success(render_tool_result(&value)),
             Err(e) => {
                 error!("Tool error: {}", e);
                 ToolCallResult::error(e.to_string())
@@ -231,6 +231,19 @@ impl McpServer {
         };
 
         serde_json::to_value(tool_result).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+    }
+}
+
+/// How one tool result reaches the model.
+///
+/// A tool that answers with TEXT answers with text: rendered through the structured
+/// formatter, a text result would be JSON-escaped onto a single line, and the line
+/// ranges of `validate read` would mean nothing — the reconstruction of an artefact
+/// depends on them (review of #1337, case 2).
+pub(crate) fn render_tool_result(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => json_to_compact(other),
     }
 }
 

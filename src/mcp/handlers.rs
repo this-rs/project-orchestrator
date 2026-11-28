@@ -949,22 +949,26 @@ impl ToolHandler {
     /// (e.g. "list_projects") for backward-compatible routing.
     pub async fn handle(&self, name: &str, args: Option<Value>) -> Result<Value> {
         let mut args = args.unwrap_or(json!({}));
-        // `full: true` — the caller wants the raw payload, not a projection (GEO-6).
-        // Read HERE, before dispatch, so no handler ever sees the switch as one of its
-        // own arguments.
-        let full = args
-            .as_object_mut()
-            .and_then(|map| map.remove("full"))
-            .and_then(|flag| flag.as_bool())
-            .unwrap_or(false);
         let start = std::time::Instant::now();
 
         // ── External MCP dispatch (server_id::tool_name) ────────────────
+        // BEFORE anything touches the arguments: a federated tool keeps its own
+        // `full` (or any other key) intact — its contract is not PO's (review of
+        // #1337, case 3).
         if let Some((server_id, tool_name)) = name.split_once("::") {
             return self
                 .handle_external(&self.mcp_registry, server_id, tool_name, args, start)
                 .await;
         }
+
+        // `full: true` — the caller wants the raw payload, not a projection (GEO-6).
+        // Read here, for PO's own tools only, so no handler ever sees the switch as
+        // one of its own arguments.
+        let full = args
+            .as_object_mut()
+            .and_then(|map| map.remove("full"))
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
 
         // ── Mega-tool resolution ────────────────────────────────────────
         let orig_name = name;
@@ -1038,7 +1042,11 @@ impl ToolHandler {
     /// so the handle outlives the session and a slice costs no re-execution. A
     /// projection that fails returns the untouched response: never a lost answer.
     fn budget(&self, tool: &str, value: Value, full: bool) -> Value {
-        if full {
+        // Never project the tool that exists to bound things: `validate read` returns
+        // the exact lines a caller asked for, and a slice over the budget would be
+        // projected again — the reconstruction could never close (review of #1337,
+        // case 2).
+        if full || tool == "validate" {
             return value;
         }
         let store = crate::tool_digest::ArtifactStore::new(self.validator.store_dir());
@@ -6870,12 +6878,11 @@ impl ToolHandler {
                     .map(|t| t.max(0) as usize)
                     .unwrap_or(from_line + 80);
                 let text = self.validator.read_portion(&artefact, from_line, to_line)?;
-                Ok(Some(json!({
-                    "artefact": artefact,
-                    "from_line": from_line,
-                    "to_line": to_line,
-                    "text": text,
-                })))
+                // The slice IS text, and it is returned as text: wrapped in an object,
+                // the structured formatter would JSON-escape its newlines onto a single
+                // line — exactly the property a line range exists to give (review of
+                // #1337, case 2: bounded slices, exact reconstruction).
+                Ok(Some(Value::String(text)))
             }
 
             // ── All tools migrated ──────────────────────────────────────
@@ -6951,6 +6958,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_federated_call_keeps_its_own_full_argument() {
+        // Review of #1337, case 3: `full` is a switch of PO's OWN tools. A federated
+        // name (`server::tool`) is dispatched before the switch is ever read, so an
+        // external tool that legitimately takes `full` receives it untouched — the
+        // refusal below names the server, never a rewritten argument list.
+        let handler = make_handler();
+        let error = handler
+            .handle("absent::tool", Some(json!({"full": true})))
+            .await
+            .expect_err("an unconnected server must refuse");
+        assert!(
+            error.to_string().contains("absent"),
+            "the call reached the federation with its arguments: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_result_is_returned_verbatim_not_escaped_onto_one_line() {
+        // A slice of an artefact is lines. Rendered through the structured formatter it
+        // would be JSON-escaped onto a single line, and a line range would mean nothing
+        // (review of #1337, case 2).
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::tool_digest::ArtifactStore::new(dir.path().join("artifacts"));
+        let text = "première ligne\ndeuxième ligne\ntroisième ligne";
+        let reference = store.put(text.as_bytes()).unwrap();
+        let mut handler = make_handler();
+        handler.set_validator(crate::validate::Validator::new(
+            dir.path().join("artifacts"),
+            vec![dir.path().to_path_buf()],
+        ));
+        let read = handler
+            .handle(
+                "validate",
+                Some(json!({"action": "read", "artefact": reference.as_str(),
+                            "from_line": 0, "to_line": 2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.as_str(), Some("première ligne\ndeuxième ligne"));
+        // And that is what the model receives: no escaping back onto one line.
+        let rendered = crate::mcp::server::render_tool_result(&read);
+        assert_eq!(rendered, "première ligne\ndeuxième ligne");
+        assert!(!rendered.contains("\\n"));
+    }
+
+    #[tokio::test]
     async fn validate_git_status_returns_a_short_digest_through_the_handler() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -6998,7 +7051,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            read["text"].as_str().unwrap().contains("M f.txt"),
+            read.as_str().unwrap_or_default().contains("M f.txt"),
             "{read:?}"
         );
     }

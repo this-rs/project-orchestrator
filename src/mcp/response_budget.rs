@@ -39,6 +39,16 @@
 //! `validate(action: "read", artefact: <address>, from_line, to_line)` returns an
 //! exact slice without executing anything again.
 //!
+//! # The address is not a capability
+//!
+//! A handle names bytes inside ONE [`ArtifactStore`]: the directory is the
+//! authorization boundary. A caller that knows the sha256 but runs against another
+//! store cannot resolve it — the read fails with a named `Missing`, never with bytes.
+//! PO's launcher gives every session its own store (`PO_VALIDATE_STORE_DIR` under the
+//! session's temporary directory, `nexus_tools::launch`), so a handle one session
+//! received is not readable from another. `scripts/geo_mcp_bench.py` proves both
+//! halves through the real MCP server, and `tests` below prove the local half.
+//!
 //! The policy is mirrored by `scripts/geo_usage_probe.py --budget`, which measures
 //! it on real transcripts; `tests::policy_matches_the_probe` refuses a divergence.
 
@@ -94,8 +104,15 @@ pub fn project(
     tool: &str,
     value: &Value,
 ) -> Result<(Value, Outcome), String> {
-    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    // The bytes that matter are the ones the MODEL sees: the rendered response, not a
+    // compact JSON dump. Two reasons, both from the review of #1337: `validate read`
+    // slices by LINES, and a `serde_json::to_vec` payload holds everything on ONE line
+    // — a slice would then be the whole thing, and a slice over the budget would be
+    // projected again. The rendered form is already one scalar per line.
+    let rendered = crate::mcp::formatter::json_to_compact(value);
+    let bytes = rendered.into_bytes();
     let before = bytes.len();
+    let lines = crate::tool_digest::split_lines(&String::from_utf8_lossy(&bytes)).len();
     if before <= MAX_INLINE_BYTES {
         return Ok((
             value.clone(),
@@ -112,7 +129,7 @@ pub fn project(
     let hint = handle_hint(&address);
 
     let mut projected = value.clone();
-    elide(&mut projected, &address);
+    elide(&mut projected, &address, lines);
     if let Some(map) = projected.as_object_mut() {
         map.insert(
             "_budget".to_string(),
@@ -120,6 +137,7 @@ pub fn project(
                 "tool": tool,
                 "bytes": before,
                 "artefact": address,
+                "lines": lines,
                 "policy": format!(
                     "strings over {MAX_STRING_CHARS} chars and arrays over \
             {MAX_ARRAY_ITEMS} items are elided, keys and short values are intact; {hint}"
@@ -142,33 +160,33 @@ pub fn project(
 }
 
 /// Replace what is only volume: long strings and long arrays.
-fn elide(value: &mut Value, address: &str) {
+fn elide(value: &mut Value, address: &str, lines: usize) {
     match value {
         Value::String(text) => {
             let chars = text.chars().count();
             if chars > MAX_STRING_CHARS {
                 let head: String = text.chars().take(MAX_STRING_CHARS).collect();
                 *text = format!(
-                    "{head}… [{} chars elided — artefact {address}]",
+                    "{head}… [{} chars elided — artefact {address}, {lines} lines]",
                     chars - MAX_STRING_CHARS
                 );
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                elide(item, address);
+                elide(item, address, lines);
             }
             if items.len() > MAX_ARRAY_ITEMS {
                 let omitted = items.len() - MAX_ARRAY_ITEMS;
                 items.truncate(MAX_ARRAY_ITEMS);
                 items.push(Value::String(format!(
-                    "… [{omitted} more items elided — artefact {address}]"
+                    "… [{omitted} more items elided — artefact {address}, {lines} lines]"
                 )));
             }
         }
         Value::Object(map) => {
             for (_, child) in map.iter_mut() {
-                elide(child, address);
+                elide(child, address, lines);
             }
         }
         _ => {}
@@ -247,7 +265,13 @@ mod tests {
     fn the_full_payload_is_retrievable_after_a_restart_without_re_running_anything() {
         let (store, dir) = store();
         let original = big_plan();
-        let exact = serde_json::to_vec(&original).unwrap();
+        // The artefact is the text the model WOULD have received, not a compact JSON
+        // dump: one scalar per line, so a line range is a real range.
+        let exact = crate::mcp::formatter::json_to_compact(&original).into_bytes();
+        assert!(
+            exact.iter().filter(|b| **b == b'\n').count() > 20,
+            "the artefact is multi-line"
+        );
         let (out, outcome) = project(&store, "plan.get", &original).unwrap();
         let address = outcome.artefact.unwrap();
 
@@ -272,6 +296,59 @@ mod tests {
             exact.split(|b| *b == b'\n').next().unwrap()
         );
         assert!(out["_budget"]["artefact"].as_str().is_some());
+    }
+
+    #[test]
+    fn another_caller_holding_the_same_address_is_refused() {
+        let (mine, _dir_a) = store();
+        let (theirs, _dir_b) = store();
+        let original = big_plan();
+        let (out, outcome) = project(&mine, "plan.get", &original).unwrap();
+        let address = outcome.artefact.unwrap();
+        assert!(out["_budget"]["artefact"].as_str().is_some());
+
+        // Knowing the sha256 is not a capability: the store is the boundary.
+        let reference = crate::tool_digest::Ref::from_hex(&address).unwrap();
+        let refused = theirs.read_portion(&reference, 0, 5);
+        assert!(refused.is_err(), "another caller must not read these bytes");
+        assert!(mine.read_portion(&reference, 0, 5).is_ok(), "the owner can");
+    }
+
+    #[test]
+    fn a_slice_is_bounded_and_the_whole_reassembles_exactly() {
+        let (store, _dir) = store();
+        let original = big_plan();
+        let exact = crate::mcp::formatter::json_to_compact(&original).into_bytes();
+        let (_, outcome) = project(&store, "plan.get", &original).unwrap();
+        let reference =
+            crate::tool_digest::Ref::from_hex(outcome.artefact.as_ref().unwrap()).unwrap();
+        let lines = crate::tool_digest::split_lines(&String::from_utf8_lossy(&exact)).len();
+
+        // One slice is small compared to the whole.
+        let first = store.read_portion(&reference, 0, 10).unwrap();
+        assert!(
+            first.len() < exact.len() / 4,
+            "a slice must be a slice: {}",
+            first.len()
+        );
+        // Reading every slice in order rebuilds the artefact byte for byte.
+        let mut rebuilt = String::new();
+        let mut at = 0;
+        while at < lines {
+            let chunk = store
+                .read_portion(&reference, at, (at + 50).min(lines))
+                .unwrap();
+            if at > 0 {
+                rebuilt.push('\n');
+            }
+            rebuilt.push_str(&chunk);
+            at += 50;
+        }
+        assert_eq!(
+            rebuilt.as_bytes(),
+            exact.as_slice(),
+            "reconstruction is exact"
+        );
     }
 
     #[test]

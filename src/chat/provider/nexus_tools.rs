@@ -1710,6 +1710,15 @@ pub async fn attach(
         for variable in ["TMPDIR", "TMP", "TEMP"] {
             env.insert(variable.to_owned(), tmp.display().to_string());
         }
+        // The artefact store IS the authorization boundary of `validate` and of the
+        // response budget (GEO-6): a handle names bytes inside ONE store. Scoped to the
+        // session's own temporary directory, another session's process cannot resolve
+        // it, even knowing the sha256 — the address alone is not a capability. Made
+        // explicit here rather than left to whatever `TMPDIR` a launcher happens to set.
+        env.insert(
+            "PO_VALIDATE_STORE_DIR".to_owned(),
+            tmp.join("artefacts").display().to_string(),
+        );
         attachment.temp_dir = Some(tmp);
     }
     env.extend(secrets);
