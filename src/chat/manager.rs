@@ -23969,9 +23969,13 @@ mod tests {
             [
                 "NEXUS_TOOLS_KEY",
                 "NEXUS_TOOLS_PROFILE",
-                // The session's own directories, for `validate`: the same scope as its
-                // file tools, never a wider one (see `nexus_tools::launch`).
+                // The session's own directories and its own artefact store, for
+                // `validate` and the response budget: the same scope as its file tools,
+                // never a wider one, and A STORE OF ITS OWN — the store directory is the
+                // authorization boundary of a handle, so a sha256 known elsewhere must
+                // not resolve (see `nexus_tools::launch`).
                 "PO_VALIDATE_ROOTS",
+                "PO_VALIDATE_STORE_DIR",
                 "TEMP",
                 "TMP",
                 "TMPDIR"
