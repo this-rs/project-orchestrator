@@ -573,6 +573,8 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "close_session", "close_chat_session"),
     ("chat", "send_message", "chat_send_message"),
     ("chat", "list_messages", "list_chat_messages"),
+    ("chat", "usage", "chat_usage"),
+    ("chat", "interrupt", "chat_interrupt"),
     ("chat", "add_discussed", "add_discussed"),
     ("chat", "get_session_entities", "get_session_entities"),
     ("chat", "get_session_tree", "get_session_tree"),
@@ -4607,6 +4609,32 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "chat_usage" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/usage", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "chat_interrupt" => {
+                let id = extract_id(args, "session_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("scope").and_then(|v| v.as_str()) {
+                    body.insert("scope".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("cascade").and_then(|v| v.as_bool()) {
+                    body.insert("cascade".to_string(), json!(v));
+                }
+                let result = http
+                    .post(
+                        &format!("/api/chat/sessions/{}/interrupt", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             "add_discussed" => {
                 let id = extract_id(args, "session_id")?;
                 let entities = args.get("entities").cloned().unwrap_or_else(|| json!([]));
@@ -7219,6 +7247,48 @@ mod tests {
 
         let client = McpHttpClient::new(base_url.clone(), Some("test-token".to_string()));
         (ToolHandler::new(client), base_url)
+    }
+
+    #[tokio::test]
+    async fn chat_usage_gets_the_session_usage() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat",
+                Some(json!({"action": "usage", "session_id": UUID1})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/chat/sessions/{UUID1}/usage"));
+        assert_eq!(result["body"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn chat_interrupt_posts_default_and_explicit_options() {
+        let (handler, _) = make_http_handler().await;
+        let default = json!({"action": "interrupt", "session_id": UUID1});
+        let explicit = json!({
+            "action": "interrupt",
+            "session_id": UUID1,
+            "scope": "turn",
+            "cascade": true,
+        });
+
+        for (arguments, body) in [
+            (default, json!({})),
+            (explicit, json!({"scope": "turn", "cascade": true})),
+        ] {
+            let result = handler.handle("chat", Some(arguments)).await.unwrap();
+
+            assert_eq!(result["method"], "POST");
+            assert_eq!(
+                result["path"],
+                format!("/api/chat/sessions/{UUID1}/interrupt")
+            );
+            assert_eq!(result["body"], body);
+        }
     }
 
     // -- Provider: the agent door of the `provider` mega-tool (B-M1) -------
@@ -12183,6 +12253,8 @@ mod tests {
             ("update_anchor", "update_chat_anchor"),
             ("remove_anchor", "remove_chat_anchor"),
             ("list_anchored_sessions", "list_anchored_sessions"),
+            ("usage", "chat_usage"),
+            ("interrupt", "chat_interrupt"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();

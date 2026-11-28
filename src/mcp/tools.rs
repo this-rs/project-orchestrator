@@ -963,7 +963,7 @@ fn chat_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "close_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions"],
+                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "close_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions", "usage", "interrupt"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID. For send_message: resume this existing session instead of creating a new one (omit to start a new conversation)"},
@@ -982,6 +982,8 @@ fn chat_tool() -> ToolDefinition {
                 "entity_id": {"type": "string", "description": "Entity UUID (associate_with): plan or task UUID to link"},
                 "source": {"type": "string", "description": "Link source (associate_with): 'manual', 'auto', etc. Default: 'manual'"},
                 "run_id": {"type": "string", "description": "PlanRun UUID (get_run_sessions)"},
+                "scope": {"type": "string", "description": "Interrupt scope (interrupt): 'turn' (ends the turn only, background subprocesses stay alive) or 'turn_and_tools' (default; also stops every descendant CLI tool)"},
+                "cascade": {"type": "boolean", "description": "Also stop every descendant session (interrupt, delegation cascade)"},
                 "project_id": {"type": "string", "description": "Project UUID (get_session_entities — scoping filter)"},
                 "limit": {"type": "integer", "description": "Max items"},
                 "text": {"type": "string", "description": "The message (team_message)"},
