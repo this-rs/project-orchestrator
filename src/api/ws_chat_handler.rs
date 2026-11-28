@@ -275,6 +275,7 @@ async fn handle_ws_chat_loop(
     // ========================================================================
     let mut event_rx;
     let mut nats_chat_sub;
+    let mut runtime_watch;
     let mut snapshot_fingerprints;
     {
         let mut sink = WsFrameSink(&mut ws_sender);
@@ -290,6 +291,7 @@ async fn handle_ws_chat_loop(
             Ok(caught_up) => {
                 event_rx = caught_up.event_rx;
                 nats_chat_sub = caught_up.nats_chat_sub;
+                runtime_watch = caught_up.runtime_watch;
                 snapshot_fingerprints = caught_up.snapshot_fingerprints;
             }
             Err(_) => {
@@ -439,56 +441,8 @@ async fn handle_ws_chat_loop(
                                             .await
                                     };
 
-                                    // A message proxied to a remote instance: make sure we
-                                    // have a NATS subscription to receive the stream.
-                                    if matches!(result, Ok((DeliveryRoute::Remote, _))) && nats_chat_sub.is_none() {
-                                        if let Some(ref nats) = state.nats_emitter {
-                                            if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
-                                                debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
-                                                nats_chat_sub = Some(sub);
-                                            }
-                                        }
-                                    }
-
                                     match result {
-                                        Ok((DeliveryRoute::ResumedAfterSendFailure, _)) => {
-                                            // Resume succeeded — subscribe to the new broadcast channel
-                                            // (the old one is dead since the CLI was replaced)
-                                            match chat_manager.subscribe(&session_id).await {
-                                                Ok(rx) => {
-                                                    event_rx = Some(rx);
-                                                    if nats_chat_sub.is_some() {
-                                                        debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
-                                                        nats_chat_sub = None;
-                                                    }
-                                                    info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
-                                                }
-                                                Err(sub_err) => {
-                                                    debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
-                                                }
-                                            }
-                                        }
-                                        Ok((_, _)) => {
-                                            // If we did a local send/resume and don't have broadcast, subscribe now
-                                            if event_rx.is_none() {
-                                                match chat_manager.subscribe(&session_id).await {
-                                                    Ok(rx) => {
-                                                        event_rx = Some(rx);
-                                                        // Now that we have local broadcast, drop the NATS
-                                                        // subscription to avoid receiving every event twice.
-                                                        if nats_chat_sub.is_some() {
-                                                            debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active");
-                                                            nats_chat_sub = None;
-                                                        }
-                                                        debug!(session_id = %session_id, "Subscribed to broadcast after first message");
-                                                    }
-                                                    Err(e) => {
-                                                        // May fail if message was proxied remotely (no local session)
-                                                        debug!(session_id = %session_id, error = %e, "No local broadcast (session may be remote)");
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        Ok(_) => {}
                                         Err(MessageDeliveryError::SendAndResume { send, resume }) => {
                                             // Both send_message and resume_session failed — show error
                                             error!(
@@ -891,12 +845,7 @@ async fn handle_ws_chat_loop(
                     let _ = ws_sender.send(Message::Text(hint.to_string().into())).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // CLI subprocess was cleaned up (idle timeout) but the WebSocket
-                    // should stay alive. Transition to dormant: disable the broadcast
-                    // branch and let ping/pong + client messages keep running.
-                    // When the user sends a new message, resume_session() will spawn
-                    // a fresh CLI and the existing `if event_rx.is_none() { subscribe() }`
-                    // logic (below) will re-subscribe automatically.
+                    // Keep watching the conversation when its current local runtime ends.
                     debug!(session_id = %session_id, "Chat broadcast closed (idle cleanup), going dormant");
                     event_rx = None;
                     snapshot_fingerprints.clear();
@@ -906,6 +855,14 @@ async fn handle_ws_chat_loop(
                     });
                     let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
                 }
+            }
+        }
+
+        // The receiver was subscribed before the new runtime emitted anything.
+        // Sends from REST/MCP, another tab or this socket all take this path.
+        Some(next_rx) = runtime_watch.next() => {
+            if event_rx.as_ref().is_none_or(|rx| !rx.same_channel(&next_rx)) {
+                event_rx = Some(next_rx);
             }
         }
 

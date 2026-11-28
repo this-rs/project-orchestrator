@@ -17,6 +17,8 @@ use super::chat_transport::{ChatTransport, RelayFailure, StreamingSnapshot};
 use super::transport::{Message, Subject, Subscriber};
 use futures::StreamExt;
 
+const CHAT_ORIGIN_HEADER: &str = "PO-Chat-Origin";
+
 // ============================================================================
 // RPC types for cross-instance chat session routing
 // ============================================================================
@@ -65,6 +67,7 @@ pub const CANCEL_TASK_RPC_TIMEOUT: std::time::Duration = std::time::Duration::fr
 pub struct NatsEmitter {
     client: async_nats::Client,
     subject_prefix: String,
+    chat_origin: String,
     /// How long a cancel relayed to the owner of a session waits for its answer.
     cancel_rpc_timeout: std::time::Duration,
 }
@@ -84,6 +87,7 @@ impl NatsEmitter {
         Self {
             client,
             subject_prefix: subject_prefix.into(),
+            chat_origin: Uuid::new_v4().to_string(),
             cancel_rpc_timeout: CANCEL_TASK_RPC_TIMEOUT,
         }
     }
@@ -168,17 +172,33 @@ impl NatsEmitter {
         format!("{}.chat.{}.cancel_tools", self.subject_prefix, session_id)
     }
 
-    /// Publish a ChatEvent to the session's NATS subject.
+    /// Publish a ChatEvent that was also emitted on the local runtime's channel.
     ///
     /// Fire-and-forget: errors are logged but never block the caller.
     pub fn publish_chat_event(&self, session_id: &str, event: ChatEvent) {
+        self.publish_chat(session_id, event, Some(self.chat_origin.as_str()));
+    }
+
+    /// Publish directly to NATS when no local runtime broadcast carries the event.
+    pub(crate) fn relay_chat_event(&self, session_id: &str, event: ChatEvent) {
+        self.publish_chat(session_id, event, None);
+    }
+
+    fn publish_chat(&self, session_id: &str, event: ChatEvent, local_origin: Option<&str>) {
         let client = self.client.clone();
         let subject = self.chat_subject(session_id);
+        let mut headers = async_nats::HeaderMap::new();
+        if let Some(origin) = local_origin {
+            headers.insert(CHAT_ORIGIN_HEADER, origin);
+        }
 
         tokio::spawn(async move {
             match serde_json::to_vec(&event) {
                 Ok(payload) => {
-                    if let Err(e) = client.publish(subject.clone(), payload.into()).await {
+                    if let Err(e) = client
+                        .publish_with_headers(subject.clone(), headers, payload.into())
+                        .await
+                    {
                         warn!(
                             subject = %subject,
                             event_type = %event.event_type(),
@@ -267,12 +287,37 @@ impl NatsEmitter {
     /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}`.
     /// Each message payload is a JSON-serialized `ChatEvent`.
     pub async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        self.subscribe_chat_events_from(session_id, None).await
+    }
+
+    /// Follow other instances while the same client receives local broadcasts.
+    pub(crate) async fn subscribe_remote_chat_events(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Subscriber> {
+        self.subscribe_chat_events_from(session_id, Some(self.chat_origin.clone()))
+            .await
+    }
+
+    async fn subscribe_chat_events_from(
+        &self,
+        session_id: &str,
+        exclude_origin: Option<String>,
+    ) -> anyhow::Result<Subscriber> {
         let subject = self.chat_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS chat events {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS chat events");
-        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
+        Ok(Subscriber::from_stream(subscriber.filter_map(move |msg| {
+            let from_this_instance = exclude_origin.as_deref().is_some_and(|origin| {
+                msg.headers
+                    .as_ref()
+                    .and_then(|headers| headers.get(CHAT_ORIGIN_HEADER))
+                    .is_some_and(|header| header.as_str() == origin)
+            });
+            std::future::ready((!from_this_instance).then(|| transport_message(msg)))
+        })))
     }
 
     // ========================================================================
@@ -675,6 +720,14 @@ impl ChatTransport for NatsEmitter {
 
     async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         NatsEmitter::subscribe_chat_events(self, session_id).await
+    }
+
+    fn relay_chat_event(&self, session_id: &str, event: ChatEvent) {
+        NatsEmitter::relay_chat_event(self, session_id, event);
+    }
+
+    async fn subscribe_remote_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_remote_chat_events(self, session_id).await
     }
 
     fn publish_chat_interrupt(&self, session_id: &str) {
