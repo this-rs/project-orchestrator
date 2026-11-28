@@ -1415,7 +1415,25 @@ impl Stage {
     async fn rpc(&self, sid: &str, message: &str, kind: &str) -> Option<bool> {
         let attempts = if kind == "control_response" { 1 } else { 10 };
         for _ in 0..attempts {
-            if let Some(answer) = self.other.request_send_message(sid, message, kind).await {
+            if let Some(answer) = self
+                .other
+                .request_send_message(sid, message, kind, None)
+                .await
+            {
+                return Some(answer.success);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        None
+    }
+
+    async fn rpc_turn(&self, sid: &str, message: &str, kind: &str, turn_id: Uuid) -> Option<bool> {
+        for _ in 0..10 {
+            if let Some(answer) = self
+                .other
+                .request_send_message(sid, message, kind, Some(turn_id))
+                .await
+            {
                 return Some(answer.success);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1841,6 +1859,16 @@ fn assistant(content: Value) -> Value {
 
 fn text(t: &str) -> Value {
     assistant(json!([{"type": "text", "text": t}]))
+}
+
+/// A streamed text delta (the CLI's `stream_event` / `content_block_delta`): the
+/// manager emits each as a `ChatEvent::StreamDelta` during the turn.
+fn streamed_text(t: &str) -> Value {
+    emit(json!({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0,
+                  "delta": {"type": "text_delta", "text": t}},
+    }))
 }
 
 fn cc_tool_use(id: &str, name: &str, input: Value) -> Value {
@@ -6158,6 +6186,124 @@ async fn the_historical_engine_completes_the_turn_it_ends_on_a_question() {
         (SessionState::WaitingOnPerson, Rule::QuestionOpen),
         "the card stays answerable while the question waits"
     );
+}
+
+/// Targeted coverage of the legacy `stream_response` delta stamp: a streamed
+/// `content_block_delta` must reach the client carrying its turn id and a
+/// monotonic offset (not the misleading `seq: 0`).
+#[tokio::test]
+async fn the_legacy_stream_stamps_each_delta_with_its_turn() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    cli.transcript(0, &[streamed_text("hi"), result_ok("hi")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    let w = Watch::start(
+        stage.graph.clone(),
+        &sid,
+        manager.subscribe(&sid).await.unwrap(),
+    );
+    assert!(
+        w.wait(WAIT, |e| matches!(
+            e,
+            ChatEvent::StreamDelta {
+                turn_id: Some(_),
+                offset: Some(_),
+                ..
+            }
+        ))
+        .await,
+        "a legacy stream delta carries its turn id and offset: {:#?}",
+        w.all().await
+    );
+}
+
+/// A message sent from the other instance reaches the LEGACY engine's owner
+/// through NATS: the listener persists it (with the origin's turn id) and runs
+/// the turn. This exercises the legacy branch of the cross-instance listener.
+#[tokio::test]
+async fn the_legacy_engine_reaches_its_owner_through_nats() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    cli.transcript(0, &[text("answered"), result_ok("answered")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    assert!(
+        stage
+            .rpc(&sid, "from afar", "user_message")
+            .await
+            .unwrap_or(false),
+        "a remote user_message reaches the legacy owner through NATS"
+    );
+}
+
+/// A remote queued message is held (not sent) while the legacy turn is open,
+/// covering the listener's held branch.
+#[tokio::test]
+async fn the_legacy_engine_holds_a_queued_message_through_nats() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let cli = FakeClaude::new();
+    // The turn stays open until interrupted, so a queued message is held.
+    cli.transcript(0, &[await_in("never-comes"), result_ok("done")]);
+
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd;
+    req.message = "hello".to_string();
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the session: {e:#}"))
+        .session_id;
+
+    // A turn id is carried so the held message reuses it (held.id = turn_id).
+    assert!(
+        stage
+            .rpc_turn(&sid, "after", "queued_user_message", Uuid::new_v4())
+            .await
+            .unwrap_or(false),
+        "a remote queued message is held on the streaming legacy session"
+    );
+    stage.other.publish_interrupt(&sid);
 }
 
 #[tokio::test]

@@ -926,6 +926,13 @@ pub enum ChatEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        /// The turn this delta belongs to (the `id` of the persisted `user_message`
+        /// event that opened it). Transient: the delta itself is never persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<Uuid>,
+        /// Monotonic position of this delta within its turn (per-turn, not global).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
     },
     /// Streaming status change (broadcast to all connected clients)
     StreamingStatus { is_streaming: bool },
@@ -2646,6 +2653,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             }
             .event_type(),
             "stream_delta"
@@ -2787,6 +2796,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
                 parent_tool_use_id: None,
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::Error {
                 message: "CLI not found".into(),
@@ -3161,6 +3172,7 @@ mod tests {
         if let ChatEvent::StreamDelta {
             text,
             parent_tool_use_id,
+            ..
         } = event
         {
             assert_eq!(text, "hello");
@@ -3200,6 +3212,8 @@ mod tests {
             ChatEvent::StreamDelta {
                 text: "tok".into(),
                 parent_tool_use_id: Some("p3".into()),
+                turn_id: None,
+                offset: None,
             },
             ChatEvent::Error {
                 message: "err".into(),

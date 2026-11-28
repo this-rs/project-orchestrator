@@ -796,8 +796,15 @@ impl ChatManager {
                 self.reopen_agent_session(&node, &item.message, None).await
             }
             Ok(()) => {
-                self.reopen_legacy_session_with(&node, &item.message, None, None, false)
-                    .await
+                self.reopen_legacy_session_with(
+                    &node,
+                    &item.message,
+                    None,
+                    None,
+                    false,
+                    Uuid::new_v4(),
+                )
+                .await
             }
             Err(e) => Err(e),
         };

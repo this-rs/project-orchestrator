@@ -337,6 +337,7 @@ pub(crate) async fn drain_pending_messages(
             search,
             documents,
             cognitive_routing,
+            next_msg.id,
         ))
         .await;
     } else if has_pending {
