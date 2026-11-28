@@ -85,7 +85,7 @@
           "type": "string"
         }
       },
-      "source": "api::ws_chat_handler::handle_ws_chat_loop"
+      "source": "api::ws_chat_handler::handle_ws_chat_loop + api::sse_chat_stream::live_loop"
     },
     "partial_text": {
       "examples": {
@@ -120,7 +120,7 @@
           "type": "string"
         }
       },
-      "source": "api::ws_chat_handler::handle_ws_chat_loop"
+      "source": "chat::event_stream::catch_up"
     },
     "replay_complete": {
       "examples": {
@@ -137,7 +137,7 @@
           "type": "string"
         }
       },
-      "source": "api::ws_chat_handler::handle_ws_chat_loop"
+      "source": "chat::event_stream::catch_up"
     },
     "session_dormant": {
       "examples": {
@@ -160,7 +160,36 @@
           "type": "string"
         }
       },
-      "source": "api::ws_chat_handler::handle_ws_chat_loop"
+      "source": "api::ws_chat_handler::handle_ws_chat_loop + api::sse_chat_stream::live_loop"
+    },
+    "stream_end": {
+      "examples": {
+        "full": {
+          "cursor": 42,
+          "reason": "dormant",
+          "type": "stream_end"
+        },
+        "minimal": {
+          "cursor": 42,
+          "reason": "dormant",
+          "type": "stream_end"
+        }
+      },
+      "fields": {
+        "cursor": {
+          "required": true,
+          "type": "number"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "source": "api::sse_chat_stream::live_loop"
     }
   }
 }

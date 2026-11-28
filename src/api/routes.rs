@@ -32,6 +32,7 @@ use super::rfc_handlers;
 use super::routing_handlers;
 use super::sharing_handlers;
 use super::skill_handlers;
+use super::sse_chat_stream;
 use super::team_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
@@ -150,6 +151,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
     let router = public
         .merge(bounded_public)
         .merge(websocket_routes())
+        .merge(event_stream_routes())
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -450,6 +452,22 @@ fn websocket_routes() -> Router<OrchestratorState> {
         .route("/ws/activity", get(ws_activity_handler::ws_activity))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
         .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
+}
+
+/// Long-lived HTTP event streams.
+///
+/// A separate group for the same reason as the sockets — the 60 s
+/// `HTTP_REQUEST_TIMEOUT_SECS` deadline on `protected_routes` would end the
+/// stream mid-conversation — and NOT under `require_auth` either: an
+/// `EventSource` cannot set an `Authorization` header, so the handler
+/// authenticates exactly like `/ws/chat/{id}` (cookie, `?ticket=`, anonymous
+/// when the server runs without auth). It carries the same frames to the same
+/// audience as that socket.
+fn event_stream_routes() -> Router<OrchestratorState> {
+    Router::new().route(
+        "/api/chat/sessions/{id}/events",
+        get(sse_chat_stream::chat_events_sse),
+    )
 }
 
 // ============================================================================

@@ -990,10 +990,12 @@ fn control_frames() -> Vec<ControlFrame> {
                 }
             }),
         },
-        // api::ws_chat_handler::handle_ws_chat_loop — mid-stream join snapshot
+        // chat::event_stream::catch_up — mid-stream join snapshot (built in the
+        // shared core, so BOTH transports send it: /ws/chat/{id} and
+        // /api/chat/sessions/{id}/events)
         ControlFrame::same(
             "partial_text",
-            "api::ws_chat_handler::handle_ws_chat_loop",
+            "chat::event_stream::catch_up",
             json!({
                 "type": "partial_text",
                 "content": "I will start by reading the upload",
@@ -1001,41 +1003,54 @@ fn control_frames() -> Vec<ControlFrame> {
                 "replaying": true
             }),
         ),
-        // api::ws_chat_handler::handle_ws_chat_loop — end of replay + snapshot
+        // chat::event_stream::catch_up — end of replay + snapshot
         ControlFrame::same(
             "replay_complete",
-            "api::ws_chat_handler::handle_ws_chat_loop",
+            "chat::event_stream::catch_up",
             json!({ "type": "replay_complete" }),
         ),
-        // api::ws_chat_handler::handle_ws_chat_loop — broadcast receiver lagged
+        // api::ws_chat_handler::handle_ws_chat_loop, api::sse_chat_stream::live_loop
         ControlFrame::same(
             "events_lagged",
-            "api::ws_chat_handler::handle_ws_chat_loop",
+            "api::ws_chat_handler::handle_ws_chat_loop + api::sse_chat_stream::live_loop",
             json!({ "type": "events_lagged", "skipped": 12 }),
         ),
-        // api::ws_chat_handler::handle_ws_chat_loop — broadcast closed (idle cleanup)
+        // api::ws_chat_handler::handle_ws_chat_loop, api::sse_chat_stream::live_loop
         ControlFrame::same(
             "session_dormant",
-            "api::ws_chat_handler::handle_ws_chat_loop",
+            "api::ws_chat_handler::handle_ws_chat_loop + api::sse_chat_stream::live_loop",
             json!({
                 "type": "session_dormant",
                 "message": "CLI session cleaned up (idle timeout). Will resume on next message."
             }),
         ),
+        // api::sse_chat_stream::live_loop — the response ends on purpose, and
+        // says why and where to resume from. Only the SSE surface has it: a
+        // socket is closed by the transport, not by the server's choice.
+        ControlFrame::same(
+            "stream_end",
+            "api::sse_chat_stream::live_loop",
+            json!({ "type": "stream_end", "reason": "dormant", "cursor": 42 }),
+        ),
     ]
 }
 
-/// Fields the WS handler ADDS to a serialized `ChatEvent` before sending it.
+/// Fields the transports ADD to a serialized `ChatEvent` before sending it.
 ///
-/// api::ws_chat_handler::handle_ws_chat_loop: live events get `seq: 0`
-/// (`send_chat_event!`), replayed events get their stored `seq` and
-/// `replaying: true`. Both carry `created_at` (`live_frame` / `replayed_frame`):
-/// seconds since the epoch, milliseconds as the fraction — the time stored for a
-/// replayed event, the forwarding time for a live one. The events of the
-/// mid-stream snapshot carry no `created_at` (their time is not kept), and the
-/// frames the handler builds itself with a `ChatEvent` tag (`error`,
-/// `streaming_status`, `pending_queue`, `permission_mode_changed`,
-/// `model_changed`) carry none of these fields, hence all are optional.
+/// chat::event_stream (`live_frame` / `replayed_frame`), used by BOTH
+/// api::ws_chat_handler::handle_ws_chat_loop and api::sse_chat_stream: live
+/// events get `seq: 0`, replayed events get their stored `seq` and
+/// `replaying: true`. Both carry `created_at`: seconds since the epoch,
+/// milliseconds as the fraction — the time stored for a replayed event, the
+/// forwarding time for a live one. The events of the mid-stream snapshot carry
+/// no `created_at` (their time is not kept), and the frames a handler builds
+/// itself with a `ChatEvent` tag (`error`, `streaming_status`, `pending_queue`,
+/// `permission_mode_changed`, `model_changed`) carry none of these fields, hence
+/// all are optional.
+///
+/// The SSE transport adds one thing this JSON does not show: a frame whose `seq`
+/// is `> 0` is preceded by `id: <seq>`, and a frame with `seq: 0` is not — that
+/// is the whole durable-cursor rule (see `api::sse_chat_stream`).
 fn event_envelope() -> (Value, Value) {
     (
         json!({ "seq": 42, "replaying": true, "created_at": 1760099999.123 }),
