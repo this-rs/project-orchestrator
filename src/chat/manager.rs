@@ -8668,6 +8668,9 @@ impl ChatManager {
                 old_session.nats_cancel.cancel();
             }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
+            self.agent_runtime
+                .live_events
+                .attach(&session_id.to_string(), &events_tx);
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
@@ -13182,11 +13185,15 @@ impl ChatManager {
         if let Err(error) = self.graph.store_chat_events(uuid, vec![record]).await {
             warn!(%session_id, %error, event = event.event_type(), "event not stored on the thread");
         }
-        if let Some((_, events_tx)) = live {
+        if let Some((_, events_tx)) = &live {
             let _ = events_tx.send(event.clone());
         }
         if let Some(nats) = &self.nats {
-            nats.publish_chat_event(session_id, event);
+            if live.is_some() {
+                nats.publish_chat_event(session_id, event);
+            } else {
+                nats.relay_chat_event(session_id, event);
+            }
         }
     }
 
@@ -14223,6 +14230,9 @@ impl ChatManager {
                 old_session.nats_cancel.cancel();
             }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
+            self.agent_runtime
+                .live_events
+                .attach(session_id, &events_tx);
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
@@ -14921,7 +14931,12 @@ impl ChatManager {
         Ok(results)
     }
 
-    /// Subscribe to a session's broadcast channel (used by WebSocket handler)
+    /// Watch for the next local runtime of a conversation, even while it is dormant.
+    pub(crate) fn watch_chat_runtime(&self, session_id: &str) -> super::event_stream::RuntimeWatch {
+        self.agent_runtime.live_events.watch(session_id)
+    }
+
+    /// Subscribe to a session's current broadcast channel.
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
         // An open mirror of a Claude Code sub-agent is followed live (P18c).
         if let Some(rx) = self.mirrors.subscribe(session_id) {

@@ -585,10 +585,14 @@ async fn emit_to_session(state: &OrchestratorState, session_id: &str, event: Cha
     if let Some(cm) = &state.chat_manager {
         if let Ok(tx) = cm.get_events_tx(session_id).await {
             let _ = tx.send(event.clone());
+            if let Some(nats) = &state.nats_emitter {
+                nats.publish_chat_event(session_id, event);
+            }
+            return;
         }
     }
     if let Some(nats) = &state.nats_emitter {
-        nats.publish_chat_event(session_id, event);
+        nats.relay_chat_event(session_id, event);
     }
 }
 
