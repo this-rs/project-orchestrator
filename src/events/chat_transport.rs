@@ -78,6 +78,21 @@ pub trait ChatTransport: Send + Sync {
     /// Subscribe to a session's chat events.
     async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber>;
 
+    /// Publish a [`ChatEvent`] when NO local runtime broadcast carries it —
+    /// relay to remote subscribers only (no local-origin header). Fire-and-forget.
+    /// Default: same as [`Self::publish_chat_event`] (in-memory/journal have no
+    /// separate remote channel).
+    fn relay_chat_event(&self, session_id: &str, event: ChatEvent) {
+        self.publish_chat_event(session_id, event);
+    }
+
+    /// Subscribe to a session's chat events while EXCLUDING the ones published by
+    /// THIS instance (filters duplicate local echoes when a local broadcast also
+    /// exists). Default: same as [`Self::subscribe_chat_events`].
+    async fn subscribe_remote_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        self.subscribe_chat_events(session_id).await
+    }
+
     /// Publish an interrupt signal for a session. Fire-and-forget.
     fn publish_chat_interrupt(&self, session_id: &str);
 
