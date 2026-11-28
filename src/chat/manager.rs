@@ -35514,6 +35514,67 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    async fn an_event_on_a_dormant_thread_reaches_local_websocket_subscribers_over_nats() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let session = test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let state = mock_app_state_with_graph(graph);
+        let broker = TestBroker::start().await;
+        let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::clone(&nats));
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        let mut local = manager.subscribe(&sid).await.unwrap();
+        let mut all = nats.subscribe_chat_events(&sid).await.unwrap();
+        let mut websocket = nats.subscribe_remote_chat_events(&sid).await.unwrap();
+        nats.client().flush().await.unwrap();
+
+        manager
+            .emit_on_session(
+                &sid,
+                ChatEvent::SystemHint {
+                    content: "live".into(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            local.try_recv().unwrap(),
+            ChatEvent::SystemHint { content } if content == "live"
+        ));
+        let sent = tokio::time::timeout(Duration::from_secs(2), all.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ChatEvent>(&sent.payload).unwrap(),
+            ChatEvent::SystemHint { content } if content == "live"
+        ));
+
+        assert!(manager.active_sessions.write().await.remove(&sid).is_some());
+        manager
+            .emit_on_session(
+                &sid,
+                ChatEvent::SystemHint {
+                    content: "dormant".into(),
+                },
+            )
+            .await;
+        let sent = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ChatEvent>(&sent.payload).unwrap(),
+            ChatEvent::SystemHint { content } if content == "dormant"
+        ));
+    }
+
+    #[tokio::test]
     async fn test_try_remote_send_no_nats() {
         // ChatManager without NATS → try_remote_send should return Ok(false) immediately
         let state = mock_app_state();

@@ -774,6 +774,87 @@ mod tests {
         proof
     }
 
+    #[tokio::test]
+    async fn vault_events_reach_dormant_and_live_chat_subscribers() {
+        use super::{emit_to_session, ChatEvent};
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::events::{nats_broker_test::TestBroker, NatsEmitter};
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::test_helpers::server_state_with_chat;
+        use futures::StreamExt;
+        use std::time::Duration;
+
+        let broker = TestBroker::start().await;
+        let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let peer = NatsEmitter::new(broker.client().await, "events");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            mock_app_state().meili,
+            test_support::chat_config(),
+        ));
+        let mut state = server_state_with_chat(manager.clone(), graph).await;
+        Arc::get_mut(&mut state).unwrap().nats_emitter = Some(nats.clone());
+        let session = Uuid::new_v4().to_string();
+        let mut local_nats = nats.subscribe_remote_chat_events(&session).await.unwrap();
+        nats.flush().await.unwrap();
+
+        let request_id = Uuid::new_v4().to_string();
+        let request = ChatEvent::SecretRequest {
+            id: request_id.clone(),
+            name: "test-credential".into(),
+            reason: "scope check".into(),
+            exists: false,
+        };
+        let expected = serde_json::to_value(&request).unwrap();
+        let wait = Duration::from_secs(5);
+        emit_to_session(&state, &session, request.clone()).await;
+        let dormant = tokio::time::timeout(wait, local_nats.next())
+            .await
+            .expect("the dormant chat subscriber receives the vault event")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&dormant.payload).unwrap(),
+            expected,
+        );
+
+        test_support::insert_live_session_without_cli(&manager, &session).await;
+        let mut local = manager.subscribe(&session).await.unwrap();
+        let mut remote = peer.subscribe_remote_chat_events(&session).await.unwrap();
+        peer.flush().await.unwrap();
+        emit_to_session(&state, &session, request).await;
+
+        assert_eq!(
+            serde_json::to_value(local.try_recv().unwrap()).unwrap(),
+            expected,
+        );
+        let forwarded = tokio::time::timeout(wait, remote.next())
+            .await
+            .expect("another instance receives the vault event from the live session")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&forwarded.payload).unwrap(),
+            expected,
+        );
+
+        // The peer has seen the publish. An untagged event sent afterward must
+        // be the next one the originating instance sees on its NATS feed.
+        let marker = ChatEvent::SecretRequestResolved {
+            id: request_id,
+            outcome: "declined".into(),
+        };
+        nats.relay_chat_event(&session, marker.clone());
+        let next = tokio::time::timeout(wait, local_nats.next())
+            .await
+            .expect("the source's NATS feed receives untagged events")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&next.payload).unwrap(),
+            serde_json::to_value(marker).unwrap(),
+            "the originating instance does not receive a second copy of the live event",
+        );
+    }
+
     /// Captures every log line, at every level, while the closure-driven
     /// scenario runs on this (current-thread) test runtime.
     #[derive(Clone, Default)]
