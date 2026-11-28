@@ -990,6 +990,8 @@ Manage chat sessions.
 | close_session | `session_id` (req) | Close a live session without deleting it (frees its slot; a later message resumes it) |
 | send_message | `message` (req), `cwd`, `project_slug`, `model`, `permission_mode`, `workspace_slug`, `add_dirs` | Send message to orchestrator |
 | list_messages | `session_id` (req), `limit`, `offset` | List messages in session |
+| usage | `session_id` (req) | The token usage of a conversation, turn by turn: input (uncached), output, cache reads and writes, reasoning, and the cache-hit ratio |
+| interrupt | `session_id` (req), `scope` (`turn`/`turn_and_tools`), `cascade` | End the current turn of a session (transport-independent REST fallback); `scope` selects turn-only or turn_and_tools |
 | add_discussed | `session_id` (req), `entities` (req: [{entity_type, entity_id}]) | Mark entities as discussed |
 | get_session_entities | `session_id` (req), `project_id` | Get entities from session |
 | get_session_tree | `session_id` (req) | Get full session conversation tree (parent + all children recursively) |
