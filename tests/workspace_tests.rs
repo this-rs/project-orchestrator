@@ -27,6 +27,7 @@ fn test_config() -> Config {
         nats_url: None,
         workspace_path: ".".into(),
         server_port: 8080,
+        server_bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         auth_config: None,
         serve_frontend: false,
         frontend_path: "./dist".to_string(),

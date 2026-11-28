@@ -432,6 +432,19 @@ fn default_true() -> bool {
 #[serde(default)]
 pub struct ServerYamlConfig {
     pub port: u16,
+    /// Interface the HTTP listener binds to, as an IP literal.
+    ///
+    /// Defaults to `0.0.0.0` — every interface — which is what every existing
+    /// install does, so an untouched `config.yaml` keeps behaving exactly as
+    /// before. Setting `127.0.0.1` keeps the server (setup wizard included)
+    /// off the network, which a bench or a throwaway instance needs: a parity
+    /// run started "without auth" used to listen on every interface with no
+    /// way to say otherwise.
+    ///
+    /// A value that is not an IP address is refused at startup
+    /// ([`parse_bind_addr`]) instead of being replaced by a default: whoever
+    /// asks for loopback must never silently get `0.0.0.0`.
+    pub bind_addr: String,
     pub workspace_path: String,
     /// Whether the backend should serve the frontend static files (default: true)
     pub serve_frontend: bool,
@@ -447,12 +460,29 @@ impl Default for ServerYamlConfig {
     fn default() -> Self {
         Self {
             port: 8080,
+            bind_addr: "0.0.0.0".into(),
             workspace_path: ".".into(),
             serve_frontend: true,
             frontend_path: "./dist".into(),
             public_url: None,
         }
     }
+}
+
+/// Parse a configured bind address, refusing anything that is not an IP
+/// literal.
+///
+/// The listener used to be hard-bound to `0.0.0.0` in two places, so no
+/// configuration could keep an instance off the network. The refusal is
+/// deliberate and fail-closed: a typo must stop the boot, not fall back to
+/// every interface.
+pub fn parse_bind_addr(raw: &str) -> Result<std::net::IpAddr> {
+    raw.trim().parse::<std::net::IpAddr>().map_err(|_| {
+        anyhow::anyhow!(
+            "server.bind_addr '{}' is not a valid IP address (expected e.g. 0.0.0.0 or 127.0.0.1)",
+            raw
+        )
+    })
 }
 
 /// Neo4j configuration section
@@ -961,6 +991,10 @@ pub struct Config {
     pub nats_url: Option<String>,
     pub workspace_path: String,
     pub server_port: u16,
+    /// Parsed `server.bind_addr` (default `0.0.0.0`). Resolved once, at load
+    /// time, so the listener, the setup-only server and the anonymous-mode
+    /// warning all read the same value.
+    pub server_bind_addr: std::net::IpAddr,
     /// Auth config — None means anonymous/open access (no auth section in YAML); a WARN is logged at startup
     pub auth_config: Option<AuthConfig>,
     /// Whether to serve the frontend static files (default: true)
@@ -1110,6 +1144,9 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(yaml.server.port),
+            server_bind_addr: parse_bind_addr(
+                &std::env::var("SERVER_BIND_ADDR").unwrap_or(yaml.server.bind_addr),
+            )?,
             auth_config: yaml.auth,
             serve_frontend: std::env::var("SERVE_FRONTEND")
                 .ok()
@@ -1502,7 +1539,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             config.server_port
         );
         boot::tracker().finish();
-        return start_setup_server(config.server_port).await;
+        return start_setup_server(config.server_port, config.server_bind_addr).await;
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1528,7 +1565,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Connections arriving during the rest of startup now wait in the listen
     // backlog and are served once `axum::serve` starts, instead of being
     // refused.
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    let addr = SocketAddr::new(config.server_bind_addr, config.server_port);
     boot.start("bind");
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
@@ -2889,7 +2926,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 /// Without frontend serving, `http://localhost:{port}/` returns 404 (white page).
 /// The Tauri desktop app sets `SERVE_FRONTEND=true` + `FRONTEND_PATH` in the
 /// `setup` callback, so the SPA loads and the React `SetupGuard` redirects to `/setup`.
-async fn start_setup_server(port: u16) -> Result<()> {
+async fn start_setup_server(port: u16, bind: std::net::IpAddr) -> Result<()> {
     use axum::routing::get;
     use serde::Serialize;
     use std::net::SocketAddr;
@@ -2968,7 +3005,7 @@ async fn start_setup_server(port: u16) -> Result<()> {
         app
     };
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(bind, port);
     tracing::info!("Setup-only server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -2983,8 +3020,9 @@ async fn start_setup_server(port: u16) -> Result<()> {
 
 /// Startup warning for anonymous mode, or `None` when auth is configured.
 ///
-/// The listener is always bound on 0.0.0.0, so anonymous mode is reachable
-/// from the network, not just loopback.
+/// The warning names the address the listener actually holds: with the default
+/// `server.bind_addr` (`0.0.0.0`) anonymous mode is reachable from the network,
+/// while a loopback bind keeps it on this machine only.
 fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) -> Option<String> {
     if auth_configured {
         return None;
@@ -3077,6 +3115,93 @@ auth:
     }
 
     /// Remote MCP is absent from most config.yaml files → defaults to disabled.
+    /// A listener that can be kept off the network (G6).
+    ///
+    /// The port used to be the only thing a `config.yaml` could choose: both
+    /// bind sites hard-coded `0.0.0.0`, so a parity bench started "without
+    /// auth" listened on every interface and no setting could say otherwise.
+    /// This is the compatibility half of the contract — a config that does not
+    /// mention the key keeps the old behaviour byte for byte.
+    #[test]
+    fn test_server_bind_addr_defaults_to_all_interfaces() {
+        let yaml = r#"
+server:
+  port: 17690
+neo4j:
+  uri: bolt://127.0.0.1:27688
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        std::env::remove_var("SERVER_BIND_ADDR");
+
+        let config = Config::from_yaml_and_env(Some(&path)).unwrap();
+        assert_eq!(
+            config.server_bind_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            "an existing config.yaml must keep listening on every interface"
+        );
+        assert_eq!(
+            std::net::SocketAddr::new(config.server_bind_addr, config.server_port).to_string(),
+            "0.0.0.0:17690"
+        );
+    }
+
+    /// The bench case itself: an explicit loopback address reaches the socket
+    /// the server binds, and the env override wins like every other setting.
+    #[test]
+    fn test_server_bind_addr_loopback_is_honoured() {
+        let yaml = r#"
+server:
+  port: 17690
+  bind_addr: 127.0.0.1
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        std::env::remove_var("SERVER_BIND_ADDR");
+
+        let config = Config::from_yaml_and_env(Some(&path)).unwrap();
+        assert_eq!(
+            config.server_bind_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            std::net::SocketAddr::new(config.server_bind_addr, config.server_port).to_string(),
+            "127.0.0.1:17690",
+            "the socket must be loopback, not all interfaces"
+        );
+
+        std::env::set_var("SERVER_BIND_ADDR", "::1");
+        let config = Config::from_yaml_and_env(Some(&path)).unwrap();
+        std::env::remove_var("SERVER_BIND_ADDR");
+        assert_eq!(
+            config.server_bind_addr,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    /// A value that is not an IP address stops the boot. Falling back to a
+    /// default would hand every interface to whoever asked for loopback.
+    #[test]
+    fn test_server_bind_addr_rejects_non_ip() {
+        let yaml = r#"
+server:
+  port: 17690
+  bind_addr: localhost
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        std::env::remove_var("SERVER_BIND_ADDR");
+
+        let err = Config::from_yaml_and_env(Some(&path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server.bind_addr"), "{err}");
+        assert!(err.contains("localhost"), "{err}");
+    }
+
     /// This is the additive-migration guarantee for existing installs.
     #[test]
     fn test_remote_mcp_defaults_disabled_when_absent() {
@@ -3260,6 +3385,7 @@ auth:
                 "MEILISEARCH_KEY",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
+                "SERVER_BIND_ADDR",
                 "SERVE_FRONTEND",
                 "FRONTEND_PATH",
             ] {
@@ -3361,6 +3487,7 @@ server:
                 "MEILISEARCH_KEY",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
+                "SERVER_BIND_ADDR",
                 "SERVE_FRONTEND",
                 "FRONTEND_PATH",
             ] {
