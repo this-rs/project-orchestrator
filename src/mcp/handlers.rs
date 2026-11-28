@@ -7249,6 +7249,48 @@ mod tests {
         (ToolHandler::new(client), base_url)
     }
 
+    #[tokio::test]
+    async fn chat_usage_gets_the_session_usage() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat",
+                Some(json!({"action": "usage", "session_id": UUID1})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/chat/sessions/{UUID1}/usage"));
+        assert_eq!(result["body"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn chat_interrupt_posts_default_and_explicit_options() {
+        let (handler, _) = make_http_handler().await;
+        let default = json!({"action": "interrupt", "session_id": UUID1});
+        let explicit = json!({
+            "action": "interrupt",
+            "session_id": UUID1,
+            "scope": "turn",
+            "cascade": true,
+        });
+
+        for (arguments, body) in [
+            (default, json!({})),
+            (explicit, json!({"scope": "turn", "cascade": true})),
+        ] {
+            let result = handler.handle("chat", Some(arguments)).await.unwrap();
+
+            assert_eq!(result["method"], "POST");
+            assert_eq!(
+                result["path"],
+                format!("/api/chat/sessions/{UUID1}/interrupt")
+            );
+            assert_eq!(result["body"], body);
+        }
+    }
+
     // -- Provider: the agent door of the `provider` mega-tool (B-M1) -------
 
     #[tokio::test]
