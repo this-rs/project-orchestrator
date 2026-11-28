@@ -10676,7 +10676,13 @@ impl ChatManager {
                                 }
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
-                                    if matches!(&event, ChatEvent::Result { is_error: false, .. }) {
+                                    if matches!(
+                                        &event,
+                                        ChatEvent::Result {
+                                            is_error: false,
+                                            ..
+                                        }
+                                    ) {
                                         residence_answered = true;
                                     }
                                     if let Some(call) = super::session_grants::observed_call(

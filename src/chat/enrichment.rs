@@ -329,9 +329,10 @@ impl EnrichmentContext {
         }
 
         let mut output = String::new();
-        if sections.iter().any(|section| {
-            crate::chat::untrusted::contains_container(&section.content)
-        }) {
+        if sections
+            .iter()
+            .any(|section| crate::chat::untrusted::contains_container(&section.content))
+        {
             output.push_str(crate::chat::untrusted::UNTRUSTED_PREAMBLE);
             output.push_str("\n\n");
         }

@@ -116,7 +116,9 @@ pub struct ResidenceOutcome {
 /// never delivered.
 pub fn global() -> Arc<ResidenceLedger> {
     static GLOBAL: OnceLock<Arc<ResidenceLedger>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Arc::new(ResidenceLedger::new())).clone()
+    GLOBAL
+        .get_or_init(|| Arc::new(ResidenceLedger::new()))
+        .clone()
 }
 
 impl ResidenceLedger {
@@ -287,10 +289,7 @@ impl ResidenceLedger {
 fn remember(map: &mut HashMap<u64, u32>, key: u64, turn: u32) {
     map.entry(key).or_insert(turn);
     while map.len() > MAX_BODIES {
-        let oldest = map
-            .iter()
-            .min_by_key(|(_, at)| **at)
-            .map(|(k, _)| *k);
+        let oldest = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k);
         match oldest {
             Some(k) => {
                 map.remove(&k);
@@ -404,7 +403,9 @@ mod tests {
     fn wip() -> String {
         let mut s = String::from("- **Plan:** Parité totale Claude Code ↔ harnais natif (priority: 95)\n  Progress: 99/110  (90%)\n");
         for i in 0..20 {
-            s.push_str(&format!("  🔄 in_progress: TÂCHE-{i} — un intitulé de tâche assez long pour peser\n"));
+            s.push_str(&format!(
+                "  🔄 in_progress: TÂCHE-{i} — un intitulé de tâche assez long pour peser\n"
+            ));
         }
         s
     }
@@ -450,7 +451,9 @@ mod tests {
         ledger.begin_turn(session);
         ledger.apply(session, &mut a);
 
-        let changed = body.replace("TÂCHE-3", "TÂCHE-3 (terminée)").replace("🔄", "✅");
+        let changed = body
+            .replace("TÂCHE-3", "TÂCHE-3 (terminée)")
+            .replace("🔄", "✅");
         let mut b = vec![section("Work In Progress", wrapped("a2", &changed))];
         ledger.begin_turn(session);
         let out = ledger.apply(session, &mut b);
@@ -537,17 +540,35 @@ mod tests {
 
         ledger.begin_turn(session);
         let mut stopped = [section("Work In Progress", &body)];
-        assert_eq!(ledger.apply_with_render(session, &mut stopped, render).1.delivered, 1);
+        assert_eq!(
+            ledger
+                .apply_with_render(session, &mut stopped, render)
+                .1
+                .delivered,
+            1
+        );
         ledger.finish_turn(session, false);
 
         ledger.begin_turn(session);
         let mut answered = [section("Work In Progress", &body)];
-        assert_eq!(ledger.apply_with_render(session, &mut answered, render).1.pointers, 0);
+        assert_eq!(
+            ledger
+                .apply_with_render(session, &mut answered, render)
+                .1
+                .pointers,
+            0
+        );
         ledger.finish_turn(session, true);
 
         ledger.begin_turn(session);
         let mut repeated = [section("Work In Progress", &body)];
-        assert_eq!(ledger.apply_with_render(session, &mut repeated, render).1.pointers, 1);
+        assert_eq!(
+            ledger
+                .apply_with_render(session, &mut repeated, render)
+                .1
+                .pointers,
+            1
+        );
         assert!(repeated[0].content.contains("unchanged since turn 2"));
     }
 
@@ -583,7 +604,10 @@ mod tests {
         let mut third = vec![section("Work In Progress", wrapped("n3", &a_body))];
         ledger.begin_turn(session);
         let out = ledger.apply(session, &mut third);
-        assert_eq!(out.pointers, 1, "the first snapshot is already in the prefix");
+        assert_eq!(
+            out.pointers, 1,
+            "the first snapshot is already in the prefix"
+        );
         assert!(third[0].content.contains("unchanged since turn 1"));
     }
 
@@ -630,7 +654,10 @@ mod tests {
         let ledger = ResidenceLedger::new();
         let session = Uuid::new_v4();
         let body = wip();
-        let mut older = vec![section("Reflexes", format!("{}{}", "z".repeat(300), Uuid::nil()))];
+        let mut older = vec![section(
+            "Reflexes",
+            format!("{}{}", "z".repeat(300), Uuid::nil()),
+        )];
         ledger.begin_turn(session);
         ledger.apply(session, &mut older);
 
@@ -689,7 +716,8 @@ mod tests {
         // The script replays real transcripts with these numbers; a silent change on
         // one side would make its --check meaningless.
         let script = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/geo_residence_replay.py"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/geo_residence_replay.py"),
         )
         .expect("scripts/geo_residence_replay.py is in the repository");
         assert!(
