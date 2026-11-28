@@ -5780,6 +5780,10 @@ impl ChatManager {
                             }
                         } else {
                             // Not streaming — persist user_message, broadcast, spawn stream
+                            // One turn id for the whole turn: the user_message event and the
+                            // stream deltas must share it, including for an old NATS RPC
+                            // message that carried no `turn_id` (else each would mint its own).
+                            let turn_id = request.turn_id.unwrap_or_else(Uuid::new_v4);
                             if let Ok(uuid) = Uuid::parse_str(&session_id) {
                                 // Update message count
                                 if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
@@ -5798,7 +5802,7 @@ impl ChatManager {
 
                                 // Persist user_message event, stamped with the origin's turn id.
                                 let user_event = crate::neo4j::models::ChatEventRecord {
-                                    id: request.turn_id.unwrap_or_else(Uuid::new_v4),
+                                    id: turn_id,
                                     session_id: uuid,
                                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
                                     event_type: "user_message".to_string(),
@@ -5866,7 +5870,7 @@ impl ChatManager {
                                     search_clone,
                                     documents_clone,
                                     cognitive_routing_clone,
-                                    request.turn_id.unwrap_or_else(Uuid::new_v4),
+                                    turn_id,
                                 )
                                 .await;
                             });
