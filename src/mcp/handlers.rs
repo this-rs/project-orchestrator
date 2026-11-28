@@ -573,6 +573,8 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "close_session", "close_chat_session"),
     ("chat", "send_message", "chat_send_message"),
     ("chat", "list_messages", "list_chat_messages"),
+    ("chat", "usage", "chat_usage"),
+    ("chat", "interrupt", "chat_interrupt"),
     ("chat", "add_discussed", "add_discussed"),
     ("chat", "get_session_entities", "get_session_entities"),
     ("chat", "get_session_tree", "get_session_tree"),
@@ -4603,6 +4605,32 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query(&format!("/api/chat/sessions/{}/messages", id), &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "chat_usage" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/usage", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "chat_interrupt" => {
+                let id = extract_id(args, "session_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("scope").and_then(|v| v.as_str()) {
+                    body.insert("scope".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("cascade").and_then(|v| v.as_bool()) {
+                    body.insert("cascade".to_string(), json!(v));
+                }
+                let result = http
+                    .post(
+                        &format!("/api/chat/sessions/{}/interrupt", id),
+                        &Value::Object(body),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -12183,6 +12211,8 @@ mod tests {
             ("update_anchor", "update_chat_anchor"),
             ("remove_anchor", "remove_chat_anchor"),
             ("list_anchored_sessions", "list_anchored_sessions"),
+            ("usage", "chat_usage"),
+            ("interrupt", "chat_interrupt"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();
