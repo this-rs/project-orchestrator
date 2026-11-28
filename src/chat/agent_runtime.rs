@@ -3639,6 +3639,7 @@ pub(crate) fn cancel_refused_event(capability: &str) -> ChatEvent {
 
 /// The live sessions of the agent path.
 pub struct AgentRuntime {
+    pub(super) live_events: super::event_stream::RuntimeEvents,
     /// The live sessions, shared with each handle (as a `Weak`) so a handle can
     /// remove itself once its provider process is gone.
     sessions: Arc<RwLock<HashMap<String, Arc<AgentSessionHandle>>>>,
@@ -3660,6 +3661,7 @@ impl AgentRuntime {
     /// A runtime persisting its events in `graph`.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
+            live_events: Default::default(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             graph,
             read_only_mcp_tools: Vec::new(),
@@ -3916,6 +3918,7 @@ impl AgentRuntime {
                 });
                 return Err(refused);
             }
+            self.live_events.attach(session_id, &handle.events_tx);
             sessions.insert(session_id.to_string(), Arc::clone(&handle))
         };
         // Started once the session is live (a refused one never runs it).

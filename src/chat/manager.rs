@@ -8668,6 +8668,9 @@ impl ChatManager {
                 old_session.nats_cancel.cancel();
             }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
+            self.agent_runtime
+                .live_events
+                .attach(&session_id.to_string(), &events_tx);
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
@@ -13182,11 +13185,15 @@ impl ChatManager {
         if let Err(error) = self.graph.store_chat_events(uuid, vec![record]).await {
             warn!(%session_id, %error, event = event.event_type(), "event not stored on the thread");
         }
-        if let Some((_, events_tx)) = live {
+        if let Some((_, events_tx)) = &live {
             let _ = events_tx.send(event.clone());
         }
         if let Some(nats) = &self.nats {
-            nats.publish_chat_event(session_id, event);
+            if live.is_some() {
+                nats.publish_chat_event(session_id, event);
+            } else {
+                nats.relay_chat_event(session_id, event);
+            }
         }
     }
 
@@ -14223,6 +14230,9 @@ impl ChatManager {
                 old_session.nats_cancel.cancel();
             }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
+            self.agent_runtime
+                .live_events
+                .attach(session_id, &events_tx);
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
@@ -14921,7 +14931,12 @@ impl ChatManager {
         Ok(results)
     }
 
-    /// Subscribe to a session's broadcast channel (used by WebSocket handler)
+    /// Watch for the next local runtime of a conversation, even while it is dormant.
+    pub(crate) fn watch_chat_runtime(&self, session_id: &str) -> super::event_stream::RuntimeWatch {
+        self.agent_runtime.live_events.watch(session_id)
+    }
+
+    /// Subscribe to a session's current broadcast channel.
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
         // An open mirror of a Claude Code sub-agent is followed live (P18c).
         if let Some(rx) = self.mirrors.subscribe(session_id) {
@@ -35497,6 +35512,67 @@ mod tests {
     // ========================================================================
     // NATS RPC routing tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn an_event_on_a_dormant_thread_reaches_local_websocket_subscribers_over_nats() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let session = test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let state = mock_app_state_with_graph(graph);
+        let broker = TestBroker::start().await;
+        let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::clone(&nats));
+        test_support::insert_mock_cli_session(&manager, &sid).await;
+        let mut local = manager.subscribe(&sid).await.unwrap();
+        let mut all = nats.subscribe_chat_events(&sid).await.unwrap();
+        let mut websocket = nats.subscribe_remote_chat_events(&sid).await.unwrap();
+        nats.client().flush().await.unwrap();
+
+        manager
+            .emit_on_session(
+                &sid,
+                ChatEvent::SystemHint {
+                    content: "live".into(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            local.try_recv().unwrap(),
+            ChatEvent::SystemHint { content } if content == "live"
+        ));
+        let sent = tokio::time::timeout(Duration::from_secs(2), all.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ChatEvent>(&sent.payload).unwrap(),
+            ChatEvent::SystemHint { content } if content == "live"
+        ));
+
+        assert!(manager.active_sessions.write().await.remove(&sid).is_some());
+        manager
+            .emit_on_session(
+                &sid,
+                ChatEvent::SystemHint {
+                    content: "dormant".into(),
+                },
+            )
+            .await;
+        let sent = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ChatEvent>(&sent.payload).unwrap(),
+            ChatEvent::SystemHint { content } if content == "dormant"
+        ));
+    }
 
     #[tokio::test]
     async fn test_try_remote_send_no_nats() {

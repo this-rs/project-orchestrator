@@ -698,7 +698,7 @@ impl ChatManager {
         }
         let sid = session_id.to_string();
         if let Some(nats) = &self.nats {
-            nats.publish_chat_event(&sid, event);
+            nats.relay_chat_event(&sid, event);
         }
         if let Some(emitter) = &self.event_emitter {
             emitter.emit_updated(

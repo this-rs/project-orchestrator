@@ -12,16 +12,90 @@
 //! snapshot, never from the durable cursor.
 #![allow(unused_imports)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use uuid::Uuid;
 
 use crate::chat::manager::ChatManager;
 use crate::chat::types::ChatEvent;
 use crate::events::{NatsEmitter, Subscriber};
 use crate::neo4j::models::ChatEventRecord;
+
+type RuntimeReceiver = broadcast::Receiver<ChatEvent>;
+type RuntimeWatchers = HashMap<String, HashMap<Uuid, mpsc::UnboundedSender<RuntimeReceiver>>>;
+
+/// Registers chat connections independently of the provider process. Each new
+/// local runtime hands existing connections a receiver before its first event.
+#[derive(Default, Clone)]
+pub(crate) struct RuntimeEvents(Arc<Mutex<RuntimeWatchers>>);
+
+impl RuntimeEvents {
+    pub(crate) fn watch(&self, session_id: &str) -> RuntimeWatch {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(id, tx);
+        RuntimeWatch {
+            events: self.clone(),
+            session_id: session_id.to_owned(),
+            id,
+            rx,
+        }
+    }
+
+    pub(crate) fn attach(&self, session_id: &str, events: &broadcast::Sender<ChatEvent>) {
+        let watchers = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session_watchers) = watchers.get(session_id) {
+            for watcher in session_watchers.values() {
+                let _ = watcher.send(events.subscribe());
+            }
+        }
+    }
+}
+
+pub(crate) struct RuntimeWatch {
+    events: RuntimeEvents,
+    session_id: String,
+    id: Uuid,
+    rx: mpsc::UnboundedReceiver<RuntimeReceiver>,
+}
+
+impl RuntimeWatch {
+    pub(crate) async fn next(&mut self) -> Option<RuntimeReceiver> {
+        self.rx.recv().await
+    }
+
+    fn take_ready(&mut self) -> Option<RuntimeReceiver> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for RuntimeWatch {
+    fn drop(&mut self) {
+        let mut watchers = self
+            .events
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session_watchers) = watchers.get_mut(&self.session_id) {
+            session_watchers.remove(&self.id);
+            if session_watchers.is_empty() {
+                watchers.remove(&self.session_id);
+            }
+        }
+    }
+}
 
 /// A server time on the chat wire: seconds since the epoch, with the
 /// milliseconds as the fraction (`1760099999.123`). The REST history and every
@@ -87,8 +161,10 @@ pub(crate) struct CatchUp {
     /// Local broadcast subscription, `None` when the session is not active
     /// locally (a remote instance owns it, or it is dormant).
     pub event_rx: Option<broadcast::Receiver<ChatEvent>>,
-    /// Cross-instance subscription, used only when there is no local broadcast.
+    /// Cross-instance subscription, kept open across local runtime changes.
     pub nats_chat_sub: Option<Subscriber>,
+    /// Receivers for any local runtime opened after this connection registered.
+    pub runtime_watch: RuntimeWatch,
     /// Fingerprints of the streaming snapshot, so live events from the
     /// subscribe→snapshot micro-window are not delivered twice.
     pub snapshot_fingerprints: HashSet<String>,
@@ -112,6 +188,10 @@ pub(crate) async fn catch_up<S: FrameSink>(
     last_event: i64,
     sink: &mut S,
 ) -> Result<CatchUp, Disconnected> {
+    // Register before reading the active runtime so an external send can open
+    // it at any time, including during catch-up.
+    let mut runtime_watch = chat_manager.watch_chat_runtime(session_id);
+
     // ====================================================================
     // Phase 1: Replay persisted events since last_event.
     // ====================================================================
@@ -162,13 +242,18 @@ pub(crate) async fn catch_up<S: FrameSink>(
     // ====================================================================
     // Phase 1.5a: subscribe BEFORE the snapshot so nothing is lost.
     // ====================================================================
-    let event_rx = chat_manager.subscribe(session_id).await.ok();
+    let active_rx = chat_manager.subscribe(session_id).await.ok();
+    let event_rx = if last_event >= SKIP_REPLAY_THRESHOLD {
+        // The UI loaded history over REST. If a runtime opened while this
+        // connection was attaching, use its receiver from before the first
+        // event. A fresh subscribe could miss the prompt of that turn.
+        runtime_watch.take_ready().or(active_rx)
+    } else {
+        active_rx
+    };
 
-    // NATS only when there is no local broadcast (else every event arrives twice).
-    let nats_chat_sub: Option<Subscriber> = if event_rx.is_some() {
-        None
-    } else if let Some(nats) = nats {
-        match nats.subscribe_chat_events(session_id).await {
+    let nats_chat_sub: Option<Subscriber> = if let Some(nats) = nats {
+        match nats.subscribe_remote_chat_events(session_id).await {
             Ok(sub) => Some(sub),
             Err(e) => {
                 tracing::warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
@@ -273,6 +358,7 @@ pub(crate) async fn catch_up<S: FrameSink>(
     Ok(CatchUp {
         event_rx,
         nats_chat_sub,
+        runtime_watch,
         snapshot_fingerprints,
     })
 }
@@ -511,12 +597,13 @@ mod tests {
         );
     }
 
-    /// A session absent from the active map but reachable cross-instance falls
-    /// back to the NATS subscription (no local broadcast → NATS chat events).
+    /// A dormant session receives remote and NATS-only events. When a local
+    /// runtime opens, its NATS echoes must not double the local broadcast.
     #[tokio::test]
     async fn catch_up_falls_back_to_nats_for_a_remote_session() {
         use crate::events::nats_broker_test::TestBroker;
         use crate::events::NatsEmitter;
+        use futures::StreamExt;
 
         let broker = TestBroker::start().await;
         let nats = NatsEmitter::new(broker.client().await, "events");
@@ -531,9 +618,54 @@ mod tests {
             .await
             .expect("catch_up succeeds");
         assert!(caught.event_rx.is_none(), "dormant: no local broadcast");
-        assert!(
-            caught.nats_chat_sub.is_some(),
-            "falls back to a NATS subscription"
+        let mut chat_events = caught.nats_chat_sub.expect("NATS chat subscription");
+        let mut both_origins = nats.subscribe_chat_events(&sid).await.unwrap();
+        nats.client().flush().await.unwrap();
+
+        nats.publish_chat_event(
+            &sid,
+            ChatEvent::SystemHint {
+                content: "echo".into(),
+            },
+        );
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), both_origins.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&message.payload).unwrap()["content"],
+            "echo"
+        );
+
+        let remote = NatsEmitter::new(broker.client().await, "events");
+        remote.publish_chat_event(
+            &sid,
+            ChatEvent::SystemHint {
+                content: "remote".into(),
+            },
+        );
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), chat_events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&message.payload).unwrap()["content"],
+            "remote"
+        );
+
+        nats.relay_chat_event(
+            &sid,
+            ChatEvent::SystemHint {
+                content: "relay".into(),
+            },
+        );
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), chat_events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&message.payload).unwrap()["content"],
+            "relay"
         );
     }
 
